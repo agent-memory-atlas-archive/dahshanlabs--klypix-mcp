@@ -3,6 +3,11 @@
 **Active state management for multi-agent coding — a local-first active context engine with a shared brain.**
 *One project. One shared understanding.*
 
+Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. When a team
+runs several agent sessions or tools on one codebase, the project's decisions, corrections and open
+questions carry across sessions and between tools, in one `brain.klypix` file committed with your
+code. Integration depth differs by host — see [Supported hosts](#supported-hosts-and-their-integration-level).
+
 [![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
 [![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
