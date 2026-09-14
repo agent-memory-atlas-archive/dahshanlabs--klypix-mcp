@@ -4,14 +4,15 @@ Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding to
 `brain.klypix` file, committed with your code, carries the project's decisions, corrections and open
 questions across sessions and between tools. Corrections supersede stale decisions; sessions declare
 the files they expect to touch and get warned about same-machine overlap. Versioned in Git. Served
-over MCP by a process on your machine — nothing is uploaded. Integration depth differs by host — see
+over MCP by a process on your machine; Klypix uploads nothing (your agent's provider still receives
+what the agent reads). Integration depth differs by host — see
 [Supported hosts](#supported-hosts-and-their-integration-level).
 
 ![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
 
 <sub>Real output, not a mockup: both panes run a real MCP client against this server
-([docs/demo/](docs/demo/) — the GIF is re-rendered by CI from a scripted tape, so it can never
-drift from what the product actually does).</sub>
+([docs/demo/](docs/demo/) — the GIF is rendered by CI from a scripted tape against this server, not
+hand-recorded, and re-rendered when the server's responses change).</sub>
 
 Run this inside your project:
 
