@@ -1,20 +1,27 @@
 # Every project gets a brain.
 
-**Active state management for multi-agent coding — a local-first active context engine with a shared brain.**
-*One project. One shared understanding.*
+Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. One
+`brain.klypix` file, committed with your code, carries the project's decisions, corrections and open
+questions across sessions and between tools. Corrections supersede stale decisions; sessions declare
+the files they expect to touch and get warned about same-machine overlap. Versioned in Git. Served
+over MCP. Integration depth differs by host — see
+[Supported hosts](#supported-hosts-and-their-integration-level).
 
-Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. When a team
-runs several agent sessions or tools on one codebase, the project's decisions, corrections and open
-questions carry across sessions and between tools, in one `brain.klypix` file committed with your
-code. Integration depth differs by host — see [Supported hosts](#supported-hosts-and-their-integration-level).
+![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
-[![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
-[![Node](https://img.shields.io/node/v/klypix-mcp?style=flat-square)](package.json)
-[![MCP](https://img.shields.io/badge/MCP-server-475569?style=flat-square)](https://modelcontextprotocol.io)
-[![Glama score](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp/badges/score.svg)](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp)
-[![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)
+<sub>Real output, not a mockup: both panes run a real MCP client against this server
+([docs/demo/](docs/demo/) — the GIF is re-rendered by CI from a scripted tape, so it can never
+drift from what the product actually does).</sub>
+
+Run this inside your project:
+
+```bash
+npx klypix-mcp install
+```
+
+It creates `brain.klypix` if the project has none, wires the editors it finds on this machine,
+registers the `.klypix` merge driver if this is a git repo, and exits only after a real MCP
+handshake has counted the tools that answered.
 
 [![Claude Code](https://img.shields.io/badge/Claude_Code-5_lifecycle_hooks-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
 [![Codex](https://img.shields.io/badge/Codex-native_MCP_%2B_presence-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
@@ -24,24 +31,18 @@ code. Integration depth differs by host — see [Supported hosts](#supported-hos
 <sub>Host badges name the **integration level**, not a flat "compatible" — the levels and what is
 actually tested are in [Supported hosts](#supported-hosts-and-their-integration-level).</sub>
 
-**One actively managed project brain for multi-agent coding.** `klypix-mcp` keeps one versioned
-`brain.klypix` in your repo: the project's active state — current decisions, corrections, evidence
-anchors, open questions, active work, and handoffs. Corrections supersede stale decisions,
-`brain_challenge` tests proposed decisions against standing rules and reversed approaches, and
-sessions declare their scope and get warned about same-machine file overlap. Agents read it and
-write to it over MCP. You read it and correct it in the [KLYPIX app](https://klypix.com).
-
 > **One project. Many agents. One current understanding.**
 
-![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
-
-<sub>Real output, not a mockup: both panes run a real MCP client against this server
-([docs/demo/](docs/demo/) — the GIF is re-rendered by CI from a scripted tape, so it can never
-drift from what the product actually does).</sub>
-
 Klypix does not launch, run, supervise, or replace your agents. It is not an agent runtime, a model
-router, a worktree manager, or a replacement for Git. It is the layer underneath them that holds
-what the project currently believes.
+router, a worktree manager, or a replacement for Git. It holds what the project currently believes.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
+[![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
+[![Node](https://img.shields.io/node/v/klypix-mcp?style=flat-square)](package.json)
+[![MCP](https://img.shields.io/badge/MCP-server-475569?style=flat-square)](https://modelcontextprotocol.io)
+[![Glama score](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp/badges/score.svg)](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp)
+[![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)
 
 ## See the shared project brain in action
 
