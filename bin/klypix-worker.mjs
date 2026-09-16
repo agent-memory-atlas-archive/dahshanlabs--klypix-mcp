@@ -34,6 +34,7 @@ import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGr
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import { consumeMessageReceipt, findProjectBrain } from '../src/agent-presence.mjs';
+import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -219,6 +220,10 @@ const mcpPresence = createMcpPresence({
     formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
   } : {},
 });
+// Release-cut reconcile: the ref each lane last scanned, so a checkpoint that
+// merely REFRESHES the same lease does not re-walk the range. In-memory only —
+// a worker restart rescans once, which costs one bounded git log.
+const lastReconcileRef = new Map();
 // Once brain_sync binds this connection to an exact project brain, all
 // project-brain-default tools must use that same file. Leaving canvas undefined
 // lets klypix-core's intentional cwd/env precedence substitute an ambient brain
@@ -627,18 +632,32 @@ server.registerTool('brain_connect', {
 }, async ({ canvas, apply, max, threshold, scope, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), apply, max, threshold, scope, pairs, relationship, log })));
 
 server.registerTool('brain_reconcile', {
-  title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',
-  description: 'Truth maintenance. (1) CONTRADICTIONS: finds same-subject live card pairs where one carries an explicit correction cue (uppercase "CORRECTION", "was WRONG", "OBSOLETE" — that side is the presumed truth, UNLESS the cue predates its counterpart: then the pair is marked "presumed superseded" and the newer card is presumed current — verify before retiring) or the two use opposite polarity words (deferred↔wired, broken↔fixed, dead↔live), i.e. stale facts whose correction never got linked — candidates only, YOU confirm each: retire the stale card via brain_note ✓. Dismiss a FALSE positive (either kind) by connecting the two ids with brain_connect pairs + relationship:"not_contradiction" — persisted, so it never resurfaces (and its cue stops overlaying recall/ask for that pair). (2) MIGRATIONS: lists committed migration files (Supabase / Rails / Prisma / Knex / generic) that NO brain card references, so an applied-but-unnarrated rollout can be recorded. (3) LEGACY: pre-v1.15 raw-bash ship cards to tidy. Reads ONLY the filesystem — never the database, never the network — and changes nothing. Run it periodically, or when recall surfaces something you believe is stale.',
+  title: 'Reconcile the brain — contradictions, unrecorded migrations, and what a release already closed',
+  description: 'Truth maintenance. (1) CONTRADICTIONS: finds same-subject live card pairs where one carries an explicit correction cue (uppercase "CORRECTION", "was WRONG", "OBSOLETE" — that side is the presumed truth, UNLESS the cue predates its counterpart: then the pair is marked "presumed superseded" and the newer card is presumed current — verify before retiring) or the two use opposite polarity words (deferred↔wired, broken↔fixed, dead↔live), i.e. stale facts whose correction never got linked — candidates only, YOU confirm each: retire the stale card via brain_note ✓. Dismiss a FALSE positive (either kind) by connecting the two ids with brain_connect pairs + relationship:"not_contradiction" — persisted, so it never resurfaces (and its cue stops overlaying recall/ask for that pair). (2) MIGRATIONS: lists committed migration files (Supabase / Rails / Prisma / Knex / generic) that NO brain card references, so an applied-but-unnarrated rollout can be recorded. (3) LEGACY: pre-v1.15 raw-bash ship cards to tidy. (4) RELEASE: which open cards look fulfilled by the commits a release ref already carries (subject+body coverage, the card\'s own #commit- receipt, or a hint edge whose milestone is in the ref). READ-ONLY by default and on every other mode. THE ONE EXCEPTION: on mode "claims" and mode "release" you may pass confirm/dismiss to actually close what you verified — confirm names exact card ids, so nothing is matched by prose; covering only part of a multi-item clause writes "✔ partial" and KEEPS the card open unless you pass whole:true; a call whose every entry is refused leaves the brain byte-identical. Never reads the database or the network. Run it periodically, when recall surfaces something you believe is stale, or right before cutting a release.',
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
-    root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
-    mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims', 'plans']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers, never auto-archived) · plans (plan / proposal / "design decided" cards a LATER 🏁 appears to have built — embedding-first because the ship is usually renamed; receipts + ✓ markers, never auto-archived).'),
+    root: z.string().optional().describe("Project root holding the migrations dir / git repo (default: the brain file's folder)."),
+    mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims', 'plans', 'release']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers; confirm with {id, milestoneId}) · plans (plan / proposal / "design decided" cards a LATER 🏁 appears to have built — embedding-first because the ship is usually renamed) · release (open cards the commits in `ref` look to have fulfilled; confirm with {id, sha}).'),
+    ref: z.string().max(200).optional().describe('mode "release": the git ref being cut. Defaults to this session\'s active release lease, else HEAD.'),
+    sinceRef: z.string().max(200).optional().describe('mode "release": the baseline the range starts from. Defaults to the highest release-shaped tag in the repo.'),
+    confirm: z.array(z.object({
+      id: z.string().max(64).describe('The OPEN card id to close.'),
+      milestoneId: z.string().max(64).optional().describe('mode "claims": the live milestone card that fulfilled it. Requires an existing "likely closed by" link or a current coverage gap on this exact pair.'),
+      sha: z.string().max(40).optional().describe('mode "release": a commit the listing named as covering this card (cov ≥ 0.6, confirmable). Omit to use the card\'s own #commit- receipt.'),
+      whole: z.boolean().optional().describe('Assert the WHOLE card is done. Without it, covering one item of a multi-item clause writes "✔ partial" and the card stays open.'),
+    })).max(64).optional().describe('Pairs YOU verified. Honoured on mode "claims" and mode "release" only. Each confirmed card is stamped ✅, archived, and arrowed "closed by" to its evidence.'),
+    dismiss: z.array(z.object({
+      openId: z.string().max(64).describe('The open card the hint was wrong about.'),
+      cardId: z.string().max(64).optional().describe('The milestone/evidence card to dismiss it against (required unless the listing already named one).'),
+      sha: z.string().max(40).optional().describe('Informational only — the commit that produced the wrong hint. A dismissal is recorded against a CARD, so a hint whose only evidence is a raw commit (no milestone card) cannot be dismissed: pass a cardId, or retire the open card itself.'),
+    })).max(64).optional().describe('Wrong hints to retire permanently as "not_fulfilled" edges between two CARDS — never re-suggested by claims, release, or the self-heal. A card-to-card pair is what makes the dismissal durable; a coverage hint built straight from a commit has no card to point at and will be re-listed at the next release cut until the open card is resolved or the pair is named with a cardId.'),
+    note: z.string().max(400).optional().describe('One line of why, echoed in the receipt.'),
   },
-}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode, log })));
+}, async ({ canvas, root, mode, ref, sinceRef, confirm, dismiss, note }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode, ref, sinceRef, confirm, dismiss, note, log })));
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',
-  description: 'Tidy an over-grown brain WITHOUT losing anything — SMART and non-invasive: it only consolidates DORMANT cards (old + peripheral), never load-bearing ones. Two phases: call it with no apply to get the areas that have accumulated forgotten cards (deterministic: >3 cards that are older than 14 days, beyond the area\'s newest 8, AND have ≤1 connection — so hubs and still-referenced decisions are left untouched; Focus/Instructions/Archive/Open-questions areas protected) plus their card text; YOU write one tight synthesis per area; then call again with apply:true, syntheses:[{title, synthesis}] AND the human\'s 8-char `approve` code (apply is REFUSED without it — you are never shown the code; the human generates it with `npx klypix-mcp garden-code` after reviewing your plan). Each area gets a 🌿 synthesis card, the originals are stamped "⤵ consolidated", moved to Archive, and arrowed to the synthesis — nothing is deleted, and one undo un-gardens. Run it when brain_insights or the brief shows an area has grown noisy.',
+  description: 'Tidy an over-grown brain WITHOUT losing anything — SMART and non-invasive: it only consolidates DORMANT cards (old + peripheral), never load-bearing ones. Two phases: call it with no apply to get the areas that have accumulated forgotten cards (deterministic: >3 cards that are older than 14 days, beyond the area\'s newest 8, AND have ≤1 connection — so hubs and still-referenced decisions are left untouched; Focus/Instructions/Archive/Open-questions areas protected) plus their card text; YOU write one tight synthesis per area; then call again with apply:true, syntheses:[{title, synthesis}] AND the human\'s 8-char `approve` code (apply is REFUSED without it — you are never shown the code; the human generates it with `npx klypix-mcp garden-code` after reviewing your plan). Each area gets a 🌿 synthesis card, the originals are stamped "⤵ consolidated", moved to Archive, and arrowed to the synthesis — nothing is deleted, and one undo un-gardens. Run it when brain_insights or the brief shows an area has grown noisy. SEPARATE PASS: `repair:"duplicate-partials"` lists (and with apply:true collapses) cards that carry the SAME `✔ partial` note more than once — the residue of a partial ✓ on a card that stays live by design. It keeps the earliest note of each distinct body and removes only exact repeats, so nothing is archived, nothing is deleted, no synthesis and no approval code are needed, and a second run finds nothing.',
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     apply: z.boolean().optional().describe('false (default) = list over-grown areas + cards to synthesize; true = consolidate using the supplied syntheses.'),
@@ -647,8 +666,9 @@ server.registerTool('brain_garden', {
       synthesis: z.string().describe('3-6 sentence prose synthesis preserving every still-relevant fact/decision/number.'),
     })).optional().describe('Required when apply:true — one entry per area you want consolidated.'),
     approve: z.string().optional().describe('Required when apply:true — the 8-char human-approval code. You are never shown it: the human runs `npx klypix-mcp garden-code` and pastes the code into chat after reviewing your plan. Never guess or fabricate it.'),
+    repair: z.enum(['duplicate-partials']).optional().describe('Run a targeted repair instead of the consolidation pass. "duplicate-partials" collapses repeated ✔ partial notes on a card to the earliest one — lossless, idempotent, no syntheses and no approval code. Dry-run by default; apply:true writes.'),
   },
-}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), apply, syntheses, approve })));
+}, async ({ canvas, apply, syntheses, approve, repair }) => toContent(await opBrainGarden({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), apply, syntheses, approve, repair })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',
@@ -908,6 +928,71 @@ server.registerTool('brain_sync', {
       }
     } catch { /* observation is best-effort — never fail a sync */ }
   }
+  // ── Release-cut reconcile advisory (1.85.0) ─────────────────────────────────
+  // A release lease was just GRANTED, so this session is about to cut a build.
+  // The one question nobody ever asked at that moment: does anything still open
+  // in the brain look like it ALREADY SHIPPED in this ref? Advisory only — it
+  // never blocks, never writes, never joins the refusal object, and any git or
+  // brain failure degrades to `{ skipped }` rather than failing a sync.
+  //
+  // Recomputed only on a NEW lease or a CHANGED ref (the worker is long-lived;
+  // a restart rescans once, which is acceptable) so a checkpoint refresh every
+  // few minutes does not re-walk 500 commits.
+  let releaseReconcileText = '';
+  {
+    const lease = report.structured?.releaseLease;
+    const granted = lease && (lease.status === 'taken' || lease.status === 'refreshed');
+    const ref = granted ? String(lease.holder?.ref || '').trim() : '';
+    const laneKey = `${String(report.structured?.project || mcpPresence.vault || '').toLowerCase()}|${String(mcpPresence.id || '')}`;
+    if (granted && ref && lastReconcileRef.get(laneKey) !== ref) {
+      lastReconcileRef.set(laneKey, ref);
+      const projectDir = report.structured?.project || mcpPresence.vault;
+      const brainPath = report.structured?.brain;
+      try {
+        const { execFileSync } = await import('child_process');
+        const repoState = (() => { try { return collectRepoState(projectDir); } catch { return null; } })();
+        const sinceRef = repoState?.latestReleaseTag?.tag
+          || (() => {
+            try {
+              return brainFormat.readShipSignals(projectDir, (args) => execFileSync('git', String(args).split(/\s+/).filter(Boolean), {
+                cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+              })).tag || '';
+            } catch { return ''; }
+          })();
+        // NO `${ref}~50` guess. On a young repo — no release-shaped tag and
+        // fewer than 50 commits, i.e. the FIRST release — `git log <ref>~50..`
+        // exits non-zero, commitsInRange reports 'bad-range', and the lease
+        // holder is told "git history for <ref> could not be read", which reads
+        // as a broken checkout when the truth is "this repo is young".
+        // commitsInRange already walks the ref's own tip window on an empty
+        // baseline, capped at the same 500 commits / 4 s either way.
+        const range = commitsInRange(projectDir, sinceRef, ref);
+        if (range.status !== 'ok' || !brainPath) {
+          lease.reconcile = { skipped: true, reason: range.status !== 'ok' ? (range.reason || 'git-unreadable') : 'no-brain' };
+          if (range.status !== 'ok') releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, skipped: true });
+        } else {
+          const { struct } = await brainFormat.parseKlypix(fs.readFileSync(brainPath));
+          const { candidates, truncated } = brainFormat.releaseFulfilledOpens(struct, range.commits, {
+            ref, containedFn: makeContainmentProbe(projectDir, ref),
+          });
+          // Zero candidates → NO key at all (RL10 parity): an absent advisory
+          // and an empty one must not look the same to a reader.
+          if (candidates.length) {
+            lease.reconcile = {
+              kind: 'open-cards-likely-fulfilled-by-release', severity: 'advisory',
+              ref, sinceRef, commitsScanned: range.commits.length, scanCapped: range.capped,
+              candidates, truncated,
+              confirmWith: brainFormat.releaseReconcileConfirmTemplate(ref),
+            };
+          }
+          releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, sinceRef, candidates });
+        }
+      } catch {
+        try { lease.reconcile = { skipped: true, reason: 'error' }; } catch { /* lease is frozen — advisory only */ }
+        releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, skipped: true });
+      }
+    }
+  }
   // ── Uncaptured-work check, host-neutral half ────────────────────────────────
   // The Stop hook can REFUSE a stop; every other host has no lifecycle hook at
   // all, so brain_sync is the only place the same question can be asked. Stamp
@@ -1031,7 +1116,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
     ...(report.isError ? { isError: true } : {}),

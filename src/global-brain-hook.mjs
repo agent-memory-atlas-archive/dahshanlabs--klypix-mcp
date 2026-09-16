@@ -1772,6 +1772,13 @@ const advanceShipBaseline = (lib) => {
         lib.writeShipObsState(CWD, lib.readShipSignals(CWD, git));
     } catch { /* best-effort */ }
 };
+// Conventional-commit subjects worth carding. The DEFINITION lives in the
+// engine (klypix-format.mjs `CC_RE`) so the release-cut reconcile advisory and
+// this capture path can never disagree about what counts as a ship. It is
+// MIRRORED here rather than imported because this hook loads the engine lazily
+// — only when a brain exists — and a static import would pay the whole engine
+// plus jszip on every prompt of every session. test/release-reconcile.mjs (RR8)
+// asserts the two literals are identical, so the mirror cannot drift.
 const CC_RE = /^(feat|fix|perf)(?:\(([^)]+)\))?!?:\s*(.+)$/i;
 function parseCommitLog(raw) {
     return String(raw).split('\x1e').map(s => s.trim()).filter(Boolean).map(rec => {
@@ -2715,6 +2722,12 @@ async function capture(lib) {
             // The ~ (update / re-verify) and ✓ (resolve) markers are IDEMPOTENT on
             // an existing card, so they BYPASS dedup entirely — that's what lets the
             // self-heal loop re-stamp a drifted fact even when its text is unchanged.
+            // The bypass is KEPT (1.85.0). What changed is that it is now honest:
+            // a PARTIAL resolve leaves its card live, so re-pushing the marker used
+            // to append the same ✔ partial note on every Stop (85 lines on one live
+            // card). The ENGINE now skips a note the card already carries, and
+            // reports it per marker — so the ledger below says
+            // `resolve-partial-skipped` instead of implying a fresh stamp.
             const additive = type !== '✓' && type !== '~';
             const key = sha((type + '|' + area + '|' + body).toLowerCase());
             if (additive) {
@@ -2723,7 +2736,10 @@ async function capture(lib) {
             }
             if (entryInGap) gapAuthored++;
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
-            if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview }); continue; }
+            // `rIdx` is this marker's position in the array handed to the engine,
+            // which is how the ledger entry is matched back to the engine's own
+            // per-resolution outcome after the capture.
+            if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview, rIdx: resolutions.length - 1 }); continue; }
             // ~ updates the matching card in place (small corrections).
             if (type === '~') { updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }); ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) }); continue; }
             // Type → scannable prefix + border color: ? open question (amber),
@@ -3087,8 +3103,37 @@ async function capture(lib) {
             enrich.recordEnrichment(BRAIN, enrichmentPairs.map(pair => ({ body: pair.body, question: pair.question })));
         } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
     }
+    // Reconcile the ledger with what the engine ACTUALLY did with each ✓. A
+    // resolve that matched a card already carrying its ✔ partial note changed
+    // nothing, and a ledger that still reads `resolve` claims a stamp that never
+    // happened. Skew-safe: an engine without resolutionOutcomes leaves the
+    // ledger exactly as it was.
+    let partialSkipped = 0;
+    if (Array.isArray(stats.resolutionOutcomes) && stats.resolutionOutcomes.length) {
+        // One ✓ can produce SEVERAL outcomes: the engine resolves up to three
+        // near-tie twins and calls outcomeOf() once per candidate, so several
+        // entries can share an `i`. Building the map by overwrite kept the LAST,
+        // so a ✓ that ARCHIVED twin A while twin B already carried its note was
+        // reported as `resolve-partial-skipped` — "nothing was re-stamped" about
+        // a card that was archived. Rank instead: the strongest outcome wins.
+        const OUTCOME_RANK = { archived: 4, partial: 3, 'fallback-milestone': 2, 'no-match': 1, 'partial-skipped': 0 };
+        const byIdx = new Map();
+        for (const o of stats.resolutionOutcomes) {
+            const prev = byIdx.get(o.i);
+            if (prev === undefined || (OUTCOME_RANK[o.outcome] ?? 0) > (OUTCOME_RANK[prev] ?? 0)) byIdx.set(o.i, o.outcome);
+        }
+        for (const d of ledger) {
+            if (d.action !== 'resolve' || d.rIdx == null) continue;
+            const outcome = byIdx.get(d.rIdx);
+            if (outcome === 'partial-skipped') { d.action = 'resolve-partial-skipped'; partialSkipped++; }
+            else if (outcome === 'partial') d.action = 'resolve-partial';
+            else if (outcome === 'fallback-milestone') d.action = 'resolve-unmatched';
+        }
+    }
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
+    if (stats.partialResolved) bits.push(`${stats.partialResolved} partial (card kept open)`);
+    if (stats.partialSkipped) bits.push(`${stats.partialSkipped} partial already noted`);
     if (stats.updated) bits.push(`${stats.updated} updated`);
     if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
@@ -3107,6 +3152,25 @@ async function capture(lib) {
     // confirmation channel: say WHAT was archived and how to undo a wrong grab.
     if (Array.isArray(stats.corrections) && stats.corrections.length) {
         process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive or ~ update if wrong\n`);
+    }
+    // A `closes:` target the engine judged too generic archived NOTHING. It used
+    // to archive an arbitrary match silently, so this receipt is the difference
+    // between "your close was refused, here is why" and losing a card.
+    if (Array.isArray(stats.closeRefused) && stats.closeRefused.length) {
+        for (const f of stats.closeRefused.slice(0, 3)) {
+            process.stderr.write(`[brain] ⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card by id. Top candidates: ${f.candidates.map(c => `(${c.id}) "${c.title}" cov ${c.cov}`).join(' · ')}\n`);
+        }
+    }
+    if (partialSkipped || stats.partialSkipped) {
+        // `partialSkipped` counts MARKERS whose strongest outcome was a skip;
+        // the engine's stat counts CARDS. They differ when one ✓ hit near-tie
+        // twins and did real work on one of them, so name the right unit rather
+        // than implying the whole marker did nothing.
+        const n = partialSkipped || stats.partialSkipped;
+        const what = partialSkipped
+            ? `${n} ✓ marker(s) matched a card that already carries that note`
+            : `${n} card(s) the ✓ matched already carried that note`;
+        process.stderr.write(`[brain] ✔ partial already noted: ${what} — nothing was re-stamped there. A partial resolve leaves its card OPEN by design, so the marker keeps matching; that is expected, not a failure.\n`);
     }
     if (stats.added > 0 && !stats.linked) process.stderr.write(`[brain] note: ${stats.added} card(s) landed unlinked — \`brain_connect\` (or [[wikilinks]] next time) wires them into the graph\n`);
     // Fulfillment receipts (claim engine): a captured 🏁 that appears to cover a
@@ -3204,6 +3268,41 @@ async function cachedStruct(lib) {
     try { fs.writeFileSync(CACHE, JSON.stringify({ mtimeMs, struct })); pruneCacheDir(); } catch { /* cache is best-effort */ }
     refreshGuardSidecar(lib, struct, mtimeMs);
     return struct;
+}
+// ── ONE honest open count (1.85.0) ──────────────────────────────────────────
+// The open-status summary (open · look already done · ⏰ overdue · created
+// >45 d ago) that every surface prints — SessionStart heal line, T8 status
+// digest, brief and ultra-brief headers — comes from the engine's ONE
+// openStatusSummary, persisted per brain next to the struct cache
+// (`.brief-cache-<key>.status.json`, keyed on mtime + size, tmp + rename,
+// parse failure = miss). The hook is a fresh process per prompt, so this
+// disk record is what lets a status prompt skip the ~0.5 s detector that
+// SessionStart already paid for. typeof-guarded: an older engine falls back
+// to the uncached pure function, then to null (renderers compute their own).
+const STATUS_CACHE = CACHE.replace(/\.json$/, '.status.json');
+function cachedOpenStatusSummary(lib, struct, opts = {}) {
+    if (!struct) return null;
+    try {
+        if (typeof lib.cachedOpenStatusSummary === 'function') {
+            return lib.cachedOpenStatusSummary(struct, { brainPath: BRAIN, cacheFile: STATUS_CACHE, ...opts }).summary || null;
+        }
+        if (typeof lib.openStatusSummary === 'function') return lib.openStatusSummary(struct, opts) || null;
+    } catch { /* best-effort — renderers derive their own summary */ }
+    return null;
+}
+// Shape the summary into the { gaps, total, plans, plansTotal } report the
+// SessionStart footer renders — so the footer's "N look DONE" is the SAME N
+// the status header prints, not a second detector's answer.
+function staleReportFromSummary(summary, struct) {
+    if (!summary || !struct) return null;
+    const byId = new Map((struct.cards || []).map(c => [c.id, c]));
+    const gaps = [...(summary.likelyDoneById || [])]
+        .map(([id, e]) => ({ open: byId.get(id), by: (e && e.byId && byId.get(e.byId)) || { id: (e && e.byId) || null, text: (e && e.by) || '' }, cov: e && e.cov, via: e && e.via }))
+        .filter(g => g.open);
+    const plans = (summary.plans || [])
+        .map(p => ({ open: byId.get(p.openId), by: (p.byId && byId.get(p.byId)) || { id: p.byId || null, text: p.by || '' }, cov: p.cov, sim: p.sim, via: p.via, kind: 'plan' }))
+        .filter(p => p.open);
+    return { gaps: gaps.slice(0, 5), total: summary.likelyDone || 0, plans: plans.slice(0, 5), plansTotal: summary.plansTotal || 0 };
 }
 // ── Guard cards: sidecar compiler (2026-08-24) ───────────────────────────────
 // The PreToolUse --guard lane avoids parsing the brain (~1s measured on the
@@ -3415,7 +3514,7 @@ async function promptRetrieve(lib) {
     // (adversarial review traced the side door). The brief's computed "Area
     // status" section carries the current-state answer instead.
     let ptoks = lib.queryTokens(humanText || '');
-    let statusShaped = false, statusStrong = false;
+    let statusShaped = false, statusStrong = false, statusAreaFamilies = null;
     if (typeof lib.splitQueryTokens === 'function') {
         const sp = lib.splitQueryTokens(humanText || '');
         ptoks = sp.content;
@@ -3426,6 +3525,8 @@ async function promptRetrieve(lib) {
         // refactor X" is a work request (review fix). Older engine without
         // `strong` degrades to content-empty as the strong signal.
         statusStrong = sp.strong !== undefined ? sp.strong : (statusShaped && sp.content.length === 0);
+        // Static area families (1.85.0) — undefined on an older engine ⇒ unscoped.
+        statusAreaFamilies = Array.isArray(sp.areaFamilies) ? sp.areaFamilies : null;
     } else if (lib.STATUS_VOCAB instanceof Set) {
         const filtered = ptoks.filter(t => !lib.STATUS_VOCAB.has(t));
         statusShaped = filtered.length < ptoks.length;
@@ -3514,7 +3615,21 @@ async function promptRetrieve(lib) {
         if (!struct) { try { struct = await cachedStruct(lib); } catch { struct = null; } }
         if (struct) {
             try {
-                const digest = lib.areaStatusDigest(struct, { maxAreas: 12 });
+                // Area scope (1.85.0): resolve the prompt's static families to
+                // exact area titles AFTER the struct is loaded — the engine
+                // owns the matching (whole-token, never substring). typeof-
+                // guarded: an older engine renders the unscoped digest, and a
+                // prompt naming no family passes null (today's behaviour).
+                let areas = null;
+                if (statusAreaFamilies && statusAreaFamilies.length && typeof lib.areaHintsFromPrompt === 'function') {
+                    try { areas = lib.areaHintsFromPrompt(struct, humanText || ''); } catch { areas = null; }
+                }
+                // ONE count (1.85.0): the per-brain cached summary feeds the
+                // area rows, the header and the ⏳/⏰ flags — the same numbers
+                // SessionStart's heal line quoted. A miss (brain changed since)
+                // recomputes and rewrites the record here.
+                const summary = cachedOpenStatusSummary(lib, struct);
+                const digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas, summary });
                 // The digest alone is per-area COUNTS ("· 8 open ·") — it never
                 // names a single open card, yet this block also clears freshHits,
                 // so a status prompt used to arrive with the instruction "answer
@@ -3534,7 +3649,7 @@ async function promptRetrieve(lib) {
                         // hash-deduped per session, and it replaces freshHits
                         // rather than adding to them. Paying ~1.2k tokens once
                         // per status conversation beats answering it wrong.
-                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200 });
+                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary });
                         // Drop its own H1; the hook's stronger header replaces it.
                         if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
                     } catch { body = null; }
@@ -4133,12 +4248,17 @@ async function read(lib) {
     // footer and the preview's heal line.
     const hasPlans = typeof lib.isPlanCard === 'function' && (struct.cards || []).some(c => lib.isPlanCard(c));
     const pairSim = hasPlans ? await cachedPairSimFor(struct) : null;
-    let stale = null;
-    try { if (typeof lib.findStaleOpenCards === 'function') stale = lib.findStaleOpenCards(struct, { max: 5, pairSim }); } catch { stale = null; }
+    // ONE count (1.85.0): SessionStart is where the detector runs and the
+    // per-brain summary record is WRITTEN — the heal line, the brief header,
+    // the ultra header and the stale footer below all read this one object,
+    // and every later status prompt in the session reads the cached record.
+    const summary = cachedOpenStatusSummary(lib, struct, { pairSim });
+    let stale = summary ? staleReportFromSummary(summary, struct) : null;
+    if (!stale) { try { if (typeof lib.findStaleOpenCards === 'function') stale = lib.findStaleOpenCards(struct, { max: 5, pairSim }); } catch { stale = null; } }
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
     // deliberately NOT part of it: messageFooter advances durable offer/ack state
     // and must only go to stdout where the receiving model can see the exact token.
-    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
+    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
@@ -4163,7 +4283,7 @@ async function read(lib) {
         fs.writeFileSync(path.resolve(CWD, briefRel),
             `<!-- auto-generated by the brain hook at session start (${nowIso()}) — read it, don't edit it; regenerated next session. Presence/in-flight/session lines are a snapshot of that instant — query brain_sync or \`npx klypix-mcp doctor\` for live peers before reporting them. -->\n` + full, 'utf8');
     } catch { return emitFull(); }
-    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel });
+    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel, summary });
     // Self-heal tiers compress to ONE line up here; the actionable detail (which
     // cards, which markers to emit) lives in the brief file.
     const heals = [];
@@ -4175,7 +4295,9 @@ async function read(lib) {
         }
     } catch { /* */ }
     if (stale) {
-        if (stale.total) heals.push(`${stale.total} open card(s) look already done`);
+        // The number here IS the status header's "look already done" — one
+        // summary, one count (1.85.0); say so, so nobody reconciles two figures.
+        if (stale.total) heals.push(`${stale.total} open card(s) look already done (the same ${stale.total} counted in the status header)`);
         if (stale.plansTotal) heals.push(`${stale.plansTotal} plan/proposal card(s) look BUILT`);
     }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';

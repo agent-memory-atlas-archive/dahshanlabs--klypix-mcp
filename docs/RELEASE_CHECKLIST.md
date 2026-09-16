@@ -16,11 +16,25 @@ declares `needs: gate`, so a red gate means npm never sees a tarball.
 | 1 | Working tree clean, on the source commit | `git status --short` |
 | 2 | Dependencies match the lockfile exactly | `npm ci` |
 | 3 | Full suite green | `npm test` |
+| 3b | Reconcile the brain against the ref you are cutting | `brain_reconcile mode:"release" ref:<release ref>` |
 | 4 | Bump the version and commit all source changes | edit `package.json` → commit |
 | 5 | Record the immutable source target | `SOURCE_COMMIT=$(git rev-parse HEAD)` |
 | 6 | Add the fixed, corroborated evidence bundle in one new commit | `.release-evidence/v<version>/` only |
 | 7 | Verify that committed bundle against the source target | command below |
 | 8 | Sanity-check what will ship | `npm pack --dry-run` |
+
+**Step 3b** lists the open cards whose claims the commits in this ref look to have
+fulfilled. Read each one against its commit, then close the pairs you verified with
+`confirm:[{ id, sha }]` (or retire a wrong hint with `dismiss:[…]`); re-running should
+then list nothing. Two rules:
+
+- **Run it with the KLYPIX desktop CLOSED** (or with `brain.klypix` not open in it) —
+  otherwise merge-on-save re-unions the pre-confirm state and the closes come back.
+- Covering one item of a multi-item clause writes `✔ partial` and keeps the card
+  **open**. That is correct; pass `whole:true` only when the whole card really is done.
+
+The confirm write is merge-safe by construction: it edits card text, moves cards to
+Archive and adds connections and one milestone. It never deletes a card or an id.
 
 The release tag does **not** point at the source commit. It points at the next,
 one-parent **evidence commit**. That commit may add only regular `100644` files under:
@@ -285,6 +299,22 @@ npm view klypix-mcp@<version> --json | grep -A3 attestations
 3. `npx klypix-mcp doctor` in a linked project — it should report aligned.
 4. Machines pick the new build up through the auto-propagation path; a fresh
    `npx klypix-mcp install` forces it.
+5. **Re-sync the DESKTOP bundle and prove it boots.** The KLYPIX repo carries its own
+   flattener, `scripts/sync-bundled-mcp.mjs`, whose import-rewrite alternation is a
+   SECOND copy of the one in [`bin/klypix-install.mjs`](../bin/klypix-install.mjs) —
+   and nothing in this repo can see it drift. Whenever a file in `bin/` starts
+   importing a new `../src/*.mjs`, BOTH lists need the module, or the flat bundle keeps
+   an unresolvable `../src/…` path and the installed worker crash-loops at startup (the
+   pre-1.72.0 `mcp-presence` incident, and `repo-state` in 1.85). Diff the two
+   alternations, run `npm run sync:mcp` in KLYPIX, then
+   `node test/verify-bundled-mcp.mjs <KLYPIX>/scripts/klypix-mcp-server.mjs`.
+   `test/cli-args.mjs` assertion G covers this repo's half only.
+   That verifier runs fine with an explicit path, but it diffs against
+   `test/baseline.json`, which is **stale** — it still lists the four `remote_*`
+   tools removed in 1.73.x, so it reports one tool-list difference on any current
+   bundle and cannot be read as a gate until the baseline is regenerated
+   (`node test/snapshot.mjs baseline` against the canonical server, reviewed as a
+   deliberate change, not a by-product of a release).
 
 ## 6. Manual re-runs
 

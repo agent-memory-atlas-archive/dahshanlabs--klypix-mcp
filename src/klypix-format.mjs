@@ -1657,6 +1657,81 @@ export const isMilestoneCard = (c) => lifecycleEligible(c) && !isSkillCard(c) &&
 // extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
 export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));
 
+// ── DECLARED vs QUOTED lifecycle (1.85.0 field incident) ────────────────────
+// The classifiers above answer "does this card CARRY a lifecycle glyph", which
+// is the right question for a read-side tier: over-including a card costs a
+// render, never data. The WRITE-side guards ask a different question — "may a
+// ✓ archive this card?" — and there the same test is a trap. `/🏁/.test(text)`
+// fires on a card that merely QUOTES the glyph, so a decision card titled
+// "Brain: The 🏁-doesn't-close-❓ gap …" (txt_4ixgcxz1 on the real brain) was
+// unresolvable by any ✓: the marker silently minted a junk fallback milestone
+// instead and the card had to be closed with an explicit closes: target.
+//
+// This helper answers "which lifecycle glyph does this card DECLARE" — the one
+// in PREFIX position on its headline, after an optional `Area:` prefix. A
+// headline that mentions a glyph mid-sentence declares NONE (that is the fix).
+// A headline with no lifecycle glyph at all falls back to the first body line
+// that declares one, which is exactly lifecycleScope's documented fallback, so
+// a brain that writes its marker under a title line is unaffected.
+//
+// It is deliberately NOT retro-fitted onto isSkillCard / isPlanCard /
+// isMilestoneCard. Those are additive classifications where over-inclusion is
+// the safe direction and narrowing them has a measured cost: applying headline
+// precedence to 🛠 demoted 7 live skill cards to milestones, silently retiring
+// 7 standing rules. Same glyphs, opposite risk — one helper would be wrong for
+// one of them.
+const LIFECYCLE_GLYPH_RE = /[❓🎯🏁🛠✅✔↩⤵]/u;
+const AREA_PREFIX_RE = /^[^:\n]{1,40}:\s*/;
+const DECLARED_GLYPH_RE = /^[\s"'“”*_>-]*([❓🎯🏁🛠✅✔↩⤵])/u;
+export function declaredLifecycleGlyph(card) {
+    const t = String(card?.text ?? card ?? '');
+    if (!t.trim()) return null;
+    const lines = t.split('\n');
+    // The prefix is stripped REPEATEDLY (bounded), testing for the glyph after
+    // each strip. A DOUBLE `Area:` prefix is a shape the engine's own
+    // fallback-milestone writer produces — `(r.area ? `${r.area}: ` : '') + '🏁 '`
+    // over a cleanR that already begins with the area — and brain.klypix carries
+    // live cards reading `iOS: iOS: 🏁 …`. Stripping once left `iOS: 🏁 …`, which
+    // declares nothing, so those real milestones lost the RESOLVE guard and a ✓
+    // could archive the very 🏁 that fulfilled its claim (2026-09-16 review).
+    // Bounded at 3 so a prose headline full of colons cannot be stripped away.
+    let head = lines[0];
+    for (let i = 0; i < 3; i++) {
+        const m = DECLARED_GLYPH_RE.exec(head);
+        if (m) return m[1];
+        if (!AREA_PREFIX_RE.test(head)) break;
+        head = head.replace(AREA_PREFIX_RE, '');
+    }
+    // The headline QUOTES a glyph but leads with none — it declares nothing.
+    if (LIFECYCLE_GLYPH_RE.test(head)) return null;
+    for (const line of lines.slice(1)) {
+        let body = line;
+        for (let i = 0; i < 3; i++) {
+            const b = DECLARED_GLYPH_RE.exec(body);
+            if (b) return b[1];
+            if (!AREA_PREFIX_RE.test(body)) break;
+            body = body.replace(AREA_PREFIX_RE, '');
+        }
+    }
+    return null;
+}
+// Areas are compared with lifecycle glyphs and punctuation stripped from BOTH
+// sides: this project has an area literally titled "Canvas UX ✅", and strict
+// lowercase equality meant every ✓ written with area "Canvas UX" silently
+// matched nothing in it (measured 2026-09-15).
+export const sameAreaKey = (a, b) => normTitleKey(a) === normTitleKey(b);
+// One normalizer for BOTH sides of a `closes:` comparison — the [[wikilink]]
+// brackets, the `Area:` prefix and any leading lifecycle glyph removed, then
+// whitespace collapsed and lowercased. Card titles are derived from prose, so
+// comparing a raw title against a raw target was comparing "canvas ux:" with a
+// sentence; and the `Area:` half is why a bare stub matched everything.
+export const closeTargetKey = (s) => String(s || '')
+    .replace(/^\s*\[\[/, '').replace(/\]\]\s*$/, '')
+    .replace(AREA_PREFIX_RE, '')
+    .replace(/^[\s"'“”*_>-]*[❓🎯🏁🛠✅✔↩⤵️]+\s*/u, '')
+    .replace(/\s+/g, ' ')
+    .trim().toLowerCase();
+
 // ── Plan-shaped plain cards (2026-08-23 AgentLit incident) ──────────────────
 // A proposal / plan / "design decided" card written WITHOUT a ❓/🎯 glyph sits
 // outside every lifecycle mechanism above — no close-pass, no fulfillment
@@ -1705,26 +1780,69 @@ export const isPlanCard = (c) => {
 // win a "what is remaining?" answer — the freshest milestone had fallen out of
 // the brief while the corpse stayed in the Open tier. O(areas), bounded, pure;
 // also the seed of the future brain_ask status mode (one digest assembler).
-export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now() } = {}) {
+//
+// `areas` (1.85.0, area-scoped digest): exact area titles to keep (as resolved
+// by areaHintsFromPrompt). Non-empty → only those areas, the dormancy cutoff is
+// BYPASSED (a named area is wanted even if quiet), and a structural
+// `_Scoped to: …_` line leads the rows; when none of the named areas exists on
+// this brain the digest says so and renders the whole brain instead. `summary`
+// is reserved for the shared openStatusSummary() (additive; ignored when null).
+export function resolveAreaScope(struct, areas) {
+    if (!Array.isArray(areas) || !areas.length || !struct || !Array.isArray(struct.cards)) return null;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const wanted = new Set(areas.map(a => normTitleKey(a)).filter(Boolean));
+    const keep = new Set();
+    let total = 0;
+    const seen = new Set();
+    for (const c of struct.cards) {
+        const title = c.type === 'container' ? flat(c.title) : flat(c.area);
+        if (!title || /^archive$/i.test(title)) continue;
+        const key = normTitleKey(title);
+        if (seen.has(key)) continue;
+        seen.add(key); total++;
+        if (wanted.has(key)) keep.add(key);
+    }
+    return { keep, total, hint: areas.map(flat).filter(Boolean).join(', ') };
+}
+export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
+    // ONE count (1.85.0): the per-area "(K look done)" reads the same
+    // openStatusSummary the header prints; a caller that already has it
+    // passes it, otherwise it is computed here.
+    const sum = summary || openStatusSummary(struct, { now });
+    const likelyDoneById = (sum && sum.likelyDoneById) || new Map();
     const cutoff = now - activeDays * 86_400_000;
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + (String(t).length > n ? '…' : ''); };
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
     const byArea = new Map();
     for (const c of struct.cards) {
         if (c.type === 'container' || !(c.text || '').trim()) continue;
         const area = flat(c.area);
         if (!area || /^archive$/i.test(area)) continue;
+        if (scoped && !scope.keep.has(normTitleKey(area))) continue;
         if (!byArea.has(area)) byArea.set(area, []);
         byArea.get(area).push(c);
+    }
+    const lead = [];
+    if (scoped) {
+        const kept = [...byArea.keys()];
+        const openN = [...byArea.values()].flat().filter(isUnresolvedOpenCard).length;
+        lead.push(`_Scoped to: ${kept.join(', ')} (${kept.length} of ${scope.total} areas · ${openN} open) — ask without an area name for the whole brain_`);
+    } else if (scope) {
+        lead.push(`_No area matched “${scope.hint}”; showing the whole brain._`);
     }
     const rows = [];
     for (const [area, cs] of byArea) {
         const newest = Math.max(...cs.map(c => c.createdAt || 0));
-        if (newest < cutoff) continue;                                  // dormant area — not "current state"
+        if (!scoped && newest < cutoff) continue;                       // dormant area — not "current state" (a NAMED area is never dormant)
         const miles = cs.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        const opens = cs.filter(isOpenCard);
+        // Parity with the status header: a ✅/↩/⤵-stamped card is not open here
+        // either (this row used to count isOpenCard while the header did not).
+        const opens = cs.filter(isUnresolvedOpenCard);
+        const done = opens.filter(c => likelyDoneById.has(c.id)).length;
         const m = miles[0];
         // Decay-aware headline (2026-07-28 post-mortem): a fast-decay milestone
         // older than DECAY_STALE_MS never leads an area as bare current state.
@@ -1735,10 +1853,10 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         const mileStale = m && mAge >= DECAY_STALE_MS && isFastDecayCard(m)
             ? ` (${formatDecayAge(mAge)} — verify live)` : '';
         const mileTxt = m ? `last 🏁 ${day(m.createdAt)}${mileStale} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
-        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
+        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open${done ? ` (${done} look done)` : ''} · latest ${day(newest)}` });
     }
     rows.sort((a, b) => b.newest - a.newest);
-    const out = rows.slice(0, maxAreas).map(r => r.line);
+    const out = [...lead, ...rows.slice(0, maxAreas).map(r => r.line)];
     if (rows.length > maxAreas) out.push(`- …and ${rows.length - maxAreas} more active area(s) — search the brain.`);
     return out;
 }
@@ -1748,7 +1866,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null, summary = null } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -1771,7 +1889,10 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // OLDEST rules forever while every rule learned since reached no session
     // (2026-08-24 audit — the founder's same-day billing rule was invisible).
     const skills = rest.filter(isSkillCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    const open = rest.filter(isOpenCard);
+    // ONE count (1.85.0): the brief's open tier lists exactly what the status
+    // header counts — a ✅/↩/⤵-stamped card is resolved, not open, on every
+    // surface (it used to be listed here while the status digest excluded it).
+    const open = rest.filter(isUnresolvedOpenCard);
     const miles = rest.filter(isMilestoneCard);
     const plain = rest.filter(c => !open.includes(c) && !miles.includes(c) && !skills.includes(c));
     const recent = plain.filter(c => c.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt).slice(0, maxRecent);
@@ -1816,7 +1937,13 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 
     // Overdue open cards (self-declared deadline passed) — badged inline so a
     // stale-dated reminder is flagged the next session instead of decaying silently.
-    const overdueById = findOverdueOpenCards(struct).byId;
+    // Both read the ONE openStatusSummary (1.85.0): `baseSummary` is whole-brain
+    // (focus cards keep their ⏰ badge), `openSummary` is narrowed to the open
+    // tier below so its header equals its bullets by construction. The hook
+    // passes the cached summary; a bare call computes it once here.
+    const baseSummary = summary || openStatusSummary(struct);
+    const openSummary = narrowOpenStatusSummary(baseSummary, open);
+    const overdueById = baseSummary.overdueById;
     const odBadge = (c) => { const o = overdueById.get(c.id); return o ? `  ·  ⏰ OVERDUE — deadline ${o.date} passed ${o.daysOverdue}d ago; verify or close (✓)` : ''; };
     push(`# ${struct.title} — brain brief`);
     push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
@@ -1834,7 +1961,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read them (MCP search) before acting; this list is NOT complete.`);
     }
     if (open.length) {
-        push('', `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`);
+        push('', openStatusHeader(openSummary, 'brief'));
         // Overdue first, then OLDEST first. This tier used to render every open
         // in FULL TEXT while every other tier rendered 160-char headlines, so a
         // handful of verbose cards spent the whole allowance: 14,401 chars of
@@ -1885,22 +2012,17 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // shipped 🏁 covers a live open claim. Suggestion-only: the open card stays
     // live until a human ✓; this section exists so the hint is SEEN (the
     // incident: a fulfilled claim kept surfacing as still-to-do for a week).
+    // ONE count (1.85.0): the rows are the summary's likelyDoneById — the same
+    // set the header's "N look already done" counts (edges ∪ detector, ∩ the
+    // opens listed above), so this section and the header can never disagree.
     {
         const byId = new Map(struct.cards.map(c => [c.id, c]));
-        const likely = [];
-        for (const cn of struct.connections || []) {
-            if (cn.label !== 'likely closed by') continue;
-            const o = byId.get(cn.fromId), m = byId.get(cn.toId);
-            // BOTH endpoints must be live: a since-archived/superseded milestone
-            // no longer vouches (mirror fulfillmentOverlaysFor — a reverted ship
-            // must not keep whispering "likely done" in the brief).
-            if (!o || !m || /^archive$/i.test(o.area || '') || /↩|✅|⤵/.test(o.text || '')) continue;
-            if (/^archive$/i.test(m.area || '') || /↩|⤵/.test(m.text || '')) continue;
-            likely.push({ o, m });
-        }
+        const likely = [...openSummary.likelyDoneById]
+            .map(([id, e]) => ({ o: byId.get(id), m: e && e.byId ? byId.get(e.byId) : null, by: e && e.by }))
+            .filter(x => x.o);
         if (likely.length) {
             push('', '## ⏳ Likely fulfilled — a milestone appears to cover these opens (confirm with a ✓ marker, or ignore)');
-            for (const { o, m } of likely.slice(0, 5)) push(`- ${headline(o, 90)}  ← likely closed by →  “${headline(m, 90)}”`);
+            for (const { o, m, by } of likely.slice(0, 5)) push(`- ${headline(o, 90)}  ← likely closed by →  “${m ? headline(m, 90) : flat(by)}”`);
             if (likely.length > 5) push(`- …and ${likely.length - 5} more — \`brain_reconcile\` mode:"claims" lists all with coverage receipts.`);
         }
     }
@@ -1917,7 +2039,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // the "where does each area stand today" answer (the 2026-07-23 incident:
     // the portal-shipped 🏁 fell out of the milestone tier and a week-old
     // "remaining:" claim answered a status question).
-    const digest = areaStatusDigest(struct);
+    const digest = areaStatusDigest(struct, { summary: baseSummary });
     if (digest.length) { push('', '## Area status (computed — newest 🏁 + open count per active area)'); for (const l of digest) push(l); }
     if (miles.length) {
         push('', '## Milestones');
@@ -1978,13 +2100,14 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 // open questions + a pointer to the FULL brief file the hook writes alongside.
 // The pointer + marker legend are reserved OUT of the budget so they always fit.
 export const ULTRA_BUDGET_CHARS = 1_800;   // sibling of BUDGET_CHARS above — sized for the harness preview, not token cost
-export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS } = {}) {
+export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS, summary = null } = {}) {
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
     const live = texts.filter(c => !isArchived(c));
     const focus = live.filter(isFocus);
-    const open = live.filter(c => isOpenCard(c) && !isFocus(c));
+    // ONE count (1.85.0): same predicate as the status header and the brief.
+    const open = live.filter(c => isUnresolvedOpenCard(c) && !isFocus(c));
     const skills = live.filter(c => isSkillCard(c) && !isFocus(c));
     const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -2022,7 +2145,11 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     }
     // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
     // line that falls off the bottom of the preview-sized budget.
-    const overdueById = findOverdueOpenCards(struct).byId;
+    // ONE count (1.85.0): header numbers and ⏰ prefixes from the same summary
+    // (the hook passes its cached one; a bare call computes it once here).
+    const openSummary = narrowOpenStatusSummary(summary || openStatusSummary(struct), open);
+    const overdueById = openSummary.overdueById;
+    const openHeaderLine = openStatusHeader(openSummary, 'brief');
     const openSorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0));
     // 🛠️ Standing rules tier (2026-08-24): the ultra brief used to render
     // skills as a COUNT in the tail — so the one surface every session reads
@@ -2036,7 +2163,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     // opens header, every overdue line, and the overflow line FIRST, and hold
     // that budget back from the skills tier. Rules yield to deadlines.
     if (skills.length) {
-        const openHeader = `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`;
+        const openHeader = openHeaderLine;
         const overdueLines = openSorted.filter(c => overdueById.has(c.id)).map(c => `- ⏰ OVERDUE ${fr(c)}${head(c)}`);
         const reserve = open.length
             ? ['', openHeader, ...overdueLines, `- …and ${open.length} more — in the full brief.`]
@@ -2052,7 +2179,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
             if (shown < skills.length) pushIfFenced(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
         }
     }
-    if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`)) {
+    if (open.length && pushIf('') && pushIf(openHeaderLine)) {
         let shown = 0;
         for (const c of openSorted) { if (!pushIf(`- ${overdueById.has(c.id) ? '⏰ OVERDUE ' : ''}${fr(c)}${head(c)}`)) break; shown++; }
         if (shown < open.length) pushIf(`- …and ${open.length - shown} more — in the full brief.`);
@@ -2071,9 +2198,139 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
 // tiebreak. Pure + node-runnable (no embeddings / network) so the Stop/prompt
 // hooks can call it with zero extra deps. `#file-…`/`#dir-…` tags (added at
 // capture) are what make a git-diff token match a card precisely.
-const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'its', 'into', 'out', 'can', 'will', 'use', 'using', 'about', 'what', 'when', 'why', 'how', 'add', 'fix', 'make', 'need', 'want', 'let', 'see', 'get', 'got', 'now', 'all', 'any', 'via', 'per', 'etc', 'should', 'could', 'would', 'does', 'did', 'still', 'just', 'like', 'also', 'then', 'than', 'them', 'they']);
+// ── Arabic folding (1.85.0) ──────────────────────────────────────────────────
+// Applied to every QUERY string before tokenizing and before any status regex
+// runs: strip combining marks (shadda/tashkeel — 'تبقّى' otherwise tokenizes to
+// 'تبق' because \p{M} is not \p{L}), fold the alef variants أ/إ/آ → ا, ة → ه and
+// ى → ي. Vocab, stopwords, aliases and the Arabic regex sources are stored in
+// the SAME folded spelling, so one normalizer decides every match. ASCII is a
+// fixed point of this function — English tokens are byte-identical to 1.84.0.
+export function foldArabic(s) {
+    return String(s || '')
+        .replace(/\p{M}+/gu, '')
+        .replace(/[أإآ]/g, 'ا')   // أ إ آ → ا
+        .replace(/ة/g, 'ه')                  // ة → ه
+        .replace(/ى/g, 'ي');                 // ى → ي
+}
+const foldAll = (list) => list.map(foldArabic);
+// 'anything' joined STOPWORDS in 1.85.0: it is the shape word of "anything
+// left / anything remaining", never a subject. Arabic function words follow —
+// most are two letters and never tokenize anyway; listed for the ones that do.
+const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'its', 'into', 'out', 'can', 'will', 'use', 'using', 'about', 'what', 'when', 'why', 'how', 'add', 'fix', 'make', 'need', 'want', 'let', 'see', 'get', 'got', 'now', 'all', 'any', 'via', 'per', 'etc', 'should', 'could', 'would', 'does', 'did', 'still', 'just', 'like', 'also', 'then', 'than', 'them', 'they', 'anything',
+    ...foldAll(['في', 'على', 'من', 'هل', 'الى', 'عن', 'مع', 'هذا', 'هذه', 'او',
+        // Arabic question words — the shape of a question, never its subject (as 'what/when/why/how' above).
+        'ماذا', 'ايش', 'وش', 'شو', 'كيف', 'متى', 'اين', 'وين', 'فين', 'لماذا', 'ليش'])]);
+// Unicode tokenizer with the SAME minimum length (3) as the ASCII class it
+// replaced — `{2,}`, deliberately not `{1,}`: the shorter class emitted ar/en/
+// ui/db/js/go/ok as new tokens and shifted every English ranking (measured).
+// ASCII output is byte-identical to the old `[a-z0-9][a-z0-9_-]{2,}` class
+// (test-locked on 30 prompts in test/status-shape.mjs).
 export function queryTokens(s) {
-    return [...new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])].filter(t => !STOPWORDS.has(t));
+    return [...new Set(foldArabic(s).toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]{2,}/gu) || [])].filter(t => !STOPWORDS.has(t));
+}
+// ── Area families (1.85.0) — static alias sets a prompt can name ─────────────
+// STATIC by design: splitQueryTokens has no struct, so it can only return
+// family NAMES; areaHintsFromPrompt(struct, text) resolves them to exact
+// container titles once a struct is loaded. Matching is WHOLE-TOKEN on folded,
+// lower-cased tokens with Arabic clitic stripping — never substring (substring
+// matched 'approval'→desktop, 'scenarios'→ios, 'dashboard'→canvas, 'webhook
+// driver'→web+drive and container 'Chat/Window'→desktop via 'win'; measured).
+// 'update'/'version' are NOT aliases: they are verbs the status phrases consume.
+export const AREA_FAMILIES = Object.freeze({
+    desktop: Object.freeze(foldAll(['desk', 'desktop', 'electron', 'installer', 'build', 'windows', 'win', 'ديسكتوب', 'سطح-المكتب'])),
+    ios: Object.freeze(foldAll(['ios', 'iphone', 'phone', 'appstore', 'testflight', 'ايفون'])),
+    web: Object.freeze(foldAll(['web', 'website', 'site', 'landing', 'viewer', 'portal', 'vercel', 'الموقع', 'ويب'])),
+    canvas: Object.freeze(['canvas', 'board']),
+    brain: Object.freeze(['brain', 'memory', 'mcp']),
+    drive: Object.freeze(['drive']),
+    release: Object.freeze(['release']),
+});
+// normTokens splits on EVERYTHING that is not a letter or digit (hyphens too,
+// unlike queryTokens) — the alias test wants bare words.
+export const normTokens = (s) => foldArabic(s).toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+// Leading Arabic clitics (definite article, prepositions, conjunctions) are
+// stripped ONLY when a ≥3-letter stem remains: 'للديسكتوب' → 'ديسكتوب',
+// 'الموقع' → 'موقع'. Longest prefix first; one strip per token.
+const AR_CLITICS = ['وال', 'بال', 'لل', 'ال', 'ب', 'و', 'ف', 'ل', 'ك'];
+export function stripArabicClitic(tok) {
+    const t = String(tok || '');
+    if (!/^[؀-ۿ]/u.test(t)) return t;
+    for (const p of AR_CLITICS) {
+        if (t.length - p.length >= 3 && t.startsWith(p)) return t.slice(p.length);
+    }
+    return t;
+}
+// Alias sets pre-folded + pre-stripped so a token matches in either spelling.
+const FAMILY_ALIAS_SETS = new Map(Object.entries(AREA_FAMILIES).map(([fam, aliases]) => {
+    const set = new Set();
+    for (const a of aliases) for (const part of normTokens(a)) { set.add(part); set.add(stripArabicClitic(part)); }
+    // Multi-token aliases ('سطح-المكتب') also register as a joined bigram key.
+    for (const a of aliases) { const parts = normTokens(a); if (parts.length > 1) set.add(parts.join(' ')); }
+    return [fam, set];
+}));
+const ALL_ALIASES = new Set([...FAMILY_ALIAS_SETS.values()].flatMap(s => [...s]));
+// Family names a token list names, in AREA_FAMILIES order. 'app' belongs to
+// ios when the prompt also says store/appstore, else to desktop — and
+// 'appstore' is explicitly NOT a desktop alias.
+export function areaFamiliesFromTokens(tokens) {
+    const toks = (Array.isArray(tokens) ? tokens : normTokens(tokens)).map(t => String(t).toLowerCase());
+    const stripped = new Set(toks.flatMap(t => [t, stripArabicClitic(t)]));
+    for (let i = 0; i + 1 < toks.length; i++) stripped.add(`${toks[i]} ${toks[i + 1]}`);
+    const hasStore = stripped.has('store') || stripped.has('appstore');
+    const out = [];
+    for (const [fam, set] of FAMILY_ALIAS_SETS) {
+        let hit = [...stripped].some(t => set.has(t));
+        if (!hit && stripped.has('app')) hit = fam === (hasStore ? 'ios' : 'desktop');
+        if (hit) out.push(fam);
+    }
+    return out;
+}
+const isAliasToken = (t) => ALL_ALIASES.has(t) || ALL_ALIASES.has(stripArabicClitic(t)) || t === 'app';
+// THE RESIDUAL RULE: a loose status phrase is a status QUESTION only when
+// nothing else is being asked — every token left after removing the matched
+// phrase, stopwords and status vocab must be an area alias. Tokens shorter than
+// 3 characters are ignored exactly as queryTokens ignores them ('or', 'v4').
+export function residualIsAreaOnly(tokens) {
+    const toks = Array.isArray(tokens) ? tokens : normTokens(tokens);
+    for (const raw of toks) {
+        const t = String(raw).toLowerCase();
+        if (t.length < 3 || STOPWORDS.has(t) || isStatusVocab(t)) continue;
+        if (!isAliasToken(t)) return false;
+    }
+    return true;
+}
+// Exact `c.area` titles the prompt's families resolve to on THIS struct —
+// whole-token intersection between each area's normTokens and the family's
+// aliases ('Canvas UX ✅' → canvas; 'Chat/Window' → nothing). null when the
+// prompt names no family (unscoped); when a family is named but no area on
+// this brain carries it, the matched alias tokens come back instead so the
+// digest can say which hint found nothing and fall back to the whole brain.
+export function areaHintsFromPrompt(struct, text) {
+    const ptoks = normTokens(text);
+    const fams = areaFamiliesFromTokens(ptoks);
+    if (!fams.length) return null;
+    const wanted = new Set(fams.flatMap(f => [...FAMILY_ALIAS_SETS.get(f)]));
+    const areaMatches = (title) => {
+        const at = normTokens(title);
+        const bag = new Set(at.flatMap(t => [t, stripArabicClitic(t)]));
+        for (let i = 0; i + 1 < at.length; i++) bag.add(`${at[i]} ${at[i + 1]}`);
+        return [...bag].some(t => wanted.has(t));
+    };
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const titles = [];
+    const seen = new Set();
+    for (const c of (struct && Array.isArray(struct.cards) ? struct.cards : [])) {
+        const title = c.type === 'container' ? flat(c.title) : flat(c.area);
+        if (!title || /^archive$/i.test(title)) continue;
+        const key = normTitleKey(title);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (areaMatches(title)) titles.push(title);
+    }
+    if (titles.length) return titles;
+    const hint = [];
+    for (const t of ptoks) if (isAliasToken(t) && !hint.includes(t)) hint.push(t);
+    return hint.length ? hint : fams.slice();
 }
 // ── Status-vocab quarantine (2026-07-23 field incident) ──────────────────────
 // Words that describe the SHAPE of a status question ("what is remaining?"),
@@ -2088,22 +2345,88 @@ export function queryTokens(s) {
 // 'status'/'progress' are NOT here — "sync status indicator" / "progress bar"
 // are real subjects (adversarial review 2026-07-23); the phrase regex below
 // still catches "current status"-style question shapes.
-export const STATUS_VOCAB = new Set(['remaining', 'remains', 'pending', 'outstanding', 'todo', 'todos', 'unfinished', 'awaits', 'awaiting']);
+// Arabic entries are stored in FOLDED spelling (foldArabic) — the tokenizer
+// folds the prompt the same way, so 'تبقّى', 'تبقى' and 'تبقي' all land here.
+export const STATUS_VOCAB = new Set(['remaining', 'remains', 'pending', 'outstanding', 'todo', 'todos', 'unfinished', 'awaits', 'awaiting',
+    ...foldAll(['تبقى', 'بقي', 'باقي', 'المتبقي', 'متبقي', 'متبقيه', 'معلق', 'معلقه', 'ناقص', 'ينقص', 'عالق'])]);
 // No bare \bto-?do\b — it matched the word "TODO" anywhere ("remove the TODO:
 // refactor X" is a work request, review-caught); to-do only counts inside a
 // question shape ("what's still to do").
+//
+// ── STRICT vs LOOSE families (1.85.0) ────────────────────────────────────────
+// STRICT: today's four English families + the Arabic 'where are we' / 'current
+// state' / 'what is left' shapes — strong on the phrase alone.
+// LOOSE: the shapes people actually type ("do i need to update the desk? ios?
+// or web?", "anything left", "what now", "are we up to date?") — strong ONLY
+// under the residual rule (residualIsAreaOnly). Measured against these very
+// regexes, 14 of 17 ordinary coding questions ("should we bump zod to v4?",
+// "what is now the correct import path?") fired without it, and a strong hit
+// REPLACES card retrieval in the hook — so a false positive costs recall.
+// 'missing' is in NO family (code-review word). 'status'/'progress' stay out.
 const STATUS_QUERY_RE = /\bwhat(?:'?s| is| are)\s+(?:still\s+)?(?:left|remaining|next|open|pending|outstanding|to\s*do|the status)\b|\bstill\s+(?:open|left|pending|remaining|to\s*do)\b|\bwhere (?:are we|do we stand)\b|\bcurrent (?:state|status)\b/i;
+export const STATUS_FAMILIES_EN = Object.freeze({
+    DO_NEED: /\b(?:do|does|should|must|need)\s+(?:i|we|you)\s+(?:still\s+)?(?:need\s+to\s+)?(?:update|upgrade|bump|rebuild|re-?release|ship|publish|deploy|push|cut)\b/i,
+    IS_THERE: /\b(?:is|are)\s+(?:there\s+)?(?:anything|something|stuff|work|items?|bugs?)\s+(?:still\s+)?(?:left|remaining|pending|open|outstanding|to\s*do)\b/i,
+    ANYTHING: /\banything\s+(?:else\s+)?(?:left|remaining|pending|open|outstanding|to\s*do)\b/i,
+    WHAT_NOW: /\bwhat(?:'?s| is)?\s+now\b/i,
+    WHAT_TODOS: /\bwhat(?:'?s| is| are)?\s+(?:the\s+)?(?:remaining|leftover|todo|to-?do)s?\b/i,
+    BEHIND: /\b(?:is|are)\s+(?:we|the\s+\S+(?:\s+\S+)?)\s+(?:up[\s-]?to[\s-]?date|behind|stale|current)\s*\?/i,
+    WHAT_NEED: /\bwhat\s+(?:do\s+)?(?:we|i)\s+(?:still\s+)?(?:have|need)\s+(?:left|to\s+do)\b/i,
+});
+// Arabic regexes use NO `\b`: JS `\b` is ASCII-\w based even under /u and never
+// matches beside an Arabic letter (measured: every Arabic positive failed with
+// it). Word edges are `(?<![\p{L}\p{N}])` / `(?![\p{L}\p{N}])`. Sources are
+// written in natural spelling and FOLDED at construction so they match the
+// folded prompt (test/status-shape.mjs asserts no `\b` in any source).
+const arRe = (src) => new RegExp(foldArabic(src), 'u');
+export const STATUS_FAMILIES_AR = Object.freeze({
+    // STRICT — the phrase alone is a status question.
+    STRICT_AR: arRe('(?<![\\p{L}\\p{N}])(?:وين|اين|فين)\\s+وصلنا(?![\\p{L}\\p{N}])|(?<![\\p{L}\\p{N}])(?:الوضع|الحاله)\\s+(?:الحالي|الحاليه|الان)(?![\\p{L}\\p{N}])'),
+    WHAT_LEFT_AR: arRe('(?<![\\p{L}\\p{N}])(?:ما|ماذا|ايش|وش|شو)\\s*(?:الذي|اللي)?\\s*(?:تبقى|بقي|باقي|ناقص|المتبقي|متبقي)(?![\\p{L}\\p{N}])'),
+    // LOOSE — a leading هل OR a trailing ؟/? is REQUIRED ('لازم ننشر النسخة
+    // الجديدة' is a work statement, measured firing without it), then the
+    // residual rule decides.
+    NEED_AR: arRe('(?:^|\\s)هل\\s+(?:نحتاج|لازم|يلزم|ضروري)\\s+(?:ان\\s+)?(?:ن?حدث|تحديث|نرفع|ننشر|نطلق|نبني)(?![\\p{L}\\p{N}])|(?:نحتاج|لازم|يلزم|ضروري)\\s+(?:ان\\s+)?(?:ن?حدث|تحديث|نرفع|ننشر|نطلق|نبني)[^؟?]{0,40}[؟?]'),
+});
+// A status noun wearing a definite article ('الباقي' = 'the remainder') is the
+// same vocab — checked in the stripped form too.
+const isStatusVocab = (t) => STATUS_VOCAB.has(t) || STATUS_VOCAB.has(stripArabicClitic(t));
+const STRICT_FAMILIES = [STATUS_QUERY_RE, STATUS_FAMILIES_AR.STRICT_AR, STATUS_FAMILIES_AR.WHAT_LEFT_AR];
+const LOOSE_FAMILIES = [...Object.values(STATUS_FAMILIES_EN), STATUS_FAMILIES_AR.NEED_AR];
+// Every span a loose family matches is blanked out (all occurrences, so a
+// repeated shape cannot smuggle its own words into the residual).
+const blankMatches = (text, re) => {
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    return text.replace(g, ' ');
+};
 export function splitQueryTokens(s) {
-    const all = queryTokens(s);
-    const content = all.filter(t => !STATUS_VOCAB.has(t));
-    const statusShaped = content.length < all.length || STATUS_QUERY_RE.test(String(s || ''));
-    // strong = the prompt IS a status question (phrase-shape match, or nothing
-    // but status words). Loose statusShaped merely quarantines tokens; only
-    // STRONG may replace retrieval with the computed digest — "remove the
+    const raw = foldArabic(s);
+    const all = queryTokens(raw);
+    const content = all.filter(t => !isStatusVocab(t));
+    const strictHit = STRICT_FAMILIES.some(re => re.test(raw));
+    const looseHits = LOOSE_FAMILIES.filter(re => re.test(raw));
+    const vocabHit = content.length < all.length;
+    // strong = the prompt IS a status question: a STRICT phrase, or a LOOSE
+    // phrase / bare status vocab whose RESIDUAL — the prompt minus the matched
+    // phrase, stopwords and status vocab — names nothing but area aliases.
+    // Only STRONG may replace retrieval with the computed digest — "remove the
     // TODO: refactor App.tsx" is a work request, not a status question
     // (review: one incidental 'pending'/'todo' token wiped targeted recall).
-    const strong = STATUS_QUERY_RE.test(String(s || '')) || (statusShaped && content.length === 0);
-    return { content, status: all.filter(t => STATUS_VOCAB.has(t)), statusShaped, strong };
+    let strong = strictHit;
+    if (!strong && (vocabHit || looseHits.length)) {
+        let rest = raw;
+        for (const re of looseHits) rest = blankMatches(rest, re);
+        strong = residualIsAreaOnly(normTokens(rest));
+    }
+    // statusShaped keeps its 1.84.0 meaning (status vocab or a strict phrase —
+    // it quarantines tokens and suppresses the file-token fallback) plus every
+    // strong hit; a loose phrase that FAILS the residual rule is an ordinary
+    // coding question and must behave exactly as it did before.
+    const statusShaped = vocabHit || strictHit || strong;
+    // STATIC family names only — no struct here; areaHintsFromPrompt(struct,
+    // text) turns them into container titles where a struct exists.
+    const areaFamilies = areaFamiliesFromTokens(normTokens(raw));
+    return { content, status: all.filter(t => isStatusVocab(t)), statusShaped, strong, areaFamilies };
 }
 const wordsOf = (s) => new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) || []);
 export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, recentDays = 30 } = {}) {
@@ -2177,8 +2500,11 @@ export const deathDateOfCard = (card) => {
 export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
-    const { content: tokens, statusShaped, strong: statusStrong } = splitQueryTokens(question);
-    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong };
+    const { content: tokens, statusShaped, strong: statusStrong, areaFamilies = [] } = splitQueryTokens(question);
+    // Area scope (1.85.0): this function HAS the struct, so it resolves the
+    // prompt's static families to exact area titles for the status renderer.
+    const areas = statusStrong ? areaHintsFromPrompt(struct, question) : null;
+    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong, areaFamilies, areas };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const asOfTs = as_of ? Date.parse(as_of) : null;
     const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
@@ -2476,7 +2802,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
             }
         } catch { /* best-effort overlay — never fail the answer */ }
     }
-    return { hits, total: scored.length, tokens, statusShaped, statusStrong };
+    return { hits, total: scored.length, tokens, statusShaped, statusStrong, areaFamilies, areas };
 }
 
 // Assemble the ranked hits into a SYNTHESIS-READY markdown context: a header that
@@ -2661,9 +2987,16 @@ export const decayMessageStamp = (ageMs) =>
 // maxOpen defaults to NO cap: the open list is the answer to a status question,
 // so it is sized to fit (per-card width adapts) rather than sliced. Callers can
 // still pass a cap explicitly.
-export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now() } = {}) {
+export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    // Area scope (1.85.0): when the prompt named areas that exist on this brain,
+    // opens and newest milestones are filtered to them — the digest prints the
+    // `_Scoped to: …_` line. A named area that does not exist falls back to the
+    // whole brain (the digest says so); `areas` null/empty is today's render.
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
+    const inScope = (c) => !scoped || scope.keep.has(normTitleKey(flat(c.area)));
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     // ⏱️ LAST KNOWN (decay-aware status, 2026-07-28): a fast-decay claim older
     // than 6h renders as last-known observation + live probe, NEVER as current
@@ -2680,7 +3013,7 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         } catch { return null; }
     };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
-    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && inScope(c));
     const out = [];
     let used = 0;
     // A truncation notice must NEVER be subject to the budget it is warning
@@ -2698,6 +3031,15 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // Resolved-but-not-archived cards (✅/↩/⤵ in text) are NOT open — every
     // sibling lifecycle matcher carries this guard (review parity fix).
     const opens = live.filter(isUnresolvedOpenCard);
+    // ONE COUNT (1.85.0): the header, the per-item ⏳/⏰ flags and the area
+    // rows all read the same openStatusSummary — narrowed to the opens THIS
+    // render lists, so the header can never claim more than the bullets flag.
+    // A caller-supplied summary (the hook's per-brain disk cache, written at
+    // SessionStart) skips the ~0.5 s detector; null computes it here. This
+    // replaced the serve-time lexical re-detect (40 miles × ≤80 opens per
+    // render) that produced a THIRD number for the same brain.
+    const base = summary || openStatusSummary(struct, { now });
+    const sum = narrowOpenStatusSummary(base, opens);
     // OPENS ARE THE PRIORITY TIER — reserve their share BEFORE the area digest
     // spends it. The digest used to run first and unbounded at 14 areas, eating
     // 1,886 of 3,200 chars (59%) before a single open card printed, so `maxOpen`
@@ -2706,51 +3048,25 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // prints its own honest "…and N more active area(s)" line when it trims.
     const openReserve = opens.length ? Math.floor(budgetChars * 0.6) : 0;
     const maxAreas = Math.max(4, Math.min(14, Math.floor((budgetChars - openReserve - used) / 100)));
-    for (const l of areaStatusDigest(struct, { maxAreas })) pushAlways(l);
+    for (const l of areaStatusDigest(struct, { maxAreas, areas, now, summary: base })) pushAlways(l);
     if (opens.length) {
-        const overdueById = findOverdueOpenCards(struct).byId;
+        const overdueById = sum.overdueById;
         // Overdue first, then OLDEST first. Age IS an open item's urgency signal,
         // and the newest opens already appear in the brief's Recent tier — so if
         // anything must be cut it should be the newest, never the long-deferred.
         // (The brief evicted oldest-first: every dropped card was older than
         // every printed one, hiding a founder-ranked #1 bug for two weeks.)
         const sorted = opens.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (a.createdAt || 0) - (b.createdAt || 0));
-        // Slice FIRST, overlay the slice — running correction/fulfillment
-        // overlays across ALL opens was a cards×cards-shaped pass per status
-        // question (review scale finding).
+        // Slice FIRST, overlay the slice — running correction overlays across
+        // ALL opens was a cards×cards-shaped pass per status question.
         const top = sorted.slice(0, maxOpen);
-        const fulfills = fulfillmentOverlaysFor(struct, top);
-        // Serve-time augmentation (2026-07-29): edge-lookup alone renders a
-        // fulfilled ❓ plain when the one capture-time check missed the pair.
-        // Re-detect lexically against the newest milestones for the opens THIS
-        // render will show — bounded (top × ≤40 miles), suggestion-only, and
-        // flagged '?' so an unconfirmed hint never reads as a settled one.
-        try {
-            const newestMiles = live.filter(isMilestoneCard)
-                .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 40);
-            if (newestMiles.length && top.length && top.length <= 80) {
-                const settled = new Set();
-                for (const cn of struct.connections || []) {
-                    if (cn.relationship === 'not_fulfilled') settled.add(`${cn.fromId}|${cn.toId}`);
-                }
-                let df = null;
-                const dfMap = () => (df ??= buildStemDf(struct));
-                for (const o of top) {
-                    if (fulfills.has(o.id)) continue;
-                    for (const m of newestMiles) {
-                        if (m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0) || settled.has(`${o.id}|${m.id}`)) continue;
-                        const lex = likelyFulfillsLexical(o, m, dfMap());
-                        if (!serveTimeAccepts(lex, (o.area || '') === (m.area || ''))) continue;
-                        fulfills.set(o.id, { by: String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100), byId: m.id, unconfirmed: true });
-                        break;
-                    }
-                }
-            }
-        } catch { /* augmentation is best-effort — the base render stands */ }
+        // Fulfillment flags come from the summary (edges ∪ detector, ∩ opens) —
+        // machine hints keep their '?' so an unconfirmed hint never reads settled.
+        const fulfills = sum.likelyDoneById;
         let overlays = new Map();
         try { overlays = correctionOverlaysFor(struct, top); } catch { /* best-effort */ }
         pushAlways('');
-        pushAlways(`## Open (${opens.length})`);
+        pushAlways(openStatusHeader(sum, 'status'));
         // COMPLETENESS OVER DEPTH: scale each line to fit rather than dropping
         // items. A 60-char headline still proves an item EXISTS and can be
         // pulled in full; a missing line asserts it doesn't. Only if every open
@@ -3247,13 +3563,20 @@ export function insightsAreasToMarkdown(ins, title = 'brain') {
     ].join('\n') + '\n';
 }
 
-export function insightsStatusToMarkdown(digest, ins, title = 'brain') {
+// `summary` (1.85.0): the ONE openStatusSummary — prints the same honest open
+// header every other surface prints, plus the per-area table (this view and
+// brain_ask are the only places that table appears; the hook digest never
+// duplicates its area rows).
+export function insightsStatusToMarkdown(digest, ins, title = 'brain', { summary = null } = {}) {
     const lines = Array.isArray(digest) ? digest : [];
+    const table = summary ? perAreaTableToMarkdown(summary, { cap: 12 }).trimEnd() : '';
     return [
         `# ${title} — area status`,
         `*${ins.totals.live} live cards · newest milestone and open count per active area*`,
+        ...(summary ? ['', openStatusHeader(summary, 'status')] : []),
         '',
         lines.length ? lines.join('\n') : '_No area has moved recently._',
+        ...(table ? ['', table] : []),
         '',
         '_Status map only. `brain_ask` answers a question; this says where the project stands._',
     ].join('\n') + '\n';
@@ -4091,6 +4414,137 @@ export function looksLikeTrap(text) {
     return TRAP_CONTRAST.test(t) || TRAP_FAILURE.test(t);
 }
 
+// ── ✔ partial notes are written ONCE (1.85.0 — live data damage) ─────────────
+// A FULL resolve is idempotent: the card is archived, so the same ✓ marker
+// never matches again. A PARTIAL resolve is NOT — the card deliberately stays
+// live — and the Claude-Code hook re-pushes every ✓ marker still visible in the
+// transcript at every Stop, on the documented promise that a resolve is
+// idempotent. So the same note appended forever. Measured in the KLYPIX brain
+// on 2026-09-15: one card carried 85 ✔ partial lines (5 distinct notes),
+// three others 31 / 9 / 9. The promise is the ENGINE's to keep — a fix in one
+// host would leave every other host still writing the damage.
+//
+// Two things make the comparison non-obvious:
+//   · rewriteCard hard-wraps every card it touches, so a stored note is split
+//     across several lines — it has to be read as a RUN, flattened.
+//   · the " — still open: …" tail legitimately drifts (each appended note
+//     changes what the clause scanner sees on the next pass), and the disk copy
+//     truncates the body to 100 chars while the in-memory mirror keeps it whole.
+//     So the identity is the note BODY, date and tail excluded.
+export const PARTIAL_NOTE_PREFIX = '✔ partial ';
+const PARTIAL_NOTE_TAIL = ' — still open:';
+const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed)/u;
+export function partialNoteKey(s) {
+    return String(s || '')
+        .replace(/\s+/g, ' ')
+        .replace(/^✔ partial\s*/u, '')
+        .replace(/^\d{4}-\d{2}-\d{2}\s*:\s*/, '')
+        .split(PARTIAL_NOTE_TAIL)[0]
+        .trim().toLowerCase();
+}
+// Every ✔ partial note on a card, as line RUNS over its raw (wrapped) content.
+// A note always begins its own line — it is appended after a '\n', and wrapText
+// only ever adds breaks inside a paragraph, it never merges two.
+export function partialNoteRuns(text) {
+    const lines = String(text || '').split('\n');
+    const runs = [];
+    let cur = null;
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (l.startsWith(PARTIAL_NOTE_PREFIX)) { if (cur) runs.push(cur); cur = { start: i, end: i, lines: [l] }; continue; }
+        if (!cur) continue;
+        if (PARTIAL_RUN_END_RE.test(l.trim())) { runs.push(cur); cur = null; continue; }
+        cur.end = i; cur.lines.push(l);
+    }
+    if (cur) runs.push(cur);
+    return runs.map(r => { const t = r.lines.join(' '); return { start: r.start, end: r.end, text: t, key: partialNoteKey(t) }; });
+}
+// Does this card already carry this note?
+//
+// WHITESPACE-INSENSITIVE, and that is the whole fix (2026-09-16 review): the
+// note is stored WRAPPED, and wrapText breaks a token longer than the card
+// width (brainCPL() = 37) MID-WORD with no space —
+// `src/canvas/interaction/ConnectionPale` + `tteOverlay.tsx`. partialNoteRuns
+// rejoins a run's lines with ' ', so the stored key gains a space the marker
+// body never had and could never equal `want`. Paths, URLs, shas, wikilinks and
+// slashed compounds routinely exceed 37 chars — 129 of the 250 ✔ partial runs on
+// the live KLYPIX brain sit on that path — so the 1.85 dedup silently did
+// nothing for most real prose and the notes kept stacking. The only thing a
+// wrap can inject is whitespace, so comparing whitespace-free keys restores the
+// identity without loosening it in any other direction.
+//
+// The prefix branch is belt-and-braces for the in-batch mirror and is gated at
+// the FULL truncation width: at the old ≥20 a genuinely NEW, shorter note that
+// happened to be a prefix of an existing longer one was swallowed and counted as
+// a skip (verified), which is silent loss — the one thing this engine may never
+// do. The mirror now stores the same 100-char body the disk gets, so the exact
+// branch covers it and this one only ever fires on a real 100-char truncation.
+export function hasPartialNote(text, body) {
+    const want = partialNoteKey(body);
+    if (!want) return false;
+    const squash = (x) => String(x).replace(/\s+/g, '');
+    const w = squash(want);
+    return partialNoteRuns(text).some(r => {
+        const k = squash(r.key);
+        return k === w || (want.length >= 100 && k.startsWith(w));
+    });
+}
+// The repair for cards already damaged: collapse duplicate notes to the FIRST
+// (earliest-dated) one. Lossless — every removed line is a repeat of one that
+// stays — and idempotent: a second run finds nothing.
+export function findDuplicatePartialNotes(struct, { max = 50 } = {}) {
+    const rows = [];
+    for (const c of (struct?.cards || [])) {
+        if (c.type === 'container' || !(c.text || '').trim()) continue;
+        const runs = partialNoteRuns(c.text);
+        if (runs.length < 2) continue;
+        const seen = new Set();
+        let duplicates = 0;
+        for (const r of runs) { if (seen.has(r.key)) duplicates++; else seen.add(r.key); }
+        if (!duplicates) continue;
+        rows.push({
+            id: c.id, area: c.area || null,
+            headline: String(c.text || '').replace(/\s+/g, ' ').trim().slice(0, 110),
+            total: runs.length, distinct: seen.size, duplicates,
+        });
+    }
+    rows.sort((a, b) => b.duplicates - a.duplicates || String(a.id).localeCompare(String(b.id)));
+    return { cards: rows.slice(0, max), total: rows.length, notes: rows.reduce((n, r) => n + r.duplicates, 0) };
+}
+export async function collapseDuplicatePartialNotes(buffer) {
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('the ✔ partial repair supports v4 .klypix only');
+    const stats = { cards: 0, notes: 0 };
+    for (const c of struct.cards) {
+        if (c.type === 'container' || (c.type != null && c.type !== 'text')) continue;
+        const ip = `items/${shard(c.id)}/${c.id}.json`;
+        const f = zip.file(ip);
+        if (!f) continue;
+        let j;
+        try { j = JSON.parse(await f.async('string')); } catch { continue; }
+        const content = String(j.content || '');
+        const runs = partialNoteRuns(content);
+        if (runs.length < 2) continue;
+        const seen = new Set();
+        const drop = new Set();
+        let dropped = 0;
+        for (const r of runs) {
+            if (seen.has(r.key)) { dropped++; for (let i = r.start; i <= r.end; i++) drop.add(i); }
+            else seen.add(r.key);
+        }
+        if (!drop.size) continue;
+        j.content = wrapText(content.split('\n').filter((_, i) => !drop.has(i)).join('\n'));
+        zip.file(ip, JSON.stringify(j));
+        const pos = canvas.positions[c.id];
+        if (pos) canvas.positions[c.id] = { ...pos, h: measureCardH(j.content) };
+        stats.cards++;
+        stats.notes += dropped;
+    }
+    if (!stats.cards) return { buffer, stats };
+    stampBrainKind(manifest);
+    return { buffer: await finalizeBrainZip(zip, canvas, manifest, Date.now()), stats };
+}
+
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
     const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6, QUESTION_MERGE_AT = 0.6;
     let work = buffer;
@@ -4128,6 +4582,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             c.type !== 'container' && (c.text || '').trim()
             && !/^archive$/i.test(c.area || '')
             && !/↩|✅/.test(c.text));
+        // Every area name this brain actually uses, normalized once. Used by the
+        // CLOSE-LINK pass to tell an `Area:` prefix from an ordinary prose colon.
+        let _areaKeys = null;
+        const knownAreaKeys = () => (_areaKeys ||= new Set(
+            struct.cards.map(c => normTitleKey(c.type === 'container' ? (c.title || c.text || '') : (c.area || ''))).filter(Boolean)));
         const rewriteCard = async (id, mutate) => {
             const ip = `items/${shard(id)}/${id}.json`;
             const f = zip.file(ip); if (!f) return false;
@@ -4192,11 +4651,105 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // for RANKING only — its bonus must never admit a lexically ineligible
         // card (the 2026-08-11 false-close incident was 0.174 + 0.15 = 0.324).
         const milestonesFallback = [];
+        // Cards the ID-ADDRESSED branch archived, reported in stats so a caller
+        // that wants to mint ONE closing milestone for them (brain_reconcile
+        // mode:'release') can pass those ids back as a card's `__closesIds` on a
+        // second capture — the same field pass 2 uses for `closes:` targets, so
+        // the arrows are identical whichever path drew them.
+        const idArchived = [];
+        // Per-resolution outcome, indexed by the caller's own array position, so
+        // a host that kept a ledger entry per marker can say what ACTUALLY
+        // happened to each one instead of implying a fresh stamp (the hook's
+        // `resolve-partial-skipped` action).
+        let rIdx = -1;
+        const outcomeOf = (outcome, extra = {}) => { (stats.resolutionOutcomes ||= []).push({ i: rIdx, outcome, ...extra }); };
         for (const r of resolutions) {
+            rIdx++;
+            // ── ID-ADDRESSED RESOLVE (1.85.0) ───────────────────────────────
+            // brain_reconcile confirm names the EXACT card, so there is nothing
+            // to fuzzy-match and RESOLVE_AT is skipped. Everything else about a
+            // ✓ is kept: the 🛠 / pure-🏁 / already-resolved refusals, and above
+            // all the PARTIAL-CLAUSE rule. findStaleOpenCards is clause-keyed —
+            // its best coverage may come from ONE item of a multi-item
+            // "remaining: A + B + C" clause — so archiving the whole card on a
+            // one-clause hit is precisely the false close this engine promises
+            // never to do. `whole: true` is the explicit human override, and the
+            // outcome (archived | partial) is reported per id.
+            if (r && r.id) {
+                const record = (outcome, extra = {}) => { (stats.idResolutions ||= []).push({ id: r.id, outcome, ...extra }); outcomeOf(extra.skipped ? 'partial-skipped' : outcome, { id: r.id }); };
+                const target = struct.cards.find(c => c.id === r.id && c.type !== 'container' && (c.text || '').trim());
+                if (!target) { record('refused', { reason: 'unknown-id' }); continue; }
+                const guarded = /🛠/.test(target.text) || /^archive$/i.test(target.area || '') || !isUnresolvedOpenCard(target);
+                if (guarded) { record('refused', { reason: 'not-open' }); continue; }
+                const rTokId = tokenSet(r.text || '');
+                const itemsId = extractOpenClauses(target.text).flatMap(cl => cl.items);
+                const coveredId = itemsId.filter(it => coverageOf(it.tokens, rTokId) >= 0.8);
+                const uncoveredId = itemsId.filter(it => coverageOf(it.tokens, rTokId) < 0.5);
+                const partialId = r.whole !== true
+                    && ((coveredId.length && uncoveredId.length) || (/🏁/.test(target.text) && itemsId.length > 0));
+                if (partialId) {
+                    const cleanR = stripLifecycleGlyphs(r.text);
+                    // Already noted → say so and change nothing (see the
+                    // PARTIAL_NOTE_PREFIX block above: a partial resolve is not
+                    // idempotent on its own, and re-pushed markers stacked 85
+                    // identical lines onto one live card).
+                    if (hasPartialNote(target.text, cleanR.slice(0, 100))) {
+                        stats.partialSkipped = (stats.partialSkipped || 0) + 1;
+                        record('partial', { skipped: true });
+                        continue;
+                    }
+                    const still = uncoveredId.length ? ` — still open: ${uncoveredId.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
+                    await rewriteCard(target.id, j => {
+                        j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
+                        j.borderColor = 'rgba(16,185,129,0.45)';
+                    });
+                    // The in-memory mirror is the string that reached DISK, not
+                    // the untruncated body: a second copy of the same marker in
+                    // the same batch then matches by exact key instead of
+                    // leaning on the prefix tolerance in hasPartialNote.
+                    target.text += `\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
+                    stats.partialResolved = (stats.partialResolved || 0) + 1;
+                    record('partial', { uncovered: uncoveredId.map(x => x.text.slice(0, 60)) });
+                    continue;
+                }
+                await rewriteCard(target.id, j => {
+                    j.content = `${j.content}\n✅ ${today}: ${r.text || 'confirmed done'}`;
+                    j.borderColor = 'rgba(16,185,129,0.35)';
+                });
+                await archiveCard(target.id);
+                target.text += ` ✅ ${r.text || ''}`;
+                stats.resolved++;
+                idArchived.push(target.id);
+                stats.idArchived = idArchived;
+                record('archived');
+                // The evidence card becomes the CONFIRMED closer: an existing
+                // dashed 'likely closed by' hint is relabeled in place (so
+                // fulfillmentOverlaysFor stops rendering it as unconfirmed)
+                // rather than left beside a second solid arrow.
+                if (r.byId && struct.cards.some(c => c.id === r.byId)) {
+                    let already = false;
+                    for (const cn of canvas.connections) {
+                        const samePair = (cn.fromId === target.id && cn.toId === r.byId) || (cn.fromId === r.byId && cn.toId === target.id);
+                        if (!samePair) continue;
+                        if (cn.label === 'likely closed by') {
+                            cn.label = 'closed by'; cn.style = 'solid'; cn.width = 2; cn.color = '#10b981'; cn.hintVia = 'human';
+                            already = true;
+                        } else if (cn.label === 'closed by') already = true;
+                    }
+                    if (!already) {
+                        canvas.connections.push({
+                            id: `con_${rand()}`, fromId: target.id, toId: r.byId, relationship: 'relates_to',
+                            label: 'closed by', arrowHead: true, width: 2, color: '#10b981', style: 'solid', hintVia: 'human',
+                        });
+                    }
+                    stats.linked++;
+                }
+                continue;
+            }
             const rTok = tokenSet(r.text);
             const cands = [];
             for (const c of liveTextCards()) {
-                if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
+                if (r.area && !sameAreaKey(c.area, r.area)) continue;
                 // Skills are standing reference — a ✓ must never archive one
                 // (mirror the supersede guard). EXCEPTION (2026-08-24): a card
                 // carrying a machine guard documents "✓-resolve retires the
@@ -4209,7 +4762,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // fulfilled it (item text ⊆ milestone) and archive the milestone
                 // too (review-traced). 🏁 cards that CARRY an open clause stay
                 // eligible — they resolve via the partial path below.
-                if (/🏁/.test(c.text) && !extractOpenClauses(c.text).length) continue;
+                // DECLARED, not quoted (2026-09-15): the old `/🏁/.test(text)`
+                // also skipped a decision card that merely MENTIONS the glyph —
+                // "Brain: The 🏁-doesn't-close-❓ gap" was unresolvable by any ✓
+                // and the marker minted a junk fallback milestone instead.
+                if (declaredLifecycleGlyph(c) === '🏁' && !extractOpenClauses(c.text).length) continue;
                 const cardTokens = tokenSet(c.text);
                 const lexical = overlapScore(rTok, cardTokens);
                 if (lexical < RESOLVE_AT) continue;
@@ -4237,13 +4794,28 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     const partial = (coveredItems.length && uncoveredItems.length) || (/🏁/.test(best.text) && items.length > 0);
                     if (partial) {
                         const cleanR = stripLifecycleGlyphs(r.text);
+                        // IDEMPOTENCE, for real (2026-09-15 live incident): the
+                        // hook re-pushes every ✓ marker in the transcript at
+                        // every Stop because a resolve is documented as
+                        // idempotent — true for a full resolve, which archives
+                        // its card, and false for this branch, which leaves it
+                        // live. 85 identical ✔ partial lines on one card before
+                        // this guard. Skipping is the honest outcome, and it is
+                        // COUNTED so the receipt can say what happened.
+                        if (hasPartialNote(best.text, cleanR.slice(0, 100))) {
+                            stats.partialSkipped = (stats.partialSkipped || 0) + 1;
+                            outcomeOf('partial-skipped', { cardId: best.id });
+                            continue;
+                        }
                         const still = uncoveredItems.length ? ` — still open: ${uncoveredItems.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
                         await rewriteCard(best.id, j => {
                             j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                             j.borderColor = 'rgba(16,185,129,0.45)';
                         });
-                        best.text += `\n✔ partial ${today}: ${cleanR}`;
+                        // Mirror the DISK string (see the id path above).
+                        best.text += `\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                         stats.partialResolved = (stats.partialResolved || 0) + 1;
+                        outcomeOf('partial', { cardId: best.id });
                         continue;
                     }
                     await rewriteCard(best.id, j => {
@@ -4253,6 +4825,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     await archiveCard(best.id);
                     best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
                     stats.resolved++;
+                    outcomeOf('archived', { cardId: best.id });
                 }
             } else {
                 // __fromResolve: an unmatched-✓ fallback card must not seed the
@@ -4262,6 +4835,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 const cleanR = stripLifecycleGlyphs(r.text);
                 if (cleanR && !nearDupExists(cleanR)) {
                     milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${cleanR}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)', __fromResolve: true });
+                    outcomeOf('fallback-milestone');
+                } else {
+                    outcomeOf('no-match');
                 }
             }
         }
@@ -4274,7 +4850,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (u.area && (c.area || '').toLowerCase() !== u.area.toLowerCase()) continue;
+                if (u.area && !sameAreaKey(c.area, u.area)) continue;   // glyph-tolerant: the area "Canvas UX ✅" is the area "Canvas UX"
                 const s = overlapScore(uTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
@@ -4381,7 +4957,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (!isCorrection && area && (c.area || '').toLowerCase() !== area) continue;
+                if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
                 if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
                 // cueMatch returns 0 unless it clears the widened bar (ratio OR
                 // absolute subject mass) — so for corrections, any non-zero fires.
@@ -4398,7 +4974,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.borderColor = 'rgba(120,120,135,0.5)';
                 });
                 await archiveCard(best.id);
-                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && (best.area || '').toLowerCase() !== area));
+                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && !sameAreaKey(best.area, area)));
                 best.text = `↩︎ ${best.text}`;
                 card.__supersedes = best.id;
                 if (readopted) {
@@ -4424,16 +5000,45 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         for (const card of cards) {
             const target = (card.closes || '').toString().trim();
             if (!target) continue;
-            const wantTitle = target.replace(/^\[\[/, '').replace(/\]\]$/, '').trim().toLowerCase();
+            // Both sides are normalized the SAME way (2026-09-15): strip the
+            // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
+            // then collapse. Card titles are derived from prose, so an
+            // unnormalized comparison was really comparing "canvas ux:" against
+            // a full sentence.
+            const wantTitle = closeTargetKey(target);
             const tTok = tokenSet(target);
+            // …but naming the area must still DISAMBIGUATE (2026-09-16 review).
+            // Stripping the prefix from BOTH sides meant `Collab: permanent
+            // share-link` stopped being distinguishable from the same-titled
+            // card in `canvas-share`: 10 stripped titles on the live brain are
+            // shared across different areas, one across five, and at ≤4 matches
+            // the close swept them all — over-matching, the loss direction. So
+            // the target's own prefix is kept as a CONSTRAINT on the title-grade
+            // paths, and ONLY when it names an area that actually exists, so an
+            // ordinary prose colon ("fix: the thing") constrains nothing. A card
+            // it excludes still reaches the token-coverage path below.
+            const wantAreaRaw = (/^\s*(?:\[\[)?\s*([^:\n]{1,40}):\s*/.exec(target) || [])[1] || '';
+            const wantArea = knownAreaKeys().has(normTitleKey(wantAreaRaw)) ? wantAreaRaw : '';
             // Collect EVERY live card the close-target covers — near-duplicate ❓
             // twins score together, and the old first-match-and-break resolved one
             // while its twin stayed "open" in every brief forever. Capped for
             // safety: a close-target is deliberate, so >4 matches means it was too
-            // generic to trust beyond the strongest few.
+            // generic to trust at all.
             const matches = [];
             for (const c of liveTextCards()) {
-                const ct = (c.title || '').trim().toLowerCase();
+                // The STRIPPED card title. The ≥10 floor on the prefix paths is
+                // the fix for the worst close-link failure mode: many titles are
+                // the bare area stub ("Canvas UX:"), which strips to a handful of
+                // characters, and `wantTitle.startsWith(core)` then matched every
+                // one of them. Simulated against the real brain, the target
+                // "Brain: The 🏁-doesn't-close-❓ gap" produced 21 live matches.
+                // Exact equality keeps the old ≥6 bar — naming a short title
+                // exactly is a deliberate act, a shared prefix is not.
+                const core = closeTargetKey(c.title);
+                const longEnough = core.length >= 10;
+                // A named area on the target constrains the TITLE-grade paths
+                // only (see wantArea above); coverage is left alone.
+                const areaOk = !wantArea || sameAreaKey(c.area, wantArea);
                 // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
                 // glyph-and-area-stripped title. Never the contains path (titles
                 // are derived from prose, so a skill that merely MENTIONS the
@@ -4441,25 +5046,73 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // trap), and never token coverage (2026-08-01: naming is a
                 // deliberate human act; overlap is not).
                 if (/🛠/.test(c.text)) {
-                    const core = ct.replace(/^[^:\n]{1,40}:\s*/, '').replace(/^[🛠️❓🎯🏁✅\s]+/u, '');
-                    if (core && wantTitle.length >= 6 && (core === wantTitle || core.startsWith(wantTitle) || wantTitle.startsWith(core))) matches.push({ c, cov: 1 });
+                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
+                    else if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) });
+                    }
                     continue;
                 }
-                // Title fast-path: exact / prefix (≥6 chars), or the card title
-                // CONTAINS the target — the contains variant needs a LONGER target
-                // (≥10) because a short generic word ("sandbox") appears in many
-                // unrelated titles and the multi-close below would sweep them all.
-                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct))) { matches.push({ c, cov: 1 }); continue; }
-                if (ct && wantTitle.length >= 10 && ct.includes(wantTitle)) { matches.push({ c, cov: 1 }); continue; }
+                // Title fast-path: exact (≥6 chars), prefix in either direction
+                // (≥6 target AND ≥10 stripped card title), or the card title
+                // CONTAINS the target — the contains variant needs a LONGER
+                // target (≥10) because a short generic word ("sandbox") appears
+                // in many unrelated titles.
+                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
+                if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) }); continue;
+                }
+                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
-                if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov >= CLOSE_COVER_AT) matches.push({ c, cov }); }
+                if (tTok.size >= 2) {
+                    const cov = coverageOf(tTok, tokenSet(c.text));
+                    if (cov >= CLOSE_COVER_AT) matches.push({ c, cov, overlap: Math.round(cov * tTok.size) });
+                }
             }
-            matches.sort((a, b) => b.cov - a.cov);
-            // >4 matches means the target was too GENERIC to trust a sweep —
-            // fall back to the single best match (the pre-1.17 behavior) rather
-            // than archive four semi-related cards in iteration order.
-            const chosen = matches.length > 4 ? matches.slice(0, 1) : matches;
+            // Ties break on the LONGER overlap and then on id — never on
+            // iteration order, which is what made the old `matches[0]` fallback
+            // archive an arbitrary card with cov 1.00 and no warning.
+            matches.sort((a, b) => (b.cov - a.cov) || ((b.overlap || 0) - (a.overlap || 0)) || String(a.c.id).localeCompare(String(b.c.id)));
+            // >4 matches means the target was too GENERIC to trust — and the old
+            // fallback of archiving `matches[0]` was silent loss, the one thing
+            // this engine may never do. REFUSE, keep the note as an ordinary
+            // card, and hand back the top candidates so the author can name a
+            // longer target or close by id.
+            //
+            // The cap applies to the TIER, not to the whole list (2026-09-16
+            // review). A title-grade hit is an unambiguous naming; coverage hits
+            // are a broad net around it, and counting them toward the cap made
+            // an exact title match refuse because the target's words happened to
+            // appear in five other cards. The documented example — `closes:
+            // v1.2.0 staged as a github draft` — matches 18 live cards on
+            // brain.klypix, exactly ONE of them title-grade (txt_kotyx0i2, rank
+            // 1): the pre-1.85 code archived that right card, this branch
+            // archived nothing. Simulated over all 1,890 live cards on
+            // brain.klypix using each card's own headline as the close target
+            // (tier cap only, no area constraint): refusals fall 45.2% → 13.2%
+            // and the intended card is the one closed in 1,569 of 1,890. A
+            // genuinely ambiguous target — review-G's 7-char 'sandbox', 6 hits,
+            // none exact — is still refused, which is what the cap is for.
+            // The tier is `cov === 1` — a title hit OR a card that carries every
+            // token of the target — deliberately NOT "title-grade only". The
+            // near-duplicate-twins guard depends on it: one ❓ twin usually
+            // matches by title and its paraphrase only by full coverage, and
+            // narrowing the tier to titles alone closed one twin and left the
+            // other open in every brief forever (caught by brain-quality P4a).
+            const exact = matches.filter(m => m.cov === 1);
+            const tier = exact.length ? exact : matches;
+            if (tier.length > 4) {
+                (stats.closeRefused ||= []).push({
+                    target: target.slice(0, 80),
+                    total: tier.length,
+                    candidates: tier.slice(0, 5).map(m => ({
+                        id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
+                        title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+                    })),
+                });
+                continue;
+            }
+            const chosen = tier;
             if (!chosen.length) continue;
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];
@@ -5464,6 +6117,12 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     for (const f of (Array.isArray(s.skillStale) ? s.skillStale : []).slice(0, maxEach)) {
         lines.push(`⚠️ rule may be obsolete (${f.cov}): skill "${String(f.skill).slice(0, 70)}" asserts "${String(f.clause || '').slice(0, 60)}" — this ship appears to remove it. If so, amend: ${f.marker} (retire by naming it in closes:, or dismiss via brain_connect relationship:"not_fulfilled")`);
     }
+    // A `closes:` target that matched too many live cards ARCHIVED NOTHING. It
+    // used to archive matches[0] in iteration order with cov 1.00 and no
+    // warning, which is silent loss; the refusal has to be visible instead.
+    for (const f of (Array.isArray(s.closeRefused) ? s.closeRefused : []).slice(0, maxEach)) {
+        lines.push(`⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card with brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]. Top candidates: ${f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''} cov ${c.cov}`).join(' · ')}`);
+    }
     return lines;
 }
 
@@ -5736,6 +6395,429 @@ export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
     }
     out.sort((a, b) => b.daysOverdue - a.daysOverdue);
     return { overdue: out, total: out.length, byId: new Map(out.map(o => [o.card.id, o])) };
+}
+
+// ── One honest open count (1.85.0) ───────────────────────────────────────────
+// Every number a human sees about open work — the status digest header, the
+// per-item ⏳/⏰ flags, the brief and ultra-brief headers, the insights status
+// view, the SessionStart self-heal line, the Codex lane — comes from THIS one
+// pure function. Before it, the header said "Open (67)", the SessionStart heal
+// line said "34 look already done", the digest flagged 7 bullets and the brief
+// listed 5 hints: four surfaces, four detectors, four numbers for one brain.
+//
+//   open        = live ∧ !archived ∧ isUnresolvedOpenCard (✅/↩/⤵ never count)
+//   likelyDone  = (persisted 'likely closed by' edges ∪ findStaleOpenCards gaps)
+//                 ∩ openIds — the intersection is MANDATORY: findStaleOpenCards
+//                 filters ↩|✅ only, so without it a ⤵-deferred card could make
+//                 the header count exceed the flagged bullets.
+//   overdue     = findOverdueOpenCards ∩ openIds
+//   untouched   = open ∧ age(createdAt) > untouchedDays ∧ !likelyDone ∧ !overdue
+//                 Struct cards carry createdAt only, so the wording is
+//                 "created >45 d ago" — never "untouched" in prose.
+//
+// Pure, no model load, no I/O. Maps serialize to arrays for the disk cache
+// (serialize/deserialize below) because the hook is a fresh process per prompt
+// and findStaleOpenCards is the expensive half (~0.5 s on the real brain).
+export const STATUS_UNTOUCHED_DAYS = 45;
+export function openStatusSummary(struct, { now = Date.now(), untouchedDays = STATUS_UNTOUCHED_DAYS, pairSim = null, areas = null } = {}) {
+    const empty = {
+        open: 0, openIds: [], overdue: 0, overdueById: new Map(), likelyDone: 0, likelyDoneById: new Map(),
+        untouched: 0, untouchedIds: [], perArea: [], plans: [], plansTotal: 0, untouchedDays, computedAt: now,
+    };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const opens = live.filter(c => isUnresolvedOpenCard(c) && (!scoped || scope.keep.has(normTitleKey(flat(c.area)))));
+    const openIds = opens.map(c => c.id);
+    const openSet = new Set(openIds);
+    const head = (t) => flat(t).slice(0, 100);
+    // Overdue ∩ open (findOverdueOpenCards skips ↩|✅ but not ⤵ — intersect).
+    const overdueById = new Map();
+    try {
+        for (const [id, o] of findOverdueOpenCards(struct, { now }).byId) {
+            if (openSet.has(id)) overdueById.set(id, { date: o.date, daysOverdue: o.daysOverdue });
+        }
+    } catch { /* deadline parsing is best-effort */ }
+    // Likely done: persisted hint edges first (they carry the human/machine
+    // provenance), then the fresh detector for pairs no capture ever linked.
+    const likelyDoneById = new Map();
+    try {
+        for (const [id, f] of fulfillmentOverlaysFor(struct, opens)) {
+            if (!openSet.has(id)) continue;
+            likelyDoneById.set(id, { byId: f.byId ?? null, by: f.by || '', via: 'edge', cov: null, unconfirmed: f.unconfirmed !== false });
+        }
+    } catch { /* edge overlay is best-effort */ }
+    let stale = null;
+    try { stale = findStaleOpenCards(struct, { max: Infinity, pairSim }); } catch { stale = null; }
+    for (const g of (stale && stale.gaps) || []) {
+        const id = g.open && g.open.id;
+        if (!openSet.has(id) || likelyDoneById.has(id)) continue;
+        likelyDoneById.set(id, {
+            byId: (g.by && g.by.id) ?? null, by: head(g.by && g.by.text),
+            via: g.via === 'anchor' ? 'anchor' : 'coverage',
+            cov: Number.isFinite(g.cov) ? g.cov : null, unconfirmed: true,
+        });
+    }
+    // Plan-shaped plain cards ride along so the SessionStart footer needs no
+    // second detector run; they are NOT opens and never touch the counts.
+    const plans = ((stale && stale.plans) || []).map(p => ({
+        openId: p.open && p.open.id, byId: (p.by && p.by.id) ?? null, by: head(p.by && p.by.text),
+        cov: Number.isFinite(p.cov) ? p.cov : null, sim: Number.isFinite(p.sim) ? p.sim : null, via: p.via || null,
+    })).filter(p => p.openId);
+    const ageMs = untouchedDays * 86_400_000;
+    const untouchedIds = opens
+        .filter(c => (c.createdAt || 0) > 0 && now - c.createdAt > ageMs && !likelyDoneById.has(c.id) && !overdueById.has(c.id))
+        .map(c => c.id);
+    const untouchedSet = new Set(untouchedIds);
+    const lastMile = new Map();
+    for (const c of live) {
+        if (!isMilestoneCard(c)) continue;
+        const a = flat(c.area);
+        if (a && (c.createdAt || 0) > (lastMile.get(a) || 0)) lastMile.set(a, c.createdAt);
+    }
+    const byArea = new Map();
+    for (const c of opens) {
+        const a = flat(c.area) || 'Notes';
+        let r = byArea.get(a);
+        if (!r) byArea.set(a, r = { area: a, open: 0, likelyDone: 0, overdue: 0, untouched: 0, lastMilestoneAt: lastMile.get(a) || null });
+        r.open++;
+        if (likelyDoneById.has(c.id)) r.likelyDone++;
+        if (overdueById.has(c.id)) r.overdue++;
+        if (untouchedSet.has(c.id)) r.untouched++;
+    }
+    const perArea = [...byArea.values()].sort((a, b) => b.open - a.open || a.area.localeCompare(b.area));
+    return {
+        open: openIds.length, openIds, overdue: overdueById.size, overdueById,
+        likelyDone: likelyDoneById.size, likelyDoneById, untouched: untouchedIds.length, untouchedIds,
+        perArea, plans, plansTotal: (stale && stale.plansTotal) || 0, untouchedDays, computedAt: now,
+    };
+}
+// Narrow a summary to the open cards a renderer is actually about to list
+// (an area-scoped digest, the brief's non-focus tier). Header numbers and
+// per-item flags then come from the SAME maps by construction, so the header
+// can never claim more than the bullets show. `cards` are struct cards.
+export function narrowOpenStatusSummary(sum, cards) {
+    if (!sum) return sum;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const list = Array.isArray(cards) ? cards.filter(Boolean) : [];
+    const ids = list.map(c => c.id);
+    const keep = new Set(ids);
+    const overdueById = new Map([...(sum.overdueById || [])].filter(([id]) => keep.has(id)));
+    const likelyDoneById = new Map([...(sum.likelyDoneById || [])].filter(([id]) => keep.has(id)));
+    const untouchedIds = (sum.untouchedIds || []).filter(id => keep.has(id));
+    const untouchedSet = new Set(untouchedIds);
+    const lastMile = new Map((sum.perArea || []).map(r => [r.area, r.lastMilestoneAt || null]));
+    const byArea = new Map();
+    for (const c of list) {
+        const a = flat(c.area) || 'Notes';
+        let r = byArea.get(a);
+        if (!r) byArea.set(a, r = { area: a, open: 0, likelyDone: 0, overdue: 0, untouched: 0, lastMilestoneAt: lastMile.get(a) || null });
+        r.open++;
+        if (likelyDoneById.has(c.id)) r.likelyDone++;
+        if (overdueById.has(c.id)) r.overdue++;
+        if (untouchedSet.has(c.id)) r.untouched++;
+    }
+    return {
+        ...sum, open: ids.length, openIds: ids, overdue: overdueById.size, overdueById,
+        likelyDone: likelyDoneById.size, likelyDoneById, untouched: untouchedIds.length, untouchedIds,
+        perArea: [...byArea.values()].sort((a, b) => b.open - a.open || a.area.localeCompare(b.area)),
+    };
+}
+// The header grammar, applied everywhere an open count is printed. Parts are
+// omitted when zero so a tidy brain still reads "## Open (3)".
+//   status: `## Open (67) · 34 look already done · 1 ⏰ overdue · 26 created >45 d ago`
+//   brief:  `## Open questions & goals (67 · 34 look already done · 1 ⏰ overdue · 26 created >45 d ago)`
+export function openStatusHeaderParts(sum) {
+    if (!sum) return [];
+    const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+    const parts = [];
+    if (sum.likelyDone) parts.push(`${sum.likelyDone} look already done`);
+    if (sum.overdue) parts.push(`${sum.overdue} ⏰ overdue`);
+    if (sum.untouched) parts.push(`${sum.untouched} created >${days} d ago`);
+    return parts;
+}
+export function openStatusHeader(sum, style = 'status') {
+    const n = sum ? sum.open : 0;
+    const parts = openStatusHeaderParts(sum);
+    if (style === 'brief') return `## Open questions & goals (${[String(n), ...parts].join(' · ')})`;
+    return `## Open (${n})${parts.map(p => ` · ${p}`).join('')}`;
+}
+// Per-area table — brain_ask and brain_insights only. The hook digest never
+// prints it: its area rows already carry "N open (K look done)", and a second
+// table costs ~1,100 budget-exempt chars on a 5,842-char injection.
+export function perAreaTableToMarkdown(sum, { cap = 12, areas = null } = {}) {
+    if (!sum || !Array.isArray(sum.perArea) || !sum.perArea.length) return '';
+    const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+    const wanted = Array.isArray(areas) && areas.length ? new Set(areas.map(a => normTitleKey(a)).filter(Boolean)) : null;
+    const rows = sum.perArea.filter(r => r.open > 0 && (!wanted || wanted.has(normTitleKey(r.area))));
+    if (!rows.length) return '';
+    const out = [`## By area (${rows.length})`];
+    for (const r of rows.slice(0, cap)) {
+        out.push(`- ${r.area} — ${r.open} open`
+            + (r.likelyDone ? ` · ${r.likelyDone} look done` : '')
+            + (r.overdue ? ` · ${r.overdue} ⏰ overdue` : '')
+            + (r.untouched ? ` · ${r.untouched} created >${days} d ago` : '')
+            + (r.lastMilestoneAt ? ` · last 🏁 ${day(r.lastMilestoneAt)}` : ''));
+    }
+    if (rows.length > cap) out.push(`- …and ${rows.length - cap} more area(s) — brain_ask for the whole brain`);
+    return out.join('\n') + '\n';
+}
+// Disk-cache codec. Maps → arrays; a record that is not the shape we wrote
+// (missing openIds / maps) deserializes to null — the reader treats that as a
+// MISS and rewrites, never throws.
+export function serializeOpenStatusSummary(sum) {
+    if (!sum) return null;
+    return { ...sum, overdueById: [...(sum.overdueById || [])], likelyDoneById: [...(sum.likelyDoneById || [])] };
+}
+export function deserializeOpenStatusSummary(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (!Number.isFinite(raw.open) || !Array.isArray(raw.openIds)) return null;
+    if (!Array.isArray(raw.overdueById) || !Array.isArray(raw.likelyDoneById)) return null;
+    if (!Array.isArray(raw.untouchedIds) || !Array.isArray(raw.perArea)) return null;
+    return {
+        ...raw,
+        overdueById: new Map(raw.overdueById.filter(e => Array.isArray(e) && e.length === 2)),
+        likelyDoneById: new Map(raw.likelyDoneById.filter(e => Array.isArray(e) && e.length === 2)),
+        plans: Array.isArray(raw.plans) ? raw.plans : [],
+        plansTotal: Number.isFinite(raw.plansTotal) ? raw.plansTotal : 0,
+        untouchedDays: Number.isFinite(raw.untouchedDays) ? raw.untouchedDays : STATUS_UNTOUCHED_DAYS,
+    };
+}
+// Cache file beside the hook's struct cache: same key formula
+// (sha1-16 of the separator/drive-normalized brain path) so the Claude lane,
+// the Codex lane and any MCP call on one brain share ONE record, and the
+// hook's existing `.brief-cache-*.json` pruning covers it.
+export function statusSummaryCachePathFor(brainPath, home = os.homedir()) {
+    const norm = String(brainPath).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+    const key = crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16);
+    return path.join(home, '.claude', 'project-brain', `.brief-cache-${key}.status.json`);
+}
+// Cached summary for one brain, keyed on BOTH mtimeMs AND size: the desktop's
+// append-only incremental saves can change bytes between two writes with a
+// coarse mtime. Written tmp + rename so two parallel sessions on one brain
+// never interleave a partial file; a JSON parse failure or shape mismatch is a
+// MISS (recomputed and rewritten), never a throw. On a hit the cheap
+// now-dependent fields (overdue, created >N d) are refreshed against the
+// struct so a brain nobody edited for a week still reports today's ages —
+// only the expensive detector result is what the cache actually saves.
+// KLYPIX_STATUS_CACHE_TRACE=<file> appends 'hit'/'miss' lines (tests only).
+export function cachedOpenStatusSummary(struct, { brainPath = null, cacheFile = null, now = Date.now(), pairSim = null, write = true } = {}) {
+    const file = cacheFile || (brainPath ? statusSummaryCachePathFor(brainPath) : null);
+    let st = null;
+    try { const s = fs.statSync(brainPath); st = { mtimeMs: s.mtimeMs, size: s.size }; } catch { st = null; }
+    const trace = (what) => {
+        const t = process.env.KLYPIX_STATUS_CACHE_TRACE;
+        if (!t) return;
+        try { fs.appendFileSync(t, what + '\n'); } catch { /* tests only */ }
+    };
+    if (file && st) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (raw && raw.mtimeMs === st.mtimeMs && raw.size === st.size) {
+                const cached = deserializeOpenStatusSummary(raw.summary);
+                if (cached) { trace('hit'); return { summary: refreshOpenStatusSummary(cached, struct, { now }), cached: true, file }; }
+            }
+        } catch { /* miss */ }
+    }
+    trace('miss');
+    const summary = openStatusSummary(struct, { now, pairSim });
+    if (file && st && write) {
+        const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        try {
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(tmp, JSON.stringify({ mtimeMs: st.mtimeMs, size: st.size, summary: serializeOpenStatusSummary(summary) }));
+            fs.renameSync(tmp, file);
+        } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } }
+    }
+    return { summary, cached: false, file };
+}
+// Re-derive the now-dependent halves of a cached summary from the struct.
+// likelyDoneById (the detector output) is kept; overdue / untouched / perArea
+// are O(opens) and recomputed so the cache never serves yesterday's ages.
+export function refreshOpenStatusSummary(sum, struct, { now = Date.now() } = {}) {
+    if (!sum || !struct || !Array.isArray(struct.cards)) return sum;
+    try {
+        const byId = new Map(struct.cards.map(c => [c.id, c]));
+        const opens = (sum.openIds || []).map(id => byId.get(id)).filter(Boolean);
+        const keep = new Set(opens.map(c => c.id));
+        const overdueById = new Map();
+        for (const [id, o] of findOverdueOpenCards(struct, { now }).byId) {
+            if (keep.has(id)) overdueById.set(id, { date: o.date, daysOverdue: o.daysOverdue });
+        }
+        const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+        const ageMs = days * 86_400_000;
+        const likely = sum.likelyDoneById || new Map();
+        const untouchedIds = opens
+            .filter(c => (c.createdAt || 0) > 0 && now - c.createdAt > ageMs && !likely.has(c.id) && !overdueById.has(c.id))
+            .map(c => c.id);
+        const base = { ...sum, overdue: overdueById.size, overdueById, untouched: untouchedIds.length, untouchedIds, computedAt: now };
+        return narrowOpenStatusSummary(base, opens);
+    } catch { return sum; }
+}
+
+// ── Release-cut reconcile (1.85.0) ───────────────────────────────────────────
+// Conventional-commit subjects worth carding. The hook's commitToCard has used
+// this exact shape since 1.15; it lives HERE now so the release advisory below
+// and the capture path can never drift apart. (The hook mirrors the literal
+// rather than importing it — it loads this module lazily, only when a brain
+// exists, and a static import would pay the whole engine on every prompt.
+// test/release-reconcile.mjs asserts the two sources are identical.)
+export const CC_RE = /^(feat|fix|perf)(?:\(([^)]+)\))?!?:\s*(.+)$/i;
+
+// Which OPEN cards look fulfilled by the commits a release ref is about to
+// carry? Pure — the caller supplies the commits and the containment oracle.
+//
+// Three sources of evidence, strongest first:
+//   commit-tag / commit-evidence  the card itself names a sha (#commit-1a2b3c4
+//                                 or evidence [{kind:'commit'}]) that IS in the
+//                                 ref. The card's own receipt; always confirmable.
+//   edge                          a 'likely closed by' hint or a current
+//                                 findStaleOpenCards gap whose MILESTONE card
+//                                 carries a contained #commit- tag.
+//   coverage / anchor             the shared claim extractor run against the
+//                                 commits themselves as pseudo-milestones.
+//
+// `confirmable` is the honesty flag, and it is deliberately conservative: with
+// `ref` defaulting to the branch being cut, "contained" is TRUE BY CONSTRUCTION
+// for every commit in the range, so containment alone proves nothing about a
+// coverage match. A coverage candidate earns confirmable only at cov ≥ 0.6 from
+// a commit with a real body (≥12 chars — the same bar commitToCard uses);
+// anchor-grade pairs never do. Measured expectation: the commits that never
+// became cards are the body-less ones, and a 5–8-token subject rarely covers a
+// card clause, so recall on that class is LOW. This advisory names what it can
+// prove and says nothing about the rest.
+export const RELEASE_RECONCILE_MAX = 40;
+const COMMIT_TAG_RE = /#commit-([0-9a-f]{7,40})\b/gi;
+export function releaseFulfilledOpens(struct, commits, { ref = '', containedFn = null, maxCandidates = RELEASE_RECONCILE_MAX, summary = null, now = Date.now() } = {}) {
+    const empty = { candidates: [], truncated: false };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const list = Array.isArray(commits) ? commits.filter(c => c && c.sha && c.subject) : [];
+    const contained = typeof containedFn === 'function' ? containedFn : () => false;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const opens = live.filter(isUnresolvedOpenCard);
+    if (!opens.length) return empty;
+    const openById = new Map(opens.map(c => [c.id, c]));
+    const byId = new Map(live.map(c => [c.id, c]));
+    const bySha = new Map(list.map(c => [String(c.sha).toLowerCase(), c]));
+    // A short sha on a card resolves against the range's full shas by prefix —
+    // #commit- tags are 7 hex, the range carries 40.
+    const resolveSha = (short) => {
+        const s = String(short || '').toLowerCase();
+        if (bySha.has(s)) return bySha.get(s);
+        for (const [full, c] of bySha) if (full.startsWith(s)) return c;
+        return null;
+    };
+    const shasOn = (card) => {
+        const out = [];
+        for (const m of String(card.text || '').matchAll(COMMIT_TAG_RE)) out.push({ sha: m[1].toLowerCase(), via: 'commit-tag' });
+        for (const t of (card.tags || [])) {
+            const m = /^#?commit-([0-9a-f]{7,40})$/i.exec(String(t));
+            if (m) out.push({ sha: m[1].toLowerCase(), via: 'commit-tag' });
+        }
+        for (const e of (card.evidence || [])) {
+            if (e && e.kind === 'commit' && typeof e.ref === 'string' && /^[0-9a-f]{7,40}$/i.test(e.ref.trim())) {
+                out.push({ sha: e.ref.trim().toLowerCase(), via: 'commit-evidence' });
+            }
+        }
+        return out;
+    };
+    const cands = new Map();                                     // openId → best candidate
+    const rank = { 'commit-tag': 5, 'commit-evidence': 4, edge: 3, coverage: 2, anchor: 1 };
+    const offer = (c) => {
+        const prev = cands.get(c.openId);
+        if (!prev || rank[c.via] > rank[prev.via] || (rank[c.via] === rank[prev.via] && (c.cov || 0) > (prev.cov || 0))) cands.set(c.openId, c);
+    };
+    const head = (card) => flat(card.text).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 110);
+
+    // (1) the card's own commit receipt
+    for (const o of opens) {
+        for (const { sha, via } of shasOn(o)) {
+            if (!contained(sha)) continue;
+            const c = resolveSha(sha);
+            offer({ openId: o.id, area: o.area || null, headline: head(o), via, cov: null, by: { sha, subject: c ? flat(c.subject).slice(0, 120) : '', cardId: null }, confirmable: true, unconfirmed: true });
+        }
+    }
+
+    // (2) coverage / anchor against the commits themselves
+    const pseudo = [];
+    for (const c of list) {
+        if (!CC_RE.test(c.subject)) continue;
+        const body = String(c.body || '').trim();
+        pseudo.push({
+            id: `commit:${c.sha}`, text: `🏁 ${c.subject}${body ? `\n${body}` : ''}`,
+            createdAt: Number.isFinite(c.ts) && c.ts > 0 ? c.ts * 1000 : now,
+            __sha: c.sha, __subject: flat(c.subject).slice(0, 120), __bodyLen: body.length,
+        });
+    }
+    if (pseudo.length) {
+        try {
+            for (const f of findFulfillmentCandidates(struct, pseudo, { maxPerMilestone: 2 })) {
+                if (!openById.has(f.open.id)) continue;
+                const m = f.milestone;
+                const via = f.via === 'anchor' ? 'anchor' : 'coverage';
+                const confirmable = via === 'coverage' && (f.cov || 0) >= 0.6 && (m.__bodyLen || 0) >= 12;
+                offer({
+                    openId: f.open.id, area: f.open.area || null, headline: head(f.open), via,
+                    cov: Number.isFinite(f.cov) ? f.cov : null,
+                    by: { sha: m.__sha, subject: m.__subject, cardId: null },
+                    confirmable, unconfirmed: true,
+                });
+            }
+        } catch { /* the advisory stands on the evidence it did gather */ }
+    }
+
+    // (3) an existing hint edge / current gap whose MILESTONE carries a
+    //     contained commit tag — the ship is already carded, and the release
+    //     is what proves the card's commit is in the build.
+    try {
+        const sum = summary || openStatusSummary(struct, { now });
+        for (const [openId, f] of (sum.likelyDoneById || new Map())) {
+            if (!openById.has(openId) || !f.byId) continue;
+            const mile = byId.get(f.byId);
+            if (!mile) continue;
+            for (const { sha } of shasOn(mile)) {
+                if (!contained(sha)) continue;
+                const c = resolveSha(sha);
+                offer({
+                    openId, area: openById.get(openId).area || null, headline: head(openById.get(openId)), via: 'edge',
+                    cov: Number.isFinite(f.cov) ? f.cov : null,
+                    by: { sha, subject: c ? flat(c.subject).slice(0, 120) : flat(f.by).slice(0, 120), cardId: f.byId },
+                    confirmable: true, unconfirmed: true,
+                });
+                break;
+            }
+        }
+    } catch { /* summary is best-effort — sources 1 and 2 stand alone */ }
+
+    const all = [...cands.values()].sort((a, b) => (rank[b.via] - rank[a.via]) || ((b.cov || 0) - (a.cov || 0)) || String(a.openId).localeCompare(String(b.openId)));
+    return { candidates: all.slice(0, maxCandidates), truncated: all.length > maxCandidates };
+}
+// The confirm call the advisory hands back — PLACEHOLDERS, never the candidate
+// ids. Prefilling them turns "paste this" into a one-keystroke mass close of
+// text-matched cards with nothing read; an agent has to name each pair it
+// actually verified. Lives here (not inline in the worker) so the placeholder
+// contract is test-locked rather than a convention.
+export const releaseReconcileConfirmTemplate = (ref) => ({
+    tool: 'brain_reconcile',
+    args: { mode: 'release', ref: String(ref || ''), confirm: [{ id: '<openId>', sha: '<sha>' }] },
+});
+// The one sentence a release-lease holder reads. Three honest shapes: found /
+// found nothing / could not look.
+export function releaseReconcileNotice({ ref, sinceRef = '', candidates = [], skipped = false } = {}) {
+    if (skipped) return `KLYPIX release reconcile skipped: git history for ${ref} could not be read.`;
+    // A young repo has no baseline to name (no release tag, no ship signal —
+    // the FIRST release), and "since ." reads like a bug. The wording is
+    // byte-identical whenever a baseline exists (RR7 locks it verbatim).
+    if (!candidates.length) return `KLYPIX release reconcile: no open cards look fulfilled by commits in ${ref}${sinceRef ? ` since ${sinceRef}` : ''}.`;
+    const confirmable = candidates.filter(c => c && c.confirmable).length;
+    return `KLYPIX release reconcile: ${candidates.length} open card(s) look fulfilled by commits already in ${ref} (${confirmable} confirmable)`
+        + ` — verify each, then confirm with brain_reconcile mode:"release" ref:"${ref}" confirm:[{ id, sha }] (or dismiss:[…]). Nothing was changed.`;
 }
 
 // ── Deliberate note → capture input ──────────────────────────────────────────
