@@ -239,20 +239,266 @@ export async function atomicWrite(filePath, buf, opts = {}) {
 const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
 const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 
+// ── Marker suffix grammar ─── MIRROR BEGIN ──────────────────────────────────
+// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` suffixes on
+// a `🧠 BRAIN` marker line. This block is byte-identical in
+// global-brain-hook.mjs (which parses markers) and klypix-format.mjs (whose
+// parseVerifySuffix reads a `verify:` still sitting in card prose), and
+// test/marker-suffix-grammar.mjs fails if the two copies drift. Neither file
+// may import the other: the hook's --live lane must never pay the format
+// import, and klypix-format.mjs is copied alone beside the git merge driver.
+//
+// 1.86.0 split a body at the FIRST whitespace + "Q:"/"q:" in any case, so
+// "Support page gets a Q: and A: layout" became the card "Support page gets
+// a", and a `~` cut the same way replaced a rich card with the stub. The older
+// keys had the same hazard ("see the ev: numbers", "every agent verify: the
+// tag", "treats closes: links as ..."). A suffix is now recognised only where
+// it cannot be prose:
+//   • keys are lowercase and written `key: value`, with whitespace before the
+//     key and after the colon, so "Q:", "FAQ:", "q:auth" and `npm run
+//     verify:mcp` are ordinary text. Two unambiguous exceptions: no space is
+//     needed before a [[wikilink]] or an ev: reference ("closes:[[X]]",
+//     "ev:src/a.ts"), and `Closes:` is accepted before a [[wikilink]];
+//   • suffixes form ONE run that reaches the end of the line, and the run
+//     cannot start right after a word that leaves a clause open ("the ev:",
+//     "a q:", "we verify:", "Always verify:", "Rule: verify:"). A single
+//     capital letter and "May" are not open words, so "option A closes:" and
+//     "ships in May closes:" end a clause. Particles and copulas ("stays on",
+//     "as is") block every run except one that opens with a well-formed ev:
+//     reference list;
+//   • every value must have its key's shape: `ev:` a comma list (`,` or `،`)
+//     of file / PR / run references; `verify:` a command (a known CLI, a
+//     script or path, a hyphenated probe name, or a tool given a --flag) with
+//     no prose connectives outside quotes; `q:` a question (a question word,
+//     or a preposition + which/what, first; `?` or `؟` last); `closes:` any
+//     title — capture puts a `closes:` that names no live card back into the
+//     card text;
+//   • a dangling key at the very end ("shipped X ev:") is dropped; a repeated
+//     ev: joins its references.
+// A run whose FIRST segment breaks a rule is not a suffix run: parsing moves on
+// to the next key, and when none qualifies the whole line stays the card body,
+// untouched. Once a run has a well-formed ev: / verify: / q: segment it IS a
+// suffix run, so a later malformed segment goes back into the card text
+// (`kept`) and the well-formed ones still count — one bad value never cancels
+// the rest. A `closes:` alone never proves a run (its value is free text),
+// unless its whole value is one [[wikilink]].
+// `closesAnchored` says the closes: is unmistakably a suffix, judged ONLY by
+// what comes before it or by its own value: it follows a clause boundary,
+// follows another well-formed suffix, or is exactly one [[wikilink]]. A
+// well-formed ev: AFTER a prose "closes:" proves nothing about the closes:
+// ("The resolver now treats closes: targets as exact titles ev: src/x.mjs"
+// is still prose), and capture only lets an UNanchored one close a card it
+// names by title.
+const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
+const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}|Closes):`, 'g');
+const MARKER_SUFFIX_OPEN_WORDS = new Set([
+    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each', 'any', 'some', 'no', 'not',
+    'of', 'to', 'than', 'via', 'per',
+    'and', 'or', 'nor', 'but', 'if', 'whether', 'because', 'so', 'then', 'when', 'while', 'where', 'which', 'who',
+    'I', 'we', 'they', 'he', 'she',
+    'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must',
+    'always', 'never', 'also', 'just', 'please',
+    'في', 'من', 'على', 'إلى', 'الى', 'عن', 'مع', 'أو', 'او', 'ثم', 'هذا', 'هذه', 'ذلك', 'تلك', 'كل',
+]);
+const MARKER_SUFFIX_SOFT_WORDS = new Set([
+    'in', 'on', 'at', 'for', 'with', 'by', 'from', 'into', 'onto', 'about', 'like', 'as', 'off', 'up', 'out', 'over',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'it', 'you', 'one',
+]);
+const MARKER_SUFFIX_CLI = new Set([
+    'gh', 'git', 'npm', 'npx', 'node', 'pnpm', 'yarn', 'bun', 'deno', 'corepack', 'curl', 'wget', 'pwsh', 'powershell',
+    'cmd', 'bash', 'sh', 'zsh', 'python', 'python3', 'py', 'pip', 'pip3', 'uv', 'cargo', 'go', 'make', 'docker',
+    'kubectl', 'helm', 'az', 'aws', 'gcloud', 'vercel', 'netlify', 'supabase', 'firebase', 'dotnet', 'mvn', 'gradle',
+    'swift', 'xcodebuild', 'xcrun', 'fastlane', 'jq', 'rg', 'grep', 'cat', 'ls', 'cd', 'echo', 'tsc', 'vitest',
+    'jest', 'eslint', 'psql', 'sqlite3', 'ssh', 'openssl', 'wsl',
+]);
+// Connectives a command line never needs outside a quoted argument: a verify:
+// value carrying one is a sentence ("npm view x version matches the tag").
+const MARKER_SUFFIX_PROSE = new Set([
+    'the', 'before', 'after', 'when', 'whenever', 'while', 'as', 'matches', 'then', 'that', 'which', 'because',
+    'should', 'must', 'is', 'are', 'was', 'were', 'until', 'unless', 'instead',
+]);
+const MARKER_SUFFIX_QUESTION_LEAD = /^(?:(?:how|what|why|where|when|which|who|whom|whose|whether|can|could|should|would|will|shall|may|might|must|do|does|did|is|are|was|were|has|have|had|am)(?:n['’]t)?|won['’]t|(?:on|in|at|for|to|from|by|with|into|onto|of|about|under|after|before)\s+(?:which|what|whom|whose)|هل|ما|ماذا|لماذا|لما|كيف|أين|اين|متى|من|كم|أي|أية|لم|ماهي|ماهو|وين|ليش|ليه|شو|إيش|ايش|أيش|مين|منين|إمتى|امتى|إزاي|ازاي)(?![\p{L}\p{N}])/iu;
+// Direction marks and Arabic vowel marks are invisible, so they never decide
+// a shape: a question that ends in ؟ followed by a right-to-left mark, or one
+// written with vowel marks (كَيْفَ), is still a question.
+const MARKER_SUFFIX_INVISIBLE = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069\u064B-\u065F\u0670\u0640]/g;
+const MARKER_SUFFIX_DIRECTION = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069]/g;   // stripped from the stored q: too
+const MARKER_SUFFIX_BOUNDARY = /[.!?;)\]✓✅…—–؛؟]$/u;
+const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
+const MARKER_SUFFIX_WIKILINK = /^\[\[[^\][]+\]\][.,;!]?$/;
+// Case matters only where it disambiguates: a single capital letter ("option
+// A") and the month "May" end a clause; any other Titlecase word counts as its
+// lowercase form, so "Always verify:" is as open as "always verify:".
+function markerSuffixWordIn(set, word) {
+    if (set.has(word)) return true;
+    return /^\p{Lu}\p{Ll}+$/u.test(word) && word !== 'May' && set.has(word.toLowerCase());
+}
+function markerSuffixRefOk(item) {
+    const ref = item.trim();
+    if (!ref) return false;
+    if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref)) return true;                  // PR#12 · PR 12 · GH3 · #12
+    const words = ref.split(/\s+/);
+    if (words.length > 4) return false;
+    // "PR#12 to the line", "3 cards on the board": a reference is never a phrase.
+    if (words.some((w) => MARKER_SUFFIX_OPEN_WORDS.has(w.toLowerCase()) || MARKER_SUFFIX_SOFT_WORDS.has(w.toLowerCase()))) return false;
+    return words.some((word) => {
+        const w = word.replace(/^[`'"([]+|[`'")\].,;]+$/g, '');
+        return /[\/\\\d]/.test(w) || /\.[A-Za-z0-9]/.test(w) || MARKER_SUFFIX_BARE_FILES.test(w);
+    });
+}
+function markerSuffixCommandOk(value) {
+    const head = value.split(/\s+/)[0].replace(/^[`'"(]+|[`'")]+$/g, '');
+    if (!head) return false;
+    const unquoted = value.replace(/`[^`]*`|"[^"]*"|'[^']*'/g, ' ');
+    if (unquoted.split(/\s+/).slice(1).some((w) => MARKER_SUFFIX_PROSE.has(w.toLowerCase()))) return false;
+    if (MARKER_SUFFIX_CLI.has(head.toLowerCase()) || /^klypix-[a-z-]+$/.test(head)) return true;
+    if (/^[A-Z][a-z]+-[A-Z][A-Za-z]+$/.test(head)) return true;                 // PowerShell Verb-Noun
+    if (/[\/\\]|^[.~$]/.test(head) || /\.(?:mjs|cjs|js|ts|ps1|sh|py|cmd|bat|exe)$/i.test(head)) return true;
+    if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(head)) return true;             // probe name: npm-version, gh-release
+    return /^[a-z][\w.-]*$/.test(head) && /\s--?[A-Za-z]/.test(value);         // any tool given a --flag
+}
+function markerSuffixValueOk(key, value) {
+    if (!value) return false;
+    if (key === 'closes') return true;
+    if (key === 'ev') {
+        const items = value.split(/[,،]/).filter((item) => item.trim());
+        return items.length > 0 && items.every(markerSuffixRefOk);
+    }
+    if (key === 'verify') return markerSuffixCommandOk(value);
+    const question = value.replace(MARKER_SUFFIX_INVISIBLE, '').replace(/^[`'"“‘(]+/, '').trim();
+    return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
+}
+// → { body, closes, ev, verify, q, kept, closesAnchored, bodyWithCloses }.
+// Strings are '' when absent. `body` is the card text (with any `kept` segment
+// folded back in); `bodyWithCloses` is the same text with the closes: segment
+// left where it was written — what lands when the closes: acts on nothing.
+function parseMarkerSuffixText(line) {
+    const text = String(line || '');
+    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
+    const keys = [];
+    for (const m of text.matchAll(MARKER_SUFFIX_KEY_RE)) {
+        const from = m.index + m[0].length;
+        const rest = text.slice(from);
+        const wiki = /^\s*\[\[/.test(rest);
+        if (m[1] === 'Closes' && !wiki) continue;                                // "Closes:" only before a [[wikilink]]
+        const spaced = rest === '' || /^\s/.test(rest);
+        if (!spaced && !(wiki && /^closes$/i.test(m[1])) && !(m[1] === 'ev' && markerSuffixRefOk((/^[^\s,،]+/.exec(rest) || [''])[0]))) continue;
+        keys.push({ key: m[1].toLowerCase(), at: m.index, from });
+    }
+    const segEnd = (k) => (k + 1 < keys.length ? keys[k + 1].at : text.length);
+    const valueOf = (k) => text.slice(keys[k].from, segEnd(k)).trim();
+    for (let start = 0; start < keys.length; start++) {
+        const body = text.slice(0, keys[start].at).trim();
+        if (!body) continue;
+        const lastWord = /(\S+)$/.exec(body)[1];
+        if (lastWord.endsWith(':') || markerSuffixWordIn(MARKER_SUFFIX_OPEN_WORDS, lastWord)) continue;
+        if (markerSuffixWordIn(MARKER_SUFFIX_SOFT_WORDS, lastWord) && !(keys[start].key === 'ev' && markerSuffixValueOk('ev', valueOf(start)))) continue;
+        const found = { closes: '', ev: [], verify: '', q: '' };
+        let closesSegment = '', failAt = -1, anchored = false;
+        for (let k = start; k < keys.length; k++) {
+            const { key } = keys[k];
+            const value = valueOf(k);
+            if (!value && k === keys.length - 1) break;                          // a dangling key at the end is dropped
+            if (!markerSuffixValueOk(key, value) || (key !== 'ev' && found[key])) { failAt = k; break; }
+            if (key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(value)) anchored = true;
+            if (key === 'ev') found.ev.push(value);
+            else found[key] = value;
+            if (key === 'closes') closesSegment = text.slice(keys[k].at, segEnd(k)).trim();
+        }
+        if (failAt !== -1 && !anchored) continue;
+        const kept = failAt === -1 ? '' : text.slice(keys[failAt].at).trim();
+        const cardBody = kept ? `${body} ${kept}` : body;
+        return {
+            body: cardBody,
+            closes: found.closes,
+            ev: found.ev.join(', '),
+            verify: found.verify,
+            q: found.q.replace(MARKER_SUFFIX_DIRECTION, '').trim(),
+            kept,
+            closesAnchored: Boolean(found.closes) && (keys[start].key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(found.closes) || MARKER_SUFFIX_BOUNDARY.test(body)),
+            bodyWithCloses: closesSegment ? [body, closesSegment, kept].filter(Boolean).join(' ') : cardBody,
+        };
+    }
+    return none;
+}
+// ── Marker suffix grammar ─── MIRROR END ────────────────────────────────────
+
 // ── verify: suffix (decay-aware status, 2026-07-28 post-mortem) ──────────────
 // A card may carry the EXACT live-probe command for its fast-decay claim as a
-// `verify:` suffix ("🏁 build 26 uploaded verify: gh run list --limit 5"), the
-// same marker grammar as closes:/ev: (value runs to the next known key or end
-// of line). The hook strips+persists it as a machine field at capture; cards
-// authored by humans/the app/brain_note keep it in prose — so parseKlypix
-// falls back to a prose parse and every render surface sees ONE `verify` field.
-const VERIFY_SUFFIX_RE = /(?:^|\s)verify:\s*([^\n]+)/i;
+// `verify:` suffix ("🏁 build 26 uploaded verify: gh run list --limit 5"), in
+// the marker grammar above. The hook strips+persists it as a machine field at
+// capture; cards authored by humans/the app/brain_note keep it in prose — so
+// parseKlypix falls back to a prose parse and every render surface sees ONE
+// `verify` field. The prose parse is the SAME grammar, line by line: on the
+// live brain (2,736 cards) the old case-insensitive `verify:` scan derived a
+// probe from the prose of 12 cards and every one was wrong ("mcp gate" from
+// `npm run verify:mcp`, "command on demand, and …" from a sentence ABOUT the
+// verify: field); this grammar derives none.
+//
+// The grammar needs the WHOLE sentence (a suffix run reaches the end of it, and
+// a verify: followed by prose is not a command), but a stored card is
+// hard-wrapped (wrapText, ~37 chars), so reading line by line cut "…requires
+// agents verify: npm view klypix-mcp version matches the tag before
+// announcing" into the "command" `npm view klypix-mcp`. The logical lines are
+// rebuilt first: a break is SOFT when the next line's first word would not
+// have fitted (wrapText's own rule — a mid-word chunk of an over-long token
+// rejoins with no space), and a line that STARTS with a suffix key (a
+// `verify: <command>` written on its own line) is the tail of the line above.
+// Tag lines and lifecycle notes (✔ ✅ ↩ ⤵ "(re-affirmed" "(~ amended") always
+// start a line of their own.
+//
+// A card can also carry AUTHORED line breaks (brain_note text, the desktop
+// app), and one that happens to fall where wrapText would have broken is
+// indistinguishable by position (review 2026-09-18): "Gate probe verify: gh
+// run list -L 5" + "Owner release lane weekly" read as the command `gh run list
+// -L 5 Owner release lane weekly`. So when a probe runs across a word-boundary
+// join onto a line that opens like a new sentence (a plain Titlecase word), the
+// probe stops at that line — only when the shorter reading is itself a probe
+// the longer one extends. A joined reading the grammar REJECTS as prose stays
+// rejected: that is exactly the wrapped-sentence case this rebuild exists for.
 export function parseVerifySuffix(text) {
-    const m = VERIFY_SUFFIX_RE.exec(String(text || ''));
-    if (!m) return null;
-    const v = m[1].split(/\s+\b(?:closes|ev):/i)[0].trim();
-    return v || null;
+    const raw = String(text || '');
+    // The hot path: parseKlypix runs this for every text card on every parse,
+    // and almost none says "verify:" at all (review 2026-09-18: ~17x slower
+    // without this line on a 2,738-card brain).
+    if (!raw.includes('verify:')) return null;
+    const cpl = brainCPL();
+    const lines = raw.split('\n');
+    const logical = [];                                   // each: [{ text, glue, sentenceJoin }]
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const prevRaw = i > 0 ? lines[i - 1] : '';
+        const blockStart = /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(line.trim());
+        if (!logical.length || !prevRaw.trim() || !line.trim() || blockStart) { logical.push([{ text: line, glue: '' }]); continue; }
+        const firstWord = (/^\S*/.exec(line.trim()) || [''])[0];
+        const midWord = prevRaw.length === cpl && !/\s/.test(prevRaw.trim());
+        const soft = prevRaw.length <= cpl && line.length <= cpl && (midWord || prevRaw.length + 1 + firstWord.length > cpl);
+        const suffixTail = /^\s*(?:closes|ev|verify|q):/.test(line);
+        if (soft || suffixTail) {
+            const glue = midWord && !suffixTail ? '' : ' ';
+            logical[logical.length - 1].push({ text: line.trim(), glue, sentenceJoin: glue === ' ' && !suffixTail && /^\p{Lu}\p{Ll}+(?=[\s,.;:!?]|$)/u.test(line.trim()) });
+        } else logical.push([{ text: line, glue: '' }]);
+    }
+    const join = (segs) => segs.reduce((acc, seg, k) => (k ? `${acc.trimEnd()}${seg.glue}${seg.text}` : seg.text), '');
+    for (const segs of logical) {
+        const whole = join(segs);
+        if (!whole.includes('verify:')) continue;
+        const { verify } = parseMarkerSuffixText(whole);
+        if (!verify) continue;
+        // Stop at the first sentence-like join after the verify: key, when the
+        // shorter reading is a probe this one merely extends.
+        for (let k = 1; k < segs.length; k++) {
+            if (!segs[k].sentenceJoin) continue;
+            const before = join(segs.slice(0, k));
+            if (!before.includes('verify:')) continue;
+            const shorter = parseMarkerSuffixText(before).verify;
+            if (shorter && verify.startsWith(shorter) && verify !== shorter) return shorter;
+        }
+        return verify;
+    }
+    return null;
 }
+export { parseMarkerSuffixText };
 
 /**
  * Parse a .klypix/.any buffer into a structured object + the loaded zip (so
@@ -380,7 +626,10 @@ export async function parseKlypix(buffer) {
             // Live-probe command for a fast-decay status claim (decay-aware
             // status): machine field when captured via a verify: marker suffix,
             // else parsed from prose so non-hook-authored cards count too.
-            verify: (typeof it.verify === 'string' && it.verify.trim()) ? it.verify.trim()
+            // A present string field is authoritative, an EMPTY one included:
+            // '' is an explicit clear (a ~ with verify ''), and reading the
+            // prose then would undo it (1.86.1).
+            verify: typeof it.verify === 'string' ? (it.verify.trim() || null)
                 : (it.type === 'text' ? parseVerifySuffix(it.content) : null),
             // Guard trigger (guard cards, 2026-08-24) — additive machine field;
             // exposed so compileGuards can read it off the parsed struct.
@@ -2113,7 +2362,8 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
     const safeCut = (t, n) => { let s = t.slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + '…'; };
-    const head = (c, max = 150) => { const t = flat(c.text); return t.length > max ? safeCut(t, max - 1) : t; };
+    // A card's newest (~ amended …) line leads its preview (amendmentFirst).
+    const head = (c, max = 150) => { const t = flat(amendmentFirst(c.text)); return t.length > max ? safeCut(t, max - 1) : t; };
     const out = [];
     let used = 0;
     const push = (...ls) => { for (const l of ls) { out.push(l); used += l.length + 1; } };
@@ -2123,7 +2373,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const tail = [
         '',
         `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
-        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` / `q: <question this answers>` (full legend in the brief file).',
+        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · line-end suffixes `closes:` / `ev:` / `q: <question?>` (full legend in the brief file).',
     ];
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
@@ -3947,6 +4197,120 @@ export const CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bwas WRONG\b/;
 const CORRECTION_PHRASE_RE = /\bstale note (?:is )?resolved\b/i;
 export const hasCorrectionCue = (t) => CORRECTION_RE.test(String(t || '')) || CORRECTION_PHRASE_RE.test(String(t || ''));
 export const CORRECTION_SUPERSEDE_AT = 0.4;   // widened cross-area bar (vs same-area SUPERSEDE_AT 0.6)
+
+// NON-DESTRUCTIVE CONFIRM GUARD (2026-07-23) for ~ updates: content replacement
+// is wholesale, so a terse "~ still true" against a rich card used to truncate
+// it to the confirmation text — the system had no non-destructive verify verb
+// at all. The guard is OPT-IN by shape: only an update that READS as a
+// confirmation ("still true", "confirmed", "verified", "unchanged", "holds") is
+// appended as a re-affirmed line; anything else — including same-vocabulary
+// inversions, terse lowercase corrections, and negations, none of which
+// token-set/length heuristics can see (adversarial review live-traced all
+// three) — REPLACES, the documented ~ semantics where the new text wins. Digits
+// or contrast/negation words disqualify ("still true but port now 9223" is a
+// correction). No ✅/↩/⤵ glyphs in the stamp — those would drop the card out of
+// liveTextCards matching forever.
+const CONFIRM_CUE_RE = /^\s*(?:\(|")?\s*(?:still\b|confirmed?\b|verified\b|unchanged\b|re-?affirmed?\b|holds\b|remains true\b)/i;
+const CONFIRM_DISQUALIFIER_RE = /\d|\b(?:not|no|never|but|instead|now|except|however|wrong|longer|actually)\b/i;
+const isTerseConfirmUpdate = (text, targetLength) => CONFIRM_CUE_RE.test(String(text || ''))
+    && !CONFIRM_DISQUALIFIER_RE.test(String(text || ''))
+    && String(text || '').length < targetLength * 0.6
+    && !hasCorrectionCue(text);
+
+// UPDATE FLOOR (1.86.1). A ~ that REPLACES its card must carry at least
+// UPDATE_MIN_WORDS distinct content words (4+ letters, the tokenSet unit) OR at
+// least half as many as the card it replaces. Both halves matter — the absolute
+// bar alone would refuse a four-word correction of a four-word card ("Dev
+// server runs on port 5174 now"), the ratio alone would let a stub replace a
+// card twice its size.
+//
+// A thinner ~ is neither dropped nor turned into a card of its own: it is
+// APPENDED to the card it matched as a dated `(~ amended <date>: …)` line. The
+// short correction is exactly what ~ is for, and it has to land on the card it
+// corrects — a price change ("$5 monthly" vs "$4 monthly") shares every content
+// word with its card, so a separate card was dropped as a near-duplicate of the
+// stale one, and a separate "now run from main" card sat live beside the card it
+// contradicts. Appending keeps both halves of the promise: the richer card is
+// never replaced by a stub, and the correction is on the card.
+export const UPDATE_MIN_WORDS = 6;
+// The words a card's CONTENT carries: tag-only lines (#area #file-x) are
+// routing, not content, and would pad the target's count.
+const updateTargetTokens = (text) => tokenSet(String(text || '').split('\n')
+    .filter((line) => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line)).join('\n'));
+export const isThinUpdate = (words, targetWords) => words < UPDATE_MIN_WORDS && words * 2 < targetWords;
+// Does a card's text already say this, word for word? Case-insensitive, on word
+// boundaries ("port 51" is not in "port 5173").
+//
+// A card is stored hard-wrapped (wrapText, ~37 chars a line), and ONE
+// amendment line can carry both kinds of break wrapText makes: a space that
+// became a line break, and a token longer than a line split MID-WORD with
+// nothing inserted ("… now set in electron/config/devServerPortSett\nings.ts").
+// The first cut of this check read the card with every break as a space OR
+// every break as nothing, and neither rebuilds text that mixes the two — so a
+// thin ~ naming a long path, URL or 40-char SHA was never recognised as
+// already said, and re-appended itself at every Stop (review 2026-09-18, the
+// same unbounded stacking as the 85-line ✔ partial incident). The body is now
+// matched as a pattern instead: a space matches any run of whitespace, and
+// between two adjacent non-space characters an optional line break — the only
+// thing a mid-word wrap inserts. A match that starts or ends at a mid-word
+// break is not on a word boundary (a body that is only the head or tail of a
+// long token is not "said").
+const sayNorm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const SAY_REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+function isMidWordBreak(raw, nl) {
+    if (raw[nl] !== '\n') return false;
+    const start = raw.lastIndexOf('\n', nl - 1) + 1;
+    const line = raw.slice(start, nl);
+    return line.length === brainCPL() && !/\s/.test(line) && /\S/.test(raw[nl + 1] || '');
+}
+export function cardAlreadySays(cardText, body) {
+    const want = sayNorm(body);
+    if (!want) return false;
+    const raw = String(cardText || '');
+    const chars = [...want];
+    let src = '';
+    for (let i = 0; i < chars.length; i++) {
+        if (chars[i] === ' ') { src += '\\s+'; continue; }
+        src += chars[i].replace(SAY_REGEX_SPECIAL, '\\$&');
+        if (i + 1 < chars.length && chars[i + 1] !== ' ') src += '\\n?';
+    }
+    let re;
+    try { re = new RegExp(`(?<![\\p{L}\\p{N}])${src}(?![\\p{L}\\p{N}])`, 'giu'); } catch { return false; }
+    for (let m = re.exec(raw); m; m = re.exec(raw)) {
+        const end = m.index + m[0].length;
+        if (!(m.index > 0 && isMidWordBreak(raw, m.index - 1)) && !isMidWordBreak(raw, end)) return true;
+        re.lastIndex = m.index + 1;
+    }
+    return false;
+}
+// A thin ~ is appended UNDER the claim it corrects (the claim is never replaced
+// by a stub), so a one-line preview that shows only a card's head showed the
+// stale claim alone — prompt-time recall prints ~120 characters, and "Dev
+// server port changed to 5174 now" on a 190-character card never appeared
+// there (review 2026-09-18). Previews render the NEWEST amendment first; the
+// stored card is untouched (its title still names the claim, which is what
+// closes: and ✓ match against). The run is rejoined across its wrap (a
+// mid-word chunk with no space) and ends at the next line that starts a block
+// of its own.
+export function amendmentFirst(text) {
+    const raw = String(text || '');
+    if (!raw.includes('(~ amended ')) return raw;
+    const lines = raw.split('\n');
+    const isRunStart = (l) => /^\(~ amended \d{4}-\d{2}-\d{2}:/.test(l.trim());
+    const isBlockStart = (l) => /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(l.trim());
+    let start = -1;
+    for (let i = lines.length - 1; i >= 0; i--) if (isRunStart(lines[i])) { start = i; break; }
+    if (start <= 0) return raw;
+    let end = start;
+    while (end + 1 < lines.length && lines[end + 1].trim() && !isBlockStart(lines[end + 1])) end++;
+    const cpl = brainCPL();
+    let run = lines[start].trim();
+    for (let i = start + 1; i <= end; i++) {
+        const prev = lines[i - 1];
+        run += (prev.length === cpl && !/\s/.test(prev.trim()) ? '' : ' ') + lines[i].trim();
+    }
+    return [run, ...lines.slice(0, start), ...lines.slice(end + 1)].join('\n');
+}
 // Cue META words describe the act of correcting, not the subject — left in, they
 // dilute the overlap denominator and push real correction pairs just under the
 // bar (the field fixture lands at 0.375 with them, 0.5 without). Stripped before
@@ -4518,7 +4882,10 @@ export function looksLikeTrap(text) {
 //     So the identity is the note BODY, date and tail excluded.
 export const PARTIAL_NOTE_PREFIX = '✔ partial ';
 const PARTIAL_NOTE_TAIL = ' — still open:';
-const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed)/u;
+// A ~ amendment line (1.86.1) also starts its own line and ends a note run —
+// without it an amendment after a ✔ partial note was read as part of that
+// note, its key changed, and the partial note re-stacked on the next ✓.
+const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed|\(~ amended)/u;
 export function partialNoteKey(s) {
     return String(s || '')
         .replace(/\s+/g, ' ')
@@ -4931,7 +5298,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // corrections that don't deserve supersession history. Content is
         // replaced (area prefix + tag preserved), createdAt bumped so the
         // brief treats it as fresh. No match → falls through as a new card.
-        for (const u of updates) {
+        // Too thin to stand in for the card it matched (UPDATE FLOOR below) →
+        // the card is kept whole and the text is appended to it as a dated
+        // `(~ amended …)` line; nothing separate is ever minted for it.
+        for (const [uIndex, u] of updates.entries()) {
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
@@ -4939,29 +5309,87 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 const s = overlapScore(uTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
-            if (best && bestScore >= UPDATE_AT) {
+            const matched = best && bestScore >= UPDATE_AT;
+            const isTerseConfirm = matched && isTerseConfirmUpdate(u.text, String(best.text || '').length);
+            // UPDATE FLOOR (1.86.1): the replace is wholesale and leaves no ↩
+            // trace and no Archive copy, so a handful of words must never stand
+            // in for a richer card. The field case: 1.86.0 cut the marker
+            // "~: Pricing page layout switches to Q: and A: FAQ blocks …" at
+            // "Q:", and the four-word stub (overlap 0.75) replaced a
+            // thirteen-word card. A terse confirmation appends, never replaces,
+            // so it is exempt; so is a guard amendment — structured intent,
+            // where a refused disarm would leave a live guard firing.
+            //
+            // A thin ~ is APPENDED to its card as a dated amendment line — the
+            // correction lands where it belongs and nothing is destroyed. It
+            // is a no-op when the card already says it word for word: that is
+            // the same marker re-harvested at the next Stop (a ~ bypasses the
+            // hook's dedup), or a stub whose full correction already replaced
+            // the card — neither is news, and re-reporting it every Stop was
+            // noise. Never a separate card: one would attract the next ~ that
+            // tried to correct the original (review-traced), or be dropped as
+            // a near-duplicate of the stale card it contradicts.
+            if (matched && !isTerseConfirm && !(u.guard && typeof u.guard === 'object')) {
+                const targetWords = updateTargetTokens(best.text).size;
+                if (isThinUpdate(uTok.size, targetWords)) {
+                    const body = stripLifecycleGlyphs(u.text);
+                    const report = {
+                        i: uIndex, id: best.id, area: best.area || null,
+                        target: String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+                        text: body.slice(0, 100), words: uTok.size, targetWords,
+                    };
+                    if (!body || cardAlreadySays(best.text, body)) {
+                        // Nothing new to say — but an explicit clear (brain_note
+                        // `verify: ""` / `evidence: []`) is still a deliberate act
+                        // on the card's metadata, and is honoured.
+                        const clearVerify = typeof u.verify === 'string' && !u.verify.trim();
+                        const clearEvidence = Array.isArray(u.evidence) && !u.evidence.length;
+                        if (clearVerify || clearEvidence) await rewriteCard(best.id, j => { if (clearVerify) j.verify = ''; if (clearEvidence) delete j.evidence; });
+                        (stats.updateUnchanged ||= []).push({ ...report, reason: 'already-says' });
+                        continue;
+                    }
+                    const line = `(~ amended ${today}: ${body})`;
+                    await rewriteCard(best.id, j => {
+                        j.content = `${j.content}\n${line}`;
+                        // An amendment ADDS a line under a claim it does not
+                        // replace, so everything that describes THAT claim stays
+                        // as it was (review 2026-09-18): createdAt (re-dating it
+                        // made the stale head claim read as fresh — the amendment
+                        // line carries its own date), the border colour (a ❓ or
+                        // 🏁 card is not turned into a decision), createdVia,
+                        // and the card's own verify probe — only a card with no
+                        // probe takes the amendment's. An explicit empty verify
+                        // is a deliberate clear and is persisted as one.
+                        if (typeof u.verify === 'string') {
+                            if (!u.verify.trim()) j.verify = '';
+                            else if (!(typeof j.verify === 'string' && j.verify.trim())) j.verify = u.verify.trim();
+                        }
+                        // Its evidence joins the card's, the amendment's refs FIRST
+                        // (a fresher stamp wins on the same ref) so the 16-ref cap
+                        // never drops the very refs the amendment brought; what the
+                        // cap does drop is reported. An explicit empty list still
+                        // clears, as on the replace path.
+                        if (Array.isArray(u.evidence)) {
+                            if (!u.evidence.length) delete j.evidence;
+                            else {
+                                const byRef = new Map();
+                                for (const ev of u.evidence) byRef.set(ev && ev.ref, ev);
+                                for (const ev of (Array.isArray(j.evidence) ? j.evidence : [])) if (!byRef.has(ev && ev.ref)) byRef.set(ev && ev.ref, ev);
+                                const all = [...byRef.values()];
+                                j.evidence = all.slice(0, 16);
+                                if (all.length > 16) report.evidenceDropped = all.length - 16;
+                            }
+                        }
+                    });
+                    best.text = `${best.text}\n${line}`;
+                    report.line = line;
+                    stats.updated++;
+                    (stats.updateAmended ||= []).push(report);
+                    continue;
+                }
+            }
+            if (matched) {
                 const tag = u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
-                // NON-DESTRUCTIVE CONFIRM GUARD (2026-07-23): content replacement
-                // is wholesale, so a terse "~ still true" against a rich card used
-                // to truncate it to the confirmation text — the system had no
-                // non-destructive verify verb at all. The guard is OPT-IN by
-                // shape: only an update that READS as a confirmation ("still
-                // true", "confirmed", "verified", "unchanged", "holds") is
-                // appended as a re-affirmed line; anything else — including
-                // same-vocabulary inversions, terse lowercase corrections, and
-                // negations, none of which token-set/length heuristics can see
-                // (adversarial review live-traced all three) — REPLACES, the
-                // documented ~ semantics where the new text wins. Digits or
-                // contrast/negation words disqualify ("still true but port now
-                // 9223" is a correction). No ✅/↩/⤵ glyphs in the stamp — those
-                // would drop the card out of liveTextCards matching forever.
-                const bestLen = String(best.text || '').length;
-                const CONFIRM_CUE_RE = /^\s*(?:\(|")?\s*(?:still\b|confirmed?\b|verified\b|unchanged\b|re-?affirmed?\b|holds\b|remains true\b)/i;
-                const CONFIRM_DISQUALIFIER_RE = /\d|\b(?:not|no|never|but|instead|now|except|however|wrong|longer|actually)\b/i;
-                const isTerseConfirm = CONFIRM_CUE_RE.test(String(u.text || ''))
-                    && !CONFIRM_DISQUALIFIER_RE.test(String(u.text || ''))
-                    && String(u.text || '').length < bestLen * 0.6
-                    && !hasCorrectionCue(u.text);
                 await rewriteCard(best.id, j => {
                     if (isTerseConfirm) j.content = `${j.content}\n(re-affirmed ${today}: ${u.text})`;
                     else j.content = (u.area ? `${u.area}: ` : '') + u.text + tag;
@@ -4969,8 +5397,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
                     // Omission preserves metadata; explicit empties clear stale anchors.
+                    // A cleared verify is PERSISTED as '' (1.86.1): deleting the
+                    // field let the reader derive a probe from the card's prose
+                    // again, so an explicit clear could silently come back.
                     if (Array.isArray(u.evidence)) { if (u.evidence.length) j.evidence = u.evidence; else delete j.evidence; }
-                    if (typeof u.verify === 'string') { if (u.verify.trim()) j.verify = u.verify.trim(); else delete j.verify; }
+                    if (typeof u.verify === 'string') j.verify = u.verify.trim();
                     // guard: replace, DISARM ({remove:true} deletes the machine
                     // field — the only authorable off-switch), or preserve.
                     if (u.guard && typeof u.guard === 'object') {
@@ -4995,6 +5426,251 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
         }
+        // Report only amendments that are still ON their card after the whole
+        // batch: a thin ~ appended and then replaced by a full ~ for the same
+        // card in the same batch left no amendment behind, and the model was
+        // told "appended, not replaced" about a line that no longer existed
+        // (review 2026-09-18).
+        if (stats.updateAmended) {
+            const textById = new Map(struct.cards.map(c => [c.id, String(c.text || '')]));
+            stats.updateAmended = stats.updateAmended.filter(f => (textById.get(f.id) || '').includes(f.line));
+            if (!stats.updateAmended.length) delete stats.updateAmended;
+        }
+
+        // STUB REPAIR (1.86.1). 1.86.0 cut every marker at the first whitespace
+        // + "closes:"/"ev:"/"verify:"/"q:" in any case (1.85 the same without
+        // q:), so a session that ran 1.86.0 before the upgrade may already have
+        // landed "Support page gets a" for "Support page gets a Q: and A: layout
+        // …". The hook recognises that marker by the dedup key the old cut
+        // wrote and hands the full card here with `repairStub` = the old cut
+        // text. The stub is rewritten IN PLACE with the full text — never a
+        // second card beside it (review 2026-09-18: 5 of 6 such markers were
+        // re-captured as siblings). When no live card is exactly that stub any
+        // more (archived, superseded, edited since), nothing lands: the marker
+        // was captured once, and a re-add would undo whatever happened to it.
+        // Glyphs, the `Area:` prefix, tag lines and wrapping are ignored in the
+        // comparison (1.86.0 classified the cut, not the full text).
+        const stubCore = (text, area) => {
+            let t = String(text || '').split('\n').filter(l => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l)).join(' ').replace(/\s+/g, ' ').trim();
+            if (area && t.toLowerCase().startsWith(`${String(area).toLowerCase()}:`)) t = t.slice(String(area).length + 1);
+            return stripLifecycleGlyphs(t).replace(/\s+/g, '').toLowerCase();
+        };
+        for (let i = cards.length - 1; i >= 0; i--) {
+            const card = cards[i];
+            if (!card || typeof card.repairStub !== 'string') continue;
+            cards.splice(i, 1);
+            const want = stubCore(card.repairStub, card.area);
+            const stub = want && liveTextCards().find(c => (!card.area || sameAreaKey(c.area, card.area)) && stubCore(c.text, card.area) === want);
+            if (!stub) { (stats.stubRepairMissing ||= []).push({ area: card.area || null, stub: String(card.repairStub).slice(0, 90) }); continue; }
+            // 1.86.0 read an ev: / verify: out of the very prose it cut ("see
+            // the ev: numbers in the report" → a junk ref), so a stub's value
+            // that is part of THIS marker's text is dropped; the full parse is
+            // the authority on what the marker's suffixes were. Anything else
+            // on the card (a ref no part of this text names) is kept.
+            const fullText = String(card.text).replace(/\s+/g, ' ').toLowerCase();
+            const fromThisProse = (v) => { const t = String(v || '').replace(/\s+/g, ' ').trim().toLowerCase(); return Boolean(t) && fullText.includes(t); };
+            await rewriteCard(stub.id, j => {
+                j.content = String(card.text);
+                if (card.borderColor) j.borderColor = card.borderColor;
+                const byRef = new Map();
+                for (const ev of (Array.isArray(card.evidence) ? card.evidence : [])) byRef.set(ev && ev.ref, ev);
+                for (const ev of (Array.isArray(j.evidence) ? j.evidence : [])) if (!fromThisProse(ev && ev.ref) && !byRef.has(ev && ev.ref)) byRef.set(ev && ev.ref, ev);
+                if (byRef.size) j.evidence = [...byRef.values()].slice(0, 16); else delete j.evidence;
+                if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
+                else if (typeof j.verify === 'string' && fromThisProse(j.verify)) delete j.verify;
+            });
+            (stats.stubRepairs ||= []).push({ id: stub.id, area: stub.area || null, from: String(card.repairStub).slice(0, 90), to: String(card.text).replace(/\s+/g, ' ').trim().slice(0, 120) });
+            stub.text = String(card.text);
+            stats.repaired = (stats.repaired || 0) + 1;
+        }
+
+        // Which live cards a close-target names — shared by the unmatched-closes
+        // pass below and the CLOSE-LINK pass, so both judge a target the same
+        // way. Returns the tier the close would act on (> 4 = too generic).
+        // strict (1.86.1): the target came from marker PROSE with nothing to
+        // anchor it as a suffix (no clause boundary before `closes:`, not a
+        // lone [[wikilink]], no well-formed ev:/verify:/q: BEFORE it), so it
+        // may act only on a card it NAMES by title — "treats closes: as free
+        // text, so …" once archived two unrelated milestones by loose token
+        // coverage. Title-grade hits carry `title: true`.
+        const closeTierFor = (target, { strict = false } = {}) => {
+            // Both sides are normalized the SAME way (2026-09-15): strip the
+            // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
+            // then collapse. Card titles are derived from prose, so an
+            // unnormalized comparison was really comparing "canvas ux:" against
+            // a full sentence.
+            const wantTitle = closeTargetKey(target);
+            const tTok = tokenSet(target);
+            // …but naming the area must still DISAMBIGUATE (2026-09-16 review).
+            // Stripping the prefix from BOTH sides meant `Collab: permanent
+            // share-link` stopped being distinguishable from the same-titled
+            // card in `canvas-share`: 10 stripped titles on the live brain are
+            // shared across different areas, one across five, and at ≤4 matches
+            // the close swept them all — over-matching, the loss direction. So
+            // the target's own prefix is kept as a CONSTRAINT on the title-grade
+            // paths, and ONLY when it names an area that actually exists, so an
+            // ordinary prose colon ("fix: the thing") constrains nothing. A card
+            // it excludes still reaches the token-coverage path below.
+            const wantAreaRaw = (/^\s*(?:\[\[)?\s*([^:\n]{1,40}):\s*/.exec(target) || [])[1] || '';
+            const wantArea = knownAreaKeys().has(normTitleKey(wantAreaRaw)) ? wantAreaRaw : '';
+            // Collect EVERY live card the close-target covers — near-duplicate ❓
+            // twins score together, and the old first-match-and-break resolved one
+            // while its twin stayed "open" in every brief forever. Capped for
+            // safety: a close-target is deliberate, so >4 matches means it was too
+            // generic to trust at all.
+            const matches = [];
+            for (const c of liveTextCards()) {
+                // The STRIPPED card title. The ≥10 floor on the prefix paths is
+                // the fix for the worst close-link failure mode: many titles are
+                // the bare area stub ("Canvas UX:"), which strips to a handful of
+                // characters, and `wantTitle.startsWith(core)` then matched every
+                // one of them. Simulated against the real brain, the target
+                // "Brain: The 🏁-doesn't-close-❓ gap" produced 21 live matches.
+                // Exact equality keeps the old ≥6 bar — naming a short title
+                // exactly is a deliberate act, a shared prefix is not.
+                const core = closeTargetKey(c.title);
+                const longEnough = core.length >= 10;
+                // A named area on the target constrains the TITLE-grade paths
+                // only (see wantArea above); coverage is left alone.
+                const areaOk = !wantArea || sameAreaKey(c.area, wantArea);
+                // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
+                // glyph-and-area-stripped title. Never the contains path (titles
+                // are derived from prose, so a skill that merely MENTIONS the
+                // target span mid-sentence would be swept — review-B's exact
+                // trap), and never token coverage (2026-08-01: naming is a
+                // deliberate human act; overlap is not).
+                if (/🛠/.test(c.text)) {
+                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length, title: true });
+                    else if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length), title: true });
+                    }
+                    continue;
+                }
+                // Title fast-path: exact (≥6 chars), prefix in either direction
+                // (≥6 target AND ≥10 stripped card title), or the card title
+                // CONTAINS the target — the contains variant needs a LONGER
+                // target (≥10) because a short generic word ("sandbox") appears
+                // in many unrelated titles.
+                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length, title: true }); continue; }
+                if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length), title: true }); continue;
+                }
+                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length, title: true }); continue; }
+                // Else target-coverage (≥2 tokens, no floor): a short deliberate
+                // close-target whose tokens are present in a card is a precise hit.
+                if (tTok.size >= 2) {
+                    const cov = coverageOf(tTok, tokenSet(c.text));
+                    if (cov >= CLOSE_COVER_AT) matches.push({ c, cov, overlap: Math.round(cov * tTok.size) });
+                }
+            }
+            // Ties break on the LONGER overlap and then on id — never on
+            // iteration order, which is what made the old `matches[0]` fallback
+            // archive an arbitrary card with cov 1.00 and no warning.
+            matches.sort((a, b) => (b.cov - a.cov) || ((b.overlap || 0) - (a.overlap || 0)) || String(a.c.id).localeCompare(String(b.c.id)));
+            // >4 matches means the target was too GENERIC to trust — and the old
+            // fallback of archiving `matches[0]` was silent loss, the one thing
+            // this engine may never do. REFUSE, keep the note as an ordinary
+            // card, and hand back the top candidates so the author can name a
+            // longer target or close by id.
+            //
+            // The cap applies to the TIER, not to the whole list (2026-09-16
+            // review). A title-grade hit is an unambiguous naming; coverage hits
+            // are a broad net around it, and counting them toward the cap made
+            // an exact title match refuse because the target's words happened to
+            // appear in five other cards. The documented example — `closes:
+            // v1.2.0 staged as a github draft` — matches 18 live cards on
+            // brain.klypix, exactly ONE of them title-grade (txt_kotyx0i2, rank
+            // 1): the pre-1.85 code archived that right card, this branch
+            // archived nothing. Simulated over all 1,890 live cards on
+            // brain.klypix using each card's own headline as the close target
+            // (tier cap only, no area constraint): refusals fall 45.2% → 13.2%
+            // and the intended card is the one closed in 1,569 of 1,890. A
+            // genuinely ambiguous target — review-G's 7-char 'sandbox', 6 hits,
+            // none exact — is still refused, which is what the cap is for.
+            // The tier is `cov === 1` — a title hit OR a card that carries every
+            // token of the target — deliberately NOT "title-grade only". The
+            // near-duplicate-twins guard depends on it: one ❓ twin usually
+            // matches by title and its paraphrase only by full coverage, and
+            // narrowing the tier to titles alone closed one twin and left the
+            // other open in every brief forever (caught by brain-quality P4a).
+            // A STRICT target acts only on the cards it NAMES by title — never
+            // on one that merely carries every word of it (review 2026-09-18:
+            // "The gardener pass closes: merge driver container dedup" named
+            // one card and archived two more that only contained those words).
+            // So the twin guard above is for an anchored close only: a prose
+            // close that names one ❓ by title leaves a paraphrased twin open,
+            // where it stays visible — under-closing, never the loss direction.
+            if (strict) return matches.filter(m => m.title);
+            // A target that names no LIVE card by title but does name a card
+            // that is already closed (archived, or stamped ✅ / ↩) is a close
+            // whose work is done — it must not fall through to word coverage
+            // and archive whatever unrelated live card happens to carry its
+            // words (review 2026-09-18, the corpus replay: "closes: PR #153
+            // needs founder Merge click." archived "🏁 Overlap story CLOSED
+            // 100%" because its named card was already in the Archive). The
+            // empty tier carries which card it named, for the receipt.
+            if (matches.length && !matches.some(m => m.title)) {
+                for (const c of struct.cards) {
+                    if (c.type === 'container' || !(c.text || '').trim()) continue;
+                    if (!/^archive$/i.test(c.area || '') && !/↩|✅/.test(c.text)) continue;
+                    const core = closeTargetKey(c.title);
+                    if (!core || wantTitle.length < 6) continue;
+                    const named = core === wantTitle
+                        || (core.length >= 10 && (core.startsWith(wantTitle) || wantTitle.startsWith(core)))
+                        || (core.length >= 10 && wantTitle.length >= 10 && core.includes(wantTitle));
+                    if (named) {
+                        const none = [];
+                        none.alreadyClosed = { id: c.id, title: String(c.title || '').replace(/\s+/g, ' ').trim().slice(0, 90) };
+                        return none;
+                    }
+                }
+            }
+            const exact = matches.filter(m => m.cov === 1);
+            const tier = exact.length ? exact : matches;
+            return tier;
+        };
+        // The receipt for a close that was too generic to trust (> 4 cards).
+        const closeRefusal = (target, tier) => ({
+            target: target.slice(0, 80),
+            total: tier.length,
+            candidates: tier.slice(0, 5).map(m => ({
+                id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
+                title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+            })),
+        });
+
+        // UNMATCHED CLOSES (1.86.1) — `closes:` is the one marker suffix whose
+        // value is free text, so no grammar can tell "shipped the uploader
+        // closes: Upload question" from "The resolver treats closes: links as
+        // exact title matches". The hook therefore hands over the card as
+        // written WITH its closes segment (closesFallbackText); when the target
+        // names no live card, that text is the card, so a prose "closes:" costs
+        // nothing and a mistyped target stays visible instead of vanishing. It
+        // runs before merge/supersede so the cut-down text never acts on
+        // anything. A structured `closes` (brain_note) carries no fallback.
+        //
+        // The decision is made ONCE, here: a close that will act (1–4 cards)
+        // keeps the cut text; anything else — nothing named, or too generic
+        // to trust (> 4) — lands the sentence as written and drops the closes,
+        // so CLOSE-LINK can never act on it later (supersede below may shrink
+        // the tier) and the truncated text never lands. A grammar-derived
+        // closes the grammar could not anchor is judged strictly (see
+        // closeTierFor), and CLOSE-LINK repeats that strictness.
+        for (const card of cards) {
+            if (!card || typeof card.closesFallbackText !== 'string') continue;
+            const fallback = card.closesFallbackText;
+            const strict = card.closesAnchored !== true;
+            delete card.closesFallbackText;
+            delete card.closesAnchored;
+            const target = (card.closes || '').toString().trim();
+            if (!target || !fallback.trim()) continue;
+            const tier = closeTierFor(target, { strict });
+            if (tier.length >= 1 && tier.length <= 4) { if (strict) card.__closeStrict = true; continue; }
+            card.text = fallback;
+            delete card.closes;
+            if (tier.length > 4) (stats.closeRefused ||= []).push(closeRefusal(target, tier));
+            else (stats.closesKept ||= []).push({ target: target.slice(0, 80), area: card.area || null, strict, ...(tier.alreadyClosed ? { alreadyClosed: tier.alreadyClosed } : {}) });
+        }
 
         // MERGE-ON-CAPTURE for duplicate open questions — a rephrased ❓ that
         // heavily overlaps an EXISTING live ❓ updates that card in place (fresh
@@ -5012,6 +5688,19 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 if (s > bestScore) { bestScore = s; best = c; }
             }
             if (best && bestScore >= QUESTION_MERGE_AT) {
+                // The merge REWRITES the open question wholesale, so the ~
+                // floor applies here too (1.86.1): a stub never replaces a
+                // richer question. A thin one the card already says word for
+                // word is a duplicate — counted as merged, the card untouched;
+                // any other thin one lands as its own card.
+                if (isThinUpdate(updateTargetTokens(card.text).size, updateTargetTokens(best.text).size)) {
+                    let asked = String(card.text).split('\n')
+                        .filter(line => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line)).join(' ').trim();
+                    if (card.area && asked.startsWith(`${card.area}:`)) asked = asked.slice(String(card.area).length + 1);
+                    asked = stripLifecycleGlyphs(asked);
+                    if (asked && cardAlreadySays(best.text, asked)) { cards.splice(i, 1); stats.merged++; }
+                    continue;
+                }
                 await rewriteCard(best.id, j => {
                     j.content = String(card.text);
                     j.createdAt = now;
@@ -5085,116 +5774,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         for (const card of cards) {
             const target = (card.closes || '').toString().trim();
             if (!target) continue;
-            // Both sides are normalized the SAME way (2026-09-15): strip the
-            // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
-            // then collapse. Card titles are derived from prose, so an
-            // unnormalized comparison was really comparing "canvas ux:" against
-            // a full sentence.
-            const wantTitle = closeTargetKey(target);
-            const tTok = tokenSet(target);
-            // …but naming the area must still DISAMBIGUATE (2026-09-16 review).
-            // Stripping the prefix from BOTH sides meant `Collab: permanent
-            // share-link` stopped being distinguishable from the same-titled
-            // card in `canvas-share`: 10 stripped titles on the live brain are
-            // shared across different areas, one across five, and at ≤4 matches
-            // the close swept them all — over-matching, the loss direction. So
-            // the target's own prefix is kept as a CONSTRAINT on the title-grade
-            // paths, and ONLY when it names an area that actually exists, so an
-            // ordinary prose colon ("fix: the thing") constrains nothing. A card
-            // it excludes still reaches the token-coverage path below.
-            const wantAreaRaw = (/^\s*(?:\[\[)?\s*([^:\n]{1,40}):\s*/.exec(target) || [])[1] || '';
-            const wantArea = knownAreaKeys().has(normTitleKey(wantAreaRaw)) ? wantAreaRaw : '';
-            // Collect EVERY live card the close-target covers — near-duplicate ❓
-            // twins score together, and the old first-match-and-break resolved one
-            // while its twin stayed "open" in every brief forever. Capped for
-            // safety: a close-target is deliberate, so >4 matches means it was too
-            // generic to trust at all.
-            const matches = [];
-            for (const c of liveTextCards()) {
-                // The STRIPPED card title. The ≥10 floor on the prefix paths is
-                // the fix for the worst close-link failure mode: many titles are
-                // the bare area stub ("Canvas UX:"), which strips to a handful of
-                // characters, and `wantTitle.startsWith(core)` then matched every
-                // one of them. Simulated against the real brain, the target
-                // "Brain: The 🏁-doesn't-close-❓ gap" produced 21 live matches.
-                // Exact equality keeps the old ≥6 bar — naming a short title
-                // exactly is a deliberate act, a shared prefix is not.
-                const core = closeTargetKey(c.title);
-                const longEnough = core.length >= 10;
-                // A named area on the target constrains the TITLE-grade paths
-                // only (see wantArea above); coverage is left alone.
-                const areaOk = !wantArea || sameAreaKey(c.area, wantArea);
-                // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
-                // glyph-and-area-stripped title. Never the contains path (titles
-                // are derived from prose, so a skill that merely MENTIONS the
-                // target span mid-sentence would be swept — review-B's exact
-                // trap), and never token coverage (2026-08-01: naming is a
-                // deliberate human act; overlap is not).
-                if (/🛠/.test(c.text)) {
-                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
-                    else if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
-                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) });
-                    }
-                    continue;
-                }
-                // Title fast-path: exact (≥6 chars), prefix in either direction
-                // (≥6 target AND ≥10 stripped card title), or the card title
-                // CONTAINS the target — the contains variant needs a LONGER
-                // target (≥10) because a short generic word ("sandbox") appears
-                // in many unrelated titles.
-                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
-                if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
-                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) }); continue;
-                }
-                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
-                // Else target-coverage (≥2 tokens, no floor): a short deliberate
-                // close-target whose tokens are present in a card is a precise hit.
-                if (tTok.size >= 2) {
-                    const cov = coverageOf(tTok, tokenSet(c.text));
-                    if (cov >= CLOSE_COVER_AT) matches.push({ c, cov, overlap: Math.round(cov * tTok.size) });
-                }
-            }
-            // Ties break on the LONGER overlap and then on id — never on
-            // iteration order, which is what made the old `matches[0]` fallback
-            // archive an arbitrary card with cov 1.00 and no warning.
-            matches.sort((a, b) => (b.cov - a.cov) || ((b.overlap || 0) - (a.overlap || 0)) || String(a.c.id).localeCompare(String(b.c.id)));
-            // >4 matches means the target was too GENERIC to trust — and the old
-            // fallback of archiving `matches[0]` was silent loss, the one thing
-            // this engine may never do. REFUSE, keep the note as an ordinary
-            // card, and hand back the top candidates so the author can name a
-            // longer target or close by id.
-            //
-            // The cap applies to the TIER, not to the whole list (2026-09-16
-            // review). A title-grade hit is an unambiguous naming; coverage hits
-            // are a broad net around it, and counting them toward the cap made
-            // an exact title match refuse because the target's words happened to
-            // appear in five other cards. The documented example — `closes:
-            // v1.2.0 staged as a github draft` — matches 18 live cards on
-            // brain.klypix, exactly ONE of them title-grade (txt_kotyx0i2, rank
-            // 1): the pre-1.85 code archived that right card, this branch
-            // archived nothing. Simulated over all 1,890 live cards on
-            // brain.klypix using each card's own headline as the close target
-            // (tier cap only, no area constraint): refusals fall 45.2% → 13.2%
-            // and the intended card is the one closed in 1,569 of 1,890. A
-            // genuinely ambiguous target — review-G's 7-char 'sandbox', 6 hits,
-            // none exact — is still refused, which is what the cap is for.
-            // The tier is `cov === 1` — a title hit OR a card that carries every
-            // token of the target — deliberately NOT "title-grade only". The
-            // near-duplicate-twins guard depends on it: one ❓ twin usually
-            // matches by title and its paraphrase only by full coverage, and
-            // narrowing the tier to titles alone closed one twin and left the
-            // other open in every brief forever (caught by brain-quality P4a).
-            const exact = matches.filter(m => m.cov === 1);
-            const tier = exact.length ? exact : matches;
+            const tier = closeTierFor(target, { strict: card.__closeStrict === true });
             if (tier.length > 4) {
-                (stats.closeRefused ||= []).push({
-                    target: target.slice(0, 80),
-                    total: tier.length,
-                    candidates: tier.slice(0, 5).map(m => ({
-                        id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
-                        title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
-                    })),
-                });
+                (stats.closeRefused ||= []).push(closeRefusal(target, tier));
                 continue;
             }
             const chosen = tier;
@@ -5202,6 +5784,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];
             for (const { c: best } of chosen) {
+                // Name what was archived — "N closed" alone gave the author no
+                // way to see that a close grabbed the wrong card.
+                const title = String(best.title || best.text || '').replace(/\s+/g, ' ').trim().slice(0, 90);
                 await rewriteCard(best.id, j => {
                     j.content = `${j.content}\n✅ ${today}: closed by → ${ship}`;
                     j.borderColor = 'rgba(16,185,129,0.35)';
@@ -5210,6 +5795,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 best.text = `✅ ${best.text}`;
                 card.__closesIds.push(best.id);
                 stats.closed++;
+                (stats.closedCards ||= []).push({ id: best.id, area: best.area || null, title, target: target.slice(0, 80) });
             }
         }
 
@@ -6207,6 +6793,38 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     // warning, which is silent loss; the refusal has to be visible instead.
     for (const f of (Array.isArray(s.closeRefused) ? s.closeRefused : []).slice(0, maxEach)) {
         lines.push(`⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card with brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]. Top candidates: ${f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''} cov ${c.cov}`).join(' · ')}`);
+    }
+    // Every card a closes: archived, by name — "N closed" alone gave the
+    // author no way to notice a close that grabbed the wrong card.
+    const closedCards = Array.isArray(s.closedCards) ? s.closedCards : [];
+    for (const f of closedCards.slice(0, maxEach)) {
+        lines.push(`✅ closes: "${f.target}" archived (id ${f.id}) "${f.title}"${f.area ? ` [${f.area}]` : ''}. If that is the wrong card, restore it from Archive.`);
+    }
+    // …and never a silent remainder: one close can archive up to four cards
+    // (review 2026-09-18: 4 closed, 3 named). The rest are named by id.
+    if (maxEach > 0 && closedCards.length > maxEach) {
+        const rest = closedCards.slice(maxEach);
+        lines.push(`✅ …and ${rest.length} more card${rest.length === 1 ? '' : 's'} archived by closes: ${rest.map(f => `(id ${f.id}) "${String(f.title).slice(0, 50)}"`).join(' · ')}. Restore any wrong one from Archive.`);
+    }
+    // A ~ too thin to stand in for the card it matched (1.86.1 update floor)
+    // was APPENDED to that card instead of replacing it — say so, and name the
+    // card, so the author knows the old claim still heads it.
+    for (const f of (Array.isArray(s.updateAmended) ? s.updateAmended : []).slice(0, maxEach)) {
+        const dropped = f.evidenceDropped ? ` The card already had 16 evidence refs, so its ${f.evidenceDropped} oldest were dropped to keep yours.` : '';
+        lines.push(`✎ ~ appended, not replaced: "${f.text}" has ${f.words} content word${f.words === 1 ? '' : 's'}, too few to replace (id ${f.id}) "${f.target}" (${f.targetWords}), so it was added to that card as a dated "(~ amended …)" line and the card's text was kept.${dropped} If it corrects the whole claim, send a ~ that restates the full corrected claim.`);
+    }
+    // A 1.86.0 stub restored to the full marker text, in place (stub repair).
+    for (const f of (Array.isArray(s.stubRepairs) ? s.stubRepairs : []).slice(0, maxEach)) {
+        lines.push(`🔧 repaired a note 1.86.0 cut short: (id ${f.id}) "${f.from}" now reads "${f.to}".`);
+    }
+    // A closes: target that names no live card closed nothing; the phrase went
+    // back into the note's text rather than vanishing.
+    for (const f of (Array.isArray(s.closesKept) ? s.closesKept : []).slice(0, maxEach)) {
+        if (f.alreadyClosed) {
+            lines.push(`↩ closes: "${f.target}" names a card that is already closed ((id ${f.alreadyClosed.id}) "${f.alreadyClosed.title}"), so nothing more was closed and the phrase stays in your note's text.`);
+            continue;
+        }
+        lines.push(`↩ closes: "${f.target}" ${f.strict ? 'names no live card by its title' : 'matched no live card'}, so nothing was closed and the phrase stays in your note's text. To close a card, end the sentence first and name its exact title or [[wikilink]].`);
     }
     return lines;
 }

@@ -24,6 +24,7 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 | `RESOLVE_AT` | 0.3 | `klypix-format.mjs` `captureIntoBrain` | ✓ resolve floor; 1.17 resolves the best match **± 0.1 near-ties** (cap 3), not just the first |
 | `CLOSE_COVER_AT` | 0.6 | `klypix-format.mjs` `captureIntoBrain` | `closes:` coverage; 1.17 resolves **ALL** matches ≥ bar (cap 4), was first-match-and-break |
 | `UPDATE_AT` | 0.45 | `klypix-format.mjs` `captureIntoBrain` | ~ update in-place match |
+| `UPDATE_MIN_WORDS` | 6 (and ≥ half the card's) | `klypix-format.mjs` `isThinUpdate` | **new 1.86.1** — a ~ that would REPLACE its card needs ≥6 distinct content words (tokenSet: 4+ letters) OR at least half the card's own. A thinner one is APPENDED to the matched card as a dated `(~ amended <date>: …)` line (`stats.updateAmended`), never a separate card; it is a no-op when the card already says it word for word (`cardAlreadySays`, `stats.updateUnchanged` — a re-harvest, or a stub whose full correction already landed). The same floor guards the ❓ merge (`QUESTION_MERGE_AT`). Terse confirmations (append) and guard amendments are exempt |
 | recall `topK=5 / minScore=3` | — | `global-brain-hook.mjs` `promptRetrieve` | per-prompt task-matched recall |
 | body-score length norm | `min(1, 6/log2(bodyWords+1))` | `klypix-format.mjs` `scoreCardsAgainstQuery` | **new 1.17** — body hits scale down for cards over ~64 distinct words; title/tag hits untouched |
 | repeat `topK=2 / minScore=5 / minTokens=2` | — | `klypix-format.mjs` `detectRepeatWork` | repeat-work nudge floors |
@@ -44,6 +45,65 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 
 Used in three places (deliberately the same): capture-side widened supersede,
 recall-side overlay (`correctionOverlaysFor`), and `detectContradictions`.
+
+## Marker suffix grammar (1.86.1)
+
+`parseMarkerSuffixText` — one block, byte-identical in `global-brain-hook.mjs` (marker
+capture) and `klypix-format.mjs` (`parseVerifySuffix`, the prose fallback for `verify`);
+`test/marker-suffix-grammar.mjs` fails if the copies drift.
+
+- Keys: `closes:` `ev:` `verify:` `q:` — lowercase only, whitespace before the key AND after
+  the colon. `Q:`, `FAQ:`, `q:auth`, `npm run verify:mcp` are text. Two exceptions with no
+  space after the colon: `closes:[[X]]` and `ev:src/a.ts`; `Closes:` counts before a
+  `[[wikilink]]`.
+- One run of suffixes that reaches the end of the line. The run may not start right after a
+  word that leaves the clause open: an article / determiner / conjunction / auxiliary / subject
+  pronoun / adverb like "always" (`the ev:`, `a q:`, `we verify:`, `Always verify:`), or a word
+  ending in `:` (`Rule: verify:`). A single capital letter and "May" do not count ("option A
+  closes:"). Particles and copulas (`on`, `in`, `as`, `is` …) block every run except one that
+  opens with a well-formed `ev:`.
+- Value shapes: `ev:` every item (`,` or `،`) is a PR shorthand or ≤4 words with a path, digit
+  or `.ext` and no prose word; `verify:` starts with a known CLI, a PowerShell Verb-Noun, a
+  path/script, a hyphenated probe name, or is a tool given a `--flag`, and carries no prose
+  connective (`the`, `before`, `matches` …) outside quotes; `q:` starts with a question word
+  or a preposition + which/what (English or Arabic, direction and vowel marks ignored) and ends
+  with `?` / `؟`; `closes:` any text. A repeated `ev:` joins its references; a dangling key at
+  the end is dropped.
+- A run whose FIRST segment breaks a rule is not a suffix run; the next key position is tried,
+  and with none left the whole line is the body. Once a well-formed `ev:` / `verify:` / `q:`
+  (or a `closes:` that is exactly one `[[wikilink]]`) proves the run, a later malformed segment
+  goes back into the body (`kept` → ledger `suffix-kept-as-text` + a receipt the next prompt
+  shows the model) and the well-formed ones still count.
+- `closesAnchored` is judged only by what comes BEFORE the `closes:` or by its own value: it
+  follows a clause boundary (`. ! ? ; ) ] ✓ …`), follows another well-formed suffix, or is
+  exactly one `[[wikilink]]`. A well-formed `ev:` AFTER a prose `closes:` anchors nothing.
+- On `✓` and `~` a `closes:` segment is plain text (they close nothing).
+- `closes:` is free text, so capture carries the card as written WITH the segment
+  (`closesFallbackText`). Before merge/supersede run, the close is decided once: 1–4 cards → it
+  acts; none → the written text lands (`stats.closesKept`); > 4 → the written text lands
+  (`stats.closeRefused`) — either way `closes` is dropped so nothing acts on it later. An
+  UNanchored `closes:` is `strict` in `closeTierFor`: it acts only on the cards it NAMES
+  (exact / prefix / contains title) — never on one that merely carries every word of the target,
+  so the `cov === 1` twin guard applies to anchored closes only. A target that names no live
+  card by title but names an already-closed one (Archive, ✅, ↩) returns an empty tier
+  (`alreadyClosed` → `stats.closesKept`) instead of falling through to word coverage. Every
+  archived card is named in `stats.closedCards`, and the receipts never hide a remainder.
+- Stop re-reads the whole transcript: additive markers are deduped by text (plus the keys the
+  PUBLISHED 1.86.0 / 1.85 cut rules wrote — a 1.86.0 stub is restored in place by the engine's
+  STUB REPAIR, `stats.repaired`); a `~` / `✓` line is deduped by transcript event + line
+  (`skipped-applied`), so a self-heal re-stamp in a new turn still applies.
+- A thin `~` amendment keeps the card's `createdAt`, border colour, `createdVia` and `verify`
+  (an explicit `verify: ""` is persisted as a clear); its evidence goes first under the 16-ref
+  cap (`evidenceDropped` reported). `cardAlreadySays` matches the body as a pattern that
+  tolerates both wrap breaks (a space → line break, an over-long token split mid-word).
+  Previews (ultra brief, prompt recall) lead with the newest amendment (`amendmentFirst`).
+- `parseVerifySuffix` reads the LOGICAL line: it rejoins wrapText's soft breaks (the next
+  line's first word would not have fitted) and a line that starts with a suffix key, so a
+  hard-wrapped card never yields half a sentence as a command, and an own-line `verify:` is
+  read. A probe stops at a joined line that opens with a plain Titlecase word when the shorter
+  reading is itself a probe (a typed break); a joined reading rejected as prose stays rejected.
+  A card with no `verify:` at all returns on the fast path. `brain_note`'s clear-verify check
+  calls this same reader (`deriveVerify`).
 
 ## Adversarial-review hardening (post-implementation, 21 confirmed findings)
 

@@ -381,6 +381,28 @@ same JSON on stdin, or `--evidence '<JSON array>'` and `--verify '<text>'`.
 On Claude Code, decisions are captured automatically at turn end from inline `🧠 BRAIN [Area]:`
 markers in the transcript, deduped, under a capture lock.
 
+A marker can end with optional suffixes, in any order: `closes: <card title or [[wikilink]]>`,
+`ev: <file[:line]>, PR#<n>`, `verify: <command>` and `q: <the question this answers?>`. They count
+only as one run at the end of the line, written lowercase as `key: value`, and each value must
+have its key's shape: references for `ev:`, a command for `verify:`, a question (question word
+first, `?` last) for `q:`. Anything else is kept as card text, so "a Q: and A: layout", "the ev:
+field" or "every agent verify: the tag" never cuts a note short. A malformed segment after a
+well-formed one also stays in the text, and the other suffixes still count; the hook tells the
+agent on its next prompt. On `✓` and `~` markers a `closes:` is plain text, because those markers
+close nothing. A `closes:` that will not act keeps the sentence as written: it names no live card,
+or it names more than four. A `closes:` that does not come after the end of a sentence, a
+`[[wikilink]]` or another suffix closes only a card it names by title. One whose named card is
+already closed closes nothing else. A `~` update too thin to replace its card (fewer than six
+content words and under half the card's) is appended to that card as a dated `(~ amended …)` line
+instead. The card keeps its date, colour and probe, and previews show the newest amendment first.
+The correction lands and nothing is lost.
+
+The Stop hook reads the whole transcript every time, so a `~` or `✓` line applies once. A marker
+that an older hook (1.85 or 1.86.0) already captured is not captured again after an upgrade. If
+1.86.0 cut the note short, the stub is restored to the full text in place. When a marker does not
+do what it says, the next prompt tells the agent. A receipt left by a session that has ended goes
+to the next session that starts in the project.
+
 On every other host, capture is explicit: `brain_note` runs the same capture engine as the hooks —
 dedup, supersession, round-trip re-adoption receipts, `✓` resolve, `~` update in place, `+` skill,
 `closes:` — and stamps which agent wrote the card. A `✓` question preference ranks only candidates
