@@ -919,10 +919,15 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', ref 
         `${i + 1}. [${c.open.area || '?'}] (id ${c.open.id}) claim: “${flat(c.item).slice(0, 100)}” · coverage ${c.cov}\n`
         + `   · likely fulfilled by [${c.milestone.area || '?'}] ${flat(c.milestone.text).slice(0, 140)}\n`
         + (c.uncovered.length ? `   · ⚠️ PARTIAL — does NOT cover: ${c.uncovered.map(u => `“${flat(u).slice(0, 60)}”`).join(' · ')}\n` : '')
+        // The id-addressed confirm is the PREFERRED channel (2026-09-29): it
+        // names exact ids, so the settle relabels the hint 'closed by' and the
+        // confirmation trail is recorded — the bare ✓ marker resolves by prose
+        // match and stays the human-typed fallback.
         + ((!c.uncovered.length && c.resolvable)
-            ? `   · confirm: \`🧠 BRAIN [${c.open.area || 'Notes'}] ✓: ${flat(c.item).slice(0, 80)}\``
+            ? `   · confirm: \`brain_reconcile mode:"claims" confirm:[{ id:"${c.open.id}", milestoneId:"${c.milestone.id}" }]\`\n`
+              + `   · human-typed fallback: \`🧠 BRAIN [${c.open.area || 'Notes'}] ✓: ${flat(c.item).slice(0, 80)}\``
             : `   · no ✓ suggested (${c.uncovered.length ? 'partial — the card stays open; a ✓ would engage the partial-resolve path only after full coverage' : 'item too short to resolve safely'}) — verify by hand`));
-      sections.push(`# ⏳ ${cands.length} open claim(s) a later milestone likely fulfilled\n_Candidates with receipts — nothing was changed, nothing auto-archives. A ✓ is only suggested for FULLY covered claims. Dismiss a wrong hint permanently: \`brain_connect\` with \`pairs:[{fromId:<open id>, toId:<milestone id>}]\` and \`relationship:"not_fulfilled"\` — it will never be re-suggested._\n\n${lines.join('\n')}`);
+      sections.push(`# ⏳ ${cands.length} open claim(s) a later milestone likely fulfilled\n_Candidates with receipts — nothing was changed, nothing auto-archives. A confirm is only suggested for FULLY covered claims — prefer the id-addressed \`brain_reconcile\` call (it settles the hint edge and records the confirmation trail); the ✓ marker is the human-typed fallback. Dismiss a wrong hint permanently: \`brain_connect\` with \`pairs:[{fromId:<open id>, toId:<milestone id>}]\` and \`relationship:"not_fulfilled"\` — it will never be re-suggested._\n\n${lines.join('\n')}`);
     } else if (mode === 'claims') {
       sections.push('✓ No fulfilled-claim candidates — no live open clause is covered by a later milestone.');
     }
@@ -1082,6 +1087,19 @@ const RECONCILE_REFUSALS = {
   'not-a-candidate': () => 'not-a-candidate (that commit was never listed as covering this card; name a listed pair)',
   'no-dismiss-target': () => 'no-dismiss-target (a dismissal is an edge between two cards — pass cardId)',
 };
+// Provenance judgments (2026-09-29) — best-effort shadow of confirm/dismiss
+// verdicts into the machine-local sidecar (src/provenance.mjs), so a verdict
+// keeps WHO decided and THROUGH WHICH SURFACE instead of evaporating into a
+// bare edge. Lazy + never-throw: a missing or unwritable sidecar costs a
+// training label, never the brain write it shadows.
+async function recordProvenance(file, entries) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  try {
+    const prov = await import('./provenance.mjs');
+    prov.recordJudgments(file, entries);
+  } catch { /* additive signal only */ }
+}
+
 async function applyBrainReconcile({ file, how, mode, root, ref, sinceRef, confirm, dismiss, note }) {
   return withCanvasWriteLock(file, async () => {
     let struct;
@@ -1173,11 +1191,13 @@ async function applyBrainReconcile({ file, how, mode, root, ref, sinceRef, confi
 
     let buf = fs.readFileSync(file);
     let outcomes = [];
+    let settledHints = [];
     try {
       if (resolutions.length) {
         const res = await captureIntoBrain(buf, { resolutions });
         buf = res.buffer;
         outcomes = res.stats?.idResolutions || [];
+        settledHints = res.stats?.settledHints || [];
         for (const o of outcomes) if (o.outcome === 'refused') refused.push({ id: o.id, reason: o.reason });
         const archivedIds = res.stats?.idArchived || [];
         // ONE milestone per release confirm, carrying the closed headlines so it
@@ -1216,6 +1236,42 @@ async function applyBrainReconcile({ file, how, mode, root, ref, sinceRef, confi
       if (applied) {
         try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep the capture result if tidy fails */ }
         await atomicWrite(file, buf);
+        // Shadow what LANDED into the provenance sidecar. Actor is
+        // 'agent-listing-bound' — the strongest attainable grade here: confirm
+        // structurally accepts only pairs the served listing showed. A byId
+        // settle IS the reconcile-confirm record; only the byId-less settles
+        // (release confirms whose evidence carried no milestone card) surface
+        // separately as hint-settle. Own try — the write above LANDED, so a
+        // shadow failure must never reach the "brain unchanged" catch below.
+        try {
+        const provEntries = [];
+        const resById = new Map(resolutions.map(r => [r.id, r]));
+        for (const o of outcomes) {
+          if (o.outcome !== 'archived') continue;
+          const r = resById.get(o.id) || {};
+          provEntries.push({
+            kind: 'pair', direction: 'fulfills', verdict: 'yes', source: 'reconcile-confirm', actor: 'agent-listing-bound',
+            from: { id: o.id, text: byId.get(o.id)?.text || '' },
+            to: r.byId ? { id: r.byId, text: byId.get(r.byId)?.text || '' } : { text: r.text || '' },
+          });
+        }
+        for (const e of dismissEdges) {
+          provEntries.push({
+            kind: 'pair', direction: 'fulfills', verdict: 'no', source: 'reconcile-dismiss', actor: 'agent-listing-bound',
+            from: { id: e.fromId, text: byId.get(e.fromId)?.text || '' },
+            to: { id: e.toId, text: byId.get(e.toId)?.text || '' },
+          });
+        }
+        for (const s of settledHints) {
+          if (s.via !== 'resolve') continue;
+          provEntries.push({
+            kind: 'pair', direction: 'closes', verdict: 'yes', source: 'hint-settle', actor: 'agent-listing-bound',
+            from: { id: s.fromId, text: s.fromText || '' },
+            to: { id: s.toId, text: s.toText || '' },
+          });
+        }
+        await recordProvenance(file, provEntries);
+        } catch { /* additive signal only — the reconcile itself succeeded */ }
       }
     } catch (e) {
       return err(`brain_reconcile ${mode} failed (brain unchanged): ${e.message}`);
@@ -1390,7 +1446,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
   }, { brain: true });
 }
 
-export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = null, scope = 'orphans', pairs = null, relationship = null, label = null, log = () => {} }) {
+export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = null, scope = 'orphans', pairs = null, relationship = null, label = null, via = '', log = () => {} }) {
   const tgt = brainTarget(vault, canvas);
   if (tgt.ambiguous) return ambiguousBrainErr(tgt.ambiguous);
   if (!tgt.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}.`);
@@ -1421,6 +1477,23 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
       try {
         const { buffer, added } = await addBrainConnections(fs.readFileSync(file), explicit);
         await atomicWrite(file, buffer);
+        // A dismissal is a durable human-adjacent NO — shadow it into the
+        // provenance sidecar with its surface and client, because the edge
+        // itself carries no actor/session/timestamp (the 19 legacy dismissals
+        // across both brains are unattributable for exactly this reason).
+        // Own try: the edges above LANDED, so a shadow failure must never
+        // surface as "Apply failed (brain unchanged)".
+        try {
+          await recordProvenance(file, explicit.slice(0, added)
+            .filter((e) => e.relationship === 'not_fulfilled' || e.relationship === 'not_contradiction')
+            .map((e) => ({
+              kind: 'pair',
+              direction: e.relationship === 'not_contradiction' ? 'contradicts' : 'fulfills',
+              verdict: 'no', source: 'connect-dismiss', actor: 'agent', client: via,
+              from: { id: e.fromId, text: byId.get(e.fromId)?.text || '' },
+              to: { id: e.toId, text: byId.get(e.toId)?.text || '' },
+            })));
+        } catch { /* additive signal only — the dismissal itself landed */ }
         return { blocks: [text(`✓ Drew ${added} connection(s)${rel === 'not_contradiction' ? ' — these pair(s) are now dismissed and will NOT resurface as brain_reconcile contradiction candidates' : ''}.\n\n${explicit.slice(0, added).map(render2).join('\n')}`)] };
       } catch (e) { return err(`Apply failed (brain unchanged): ${e.message}`); }
     }, { brain: true });
@@ -1638,6 +1711,21 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
         enrich.recordEnrichment(file, enrichmentQuestions.map((question) => ({ body: noteText, question })));
       } catch { /* sidecar unavailable — additive signal only */ }
     }
+    // A full ✓ that settled its unambiguous hint edge (settleHintEdges) is a
+    // verdict worth keeping: shadow it into the provenance sidecar. Actor is
+    // 'agent' — an MCP marker is agent-asserted, nothing stronger provable.
+    // Own try: the note landed, so a shadow failure must never surface as
+    // "brain_note failed (brain unchanged)".
+    try {
+      await recordProvenance(file, (res.stats?.settledHints || [])
+        .filter((s) => s.via === 'resolve')
+        .map((s) => ({
+          kind: 'pair', direction: 'closes', verdict: 'yes', source: 'hint-settle', actor: 'agent',
+          client: via || '',
+          from: { id: s.fromId, text: s.fromText || '' },
+          to: { id: s.toId, text: s.toText || '' },
+        })));
+    } catch { /* additive signal only — the note itself landed */ }
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);

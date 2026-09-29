@@ -5329,6 +5329,112 @@ export async function collapseDuplicatePartialNotes(buffer) {
     return { buffer: await finalizeBrainZip(zip, canvas, manifest, Date.now()), stats };
 }
 
+// ── Confirmation-trail settle (2026-09-29) ───────────────────────────────────
+// A FULL resolve settles the dashed 'likely closed by' hint(s) on its card, so
+// the confirmation trail exists on every resolve channel — not only the
+// id-addressed brain_reconcile confirm. Two modes:
+//
+// byId GIVEN (the id-addressed confirm — historical behaviour, extracted
+// verbatim): relabel the matching dashed hint in place to a solid 'closed by'
+// with hintVia:'human' (fulfillmentOverlaysFor stops rendering it as
+// unconfirmed), else push the new solid edge. 'human' is earned here: the
+// confirm names exact ids the reconcile listing served.
+//
+// byId ABSENT (NEW — the text-✓ path, and an id-resolve whose byId is missing):
+// settle ONLY an UNAMBIGUOUS hint — live 'likely closed by' edges from the
+// target whose milestone exists outside Archive and whose pair carries no
+// dismissal edge. Exactly one candidate settles; among several, only a
+// DOMINANT one does (resolve-text coverage ≥ 0.5 AND ≥ 1.5× the runner-up),
+// else none — 'closed by' edges are identity-bearing lifecycle input to
+// successorOf and corpseRate, so attribution is never guessed. NEVER mints a
+// new edge, never touches dismissed pairs, and an already-'closed by' pair is
+// a no-op (idempotent on re-run). hintVia here is 'resolve', NOT 'human': a ✓
+// marker is agent-emittable, so the marker channel must never stamp the human
+// grade (provenance-honesty rule — see src/provenance.mjs).
+//
+// MEASURED LIMIT (2026-09-29 replay of all 19 human dismissal edges on both
+// real brains, read-only): replaying history's ACTUAL resolution texts settles
+// zero later-dismissed pairs, and no dismissed pair even presents a multi-
+// candidate tiebreak. But a fabricated ✓ that merely restates a never-resolved
+// card's title, on a pair whose dismissal edge is deleted, settles 2 of 17
+// counterfactuals through the exactly-one rule — the settle an agent asserting
+// unhappened work could cause. It stays relabel-only at 'resolve' grade; the
+// dismissal guard makes every pair a human HAS dismissed permanently immune.
+//
+// Every settle is reported in stats.settledHints ({fromId, toId, via, action,
+// fromText, toText, ri}) so hosts can shadow it into the provenance sidecar;
+// `ri` is the caller's resolutions-array index that caused the settle (same
+// indexing contract as stats.resolutionOutcomes), so a host that merged queued
+// batches from OTHER sessions into one capture can attribute each settle to
+// the batch that carried its marker. This file itself never writes outside
+// the brain.
+function settleHintEdges(canvas, struct, targetId, byId, { rand, stats, resolveText = '', ri = null } = {}) {
+    const conns = canvas.connections;
+    const cardText = (id) => String((struct.cards.find(c => c.id === id) || {}).text || '').slice(0, 200);
+    const settled = (toId, via, action) => {
+        (stats.settledHints ||= []).push({ fromId: targetId, toId, via, action, fromText: cardText(targetId), toText: cardText(toId), ...(Number.isInteger(ri) ? { ri } : {}) });
+    };
+    const relabel = (cn, via) => { cn.label = 'closed by'; cn.style = 'solid'; cn.width = 2; cn.color = '#10b981'; cn.hintVia = via; };
+    if (byId) {
+        let already = false, relabeled = false;
+        for (const cn of conns) {
+            const samePair = (cn.fromId === targetId && cn.toId === byId) || (cn.fromId === byId && cn.toId === targetId);
+            if (!samePair) continue;
+            if (cn.label === 'likely closed by') {
+                relabel(cn, 'human');
+                already = true; relabeled = true;
+            } else if (cn.label === 'closed by') already = true;
+        }
+        if (relabeled) settled(byId, 'human', 'relabeled');
+        if (!already) {
+            conns.push({
+                id: `con_${rand()}`, fromId: targetId, toId: byId, relationship: 'relates_to',
+                label: 'closed by', arrowHead: true, width: 2, color: '#10b981', style: 'solid', hintVia: 'human',
+            });
+            settled(byId, 'human', 'minted');
+        }
+        stats.linked++;
+        return;
+    }
+    // byId-less: unambiguous-only, relabel-only.
+    const byCard = new Map(struct.cards.map(c => [c.id, c]));
+    const dismissed = new Set();
+    const closedWith = new Set();
+    for (const cn of conns) {
+        if (DISMISSAL_RELS.has(cn.relationship)) { dismissed.add(`${cn.fromId}|${cn.toId}`); dismissed.add(`${cn.toId}|${cn.fromId}`); }
+        if (cn.label === 'closed by' && (cn.fromId === targetId || cn.toId === targetId)) {
+            closedWith.add(cn.fromId === targetId ? cn.toId : cn.fromId);
+        }
+    }
+    const candidates = [];
+    const seenTo = new Set();
+    for (const cn of conns) {
+        if (cn.label !== 'likely closed by' || cn.fromId !== targetId) continue;
+        if (seenTo.has(cn.toId)) continue;   // twin hints on one pair count once
+        if (dismissed.has(`${cn.fromId}|${cn.toId}`) || closedWith.has(cn.toId)) continue;
+        const m = byCard.get(cn.toId);
+        if (!m || m.type === 'container' || !(m.text || '').trim() || /^archive$/i.test(m.area || '')) continue;
+        seenTo.add(cn.toId);
+        candidates.push({ toId: cn.toId, m });
+    }
+    if (!candidates.length) return;
+    let chosen = null;
+    if (candidates.length === 1) chosen = candidates[0];
+    else {
+        const rTok = tokenSet(resolveText);
+        const scored = candidates
+            .map(c => ({ ...c, cov: coverageOf(rTok, tokenSet(c.m.text)) }))
+            .sort((a, b) => b.cov - a.cov);
+        if (scored[0].cov >= 0.5 && scored[0].cov >= 1.5 * scored[1].cov) chosen = scored[0];
+    }
+    if (!chosen) return;
+    for (const cn of conns) {
+        if (cn.label === 'likely closed by' && cn.fromId === targetId && cn.toId === chosen.toId) relabel(cn, 'resolve');
+    }
+    settled(chosen.toId, 'resolve', 'relabeled');
+    stats.linked++;
+}
+
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
     const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6, QUESTION_MERGE_AT = 0.6;
     let work = buffer;
@@ -5509,25 +5615,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // The evidence card becomes the CONFIRMED closer: an existing
                 // dashed 'likely closed by' hint is relabeled in place (so
                 // fulfillmentOverlaysFor stops rendering it as unconfirmed)
-                // rather than left beside a second solid arrow.
-                if (r.byId && struct.cards.some(c => c.id === r.byId)) {
-                    let already = false;
-                    for (const cn of canvas.connections) {
-                        const samePair = (cn.fromId === target.id && cn.toId === r.byId) || (cn.fromId === r.byId && cn.toId === target.id);
-                        if (!samePair) continue;
-                        if (cn.label === 'likely closed by') {
-                            cn.label = 'closed by'; cn.style = 'solid'; cn.width = 2; cn.color = '#10b981'; cn.hintVia = 'human';
-                            already = true;
-                        } else if (cn.label === 'closed by') already = true;
-                    }
-                    if (!already) {
-                        canvas.connections.push({
-                            id: `con_${rand()}`, fromId: target.id, toId: r.byId, relationship: 'relates_to',
-                            label: 'closed by', arrowHead: true, width: 2, color: '#10b981', style: 'solid', hintVia: 'human',
-                        });
-                    }
-                    stats.linked++;
-                }
+                // rather than left beside a second solid arrow. Without a
+                // (valid) byId the settle still runs, in unambiguous-only mode
+                // — see settleHintEdges above.
+                const confirmedBy = (r.byId && struct.cards.some(c => c.id === r.byId)) ? r.byId : null;
+                settleHintEdges(canvas, struct, target.id, confirmedBy, { rand, stats, resolveText: r.text || '', ri: rIdx });
                 continue;
             }
             const rTok = tokenSet(r.text);
@@ -5610,6 +5702,12 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
                     stats.resolved++;
                     outcomeOf('archived', { cardId: best.id });
+                    // A full text-✓ resolve settles its unambiguous hint too —
+                    // the 56 dashed hints dangling from already-archived cards
+                    // on the real brain are the residue of resolves that never
+                    // did. Partial resolves `continue` above and never reach
+                    // this (the card stays open, so its hints stay hedged).
+                    settleHintEdges(canvas, struct, best.id, null, { rand, stats, resolveText: r.text || '', ri: rIdx });
                 }
             } else {
                 // __fromResolve: an unmatched-✓ fallback card must not seed the

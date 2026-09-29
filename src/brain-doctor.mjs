@@ -57,6 +57,11 @@ try { repoStateLib = await import('./repo-state.mjs'); } catch { repoStateLib = 
 // (the exact drift that once produced three different live-session counts).
 let presenceLib = null;
 try { presenceLib = await import('./agent-presence.mjs'); } catch { presenceLib = null; }
+// provenance powers the informational JUDGMENTS line (confirm/dismiss verdict
+// counts + rejected-prompt pool). Same failure-tolerant idiom; absence of the
+// module OR of any records is a fact, never drift.
+let provenanceLib = null;
+try { provenanceLib = await import('./provenance.mjs'); } catch { provenanceLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -497,6 +502,13 @@ export function inspect(opts = {}) {
       history = { available: true, count: points.length, newestAt: points[0]?.ts || null };
     } catch { history = { available: true, count: 0, newestAt: null }; }
   }
+  // Judgment provenance (2026-09-29). Informational only: a brain with zero
+  // recorded verdicts is NEW, not drifted (same doctrine as history above).
+  let provenance = null;
+  if (hasBrain && provenanceLib && typeof provenanceLib.provenanceCounts === 'function') {
+    try { provenance = { available: true, ...provenanceLib.provenanceCounts(brainPath, { home }) }; }
+    catch { provenance = null; }
+  }
   const tools = inspectTools(brainDir, PKG_ROOT);
   // ── CHECKOUT (release-state visibility, 2026-08-14 incident) ──────────────
   // Advisory, never a verdict layer: when the PROJECT itself is a versioned
@@ -669,7 +681,7 @@ export function inspect(opts = {}) {
 
   // `checkout` is additive (schema-stable): downstream renderers keep parsing
   // every existing field; it never feeds layers/verdict/actions by design.
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -839,6 +851,17 @@ export function render(r, opts = {}) {
   if (r.history?.available) {
     const age = r.history.newestAt ? `${Math.max(0, Math.round((Date.now() - r.history.newestAt) / 60000))}m ago` : 'none yet';
     L.push(`${ok} ${c.bold}HISTORY${c.rst}  ${r.history.count} restore point(s) · newest ${age} ${c.dim}(npx klypix-mcp brain-history list)${c.rst}`);
+  }
+  // Judgment provenance — say what confirm/dismiss verdicts this machine has
+  // recorded, by verdict and surface, because "the trail exists" is only
+  // believable with the counts on the table. Zero records = a new sidecar,
+  // never a warning.
+  if (r.provenance?.available) {
+    const j = r.provenance.judgments || { total: 0, byVerdict: {}, bySource: {} };
+    const rej = r.provenance.rejected || { total: 0 };
+    const since = j.firstTs ? ` · since ${new Date(j.firstTs).toISOString().slice(0, 10)}` : '';
+    const srcBits = Object.entries(j.bySource || {}).map(([source, n]) => `${source} ${n}`).join(' · ');
+    L.push(`${ok} ${c.bold}JUDGMENTS${c.rst} ${j.total} recorded (${j.byVerdict?.yes || 0} yes / ${j.byVerdict?.no || 0} no)${since} · rejected-prompt pool ${rej.total}${srcBits ? ` ${c.dim}(${srcBits})${c.rst}` : ''}`);
   }
 
   // TOOLS
