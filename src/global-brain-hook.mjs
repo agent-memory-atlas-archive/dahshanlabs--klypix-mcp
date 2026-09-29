@@ -2743,13 +2743,19 @@ function draftRulesFromFixes(lib, cards, verified, sid) {
                 candidates.push({ area: c.area || '', text: seed, source: c.createdVia || 'marker' });
             }
         }
-        if (!candidates.length && !skillCards.length) return { drafted: 0, approved: 0 };
+        if (!candidates.length && !skillCards.length) return { drafted: 0, approved: 0, approvedDrafts: [] };
         let added = 0, approved = 0;
+        const approvedDrafts = [];   // which draft each skill retired — the shown-then-promoted provenance signal
         persistDrafts((drafts, now) => {
             if (skillCards.length) {   // approval: a captured 🛠️ skill retires the draft it fulfils
-                const before = drafts.length;
-                drafts = drafts.filter(d => !skillCards.some(sc => draftMatches(d, String(sc.text || ''))));
-                approved = before - drafts.length;
+                const kept = [];
+                for (const d of drafts) {
+                    const sc = skillCards.find(sc => draftMatches(d, String(sc.text || '')));
+                    if (sc) approvedDrafts.push({ area: d.area || '', text: String(d.text || ''), skillText: String(sc.text || '') });
+                    else kept.push(d);
+                }
+                approved = drafts.length - kept.length;
+                drafts = kept;
             }
             const handled = new Set();
             for (const cand of candidates) {
@@ -2764,8 +2770,8 @@ function draftRulesFromFixes(lib, cards, verified, sid) {
             }
             return drafts;
         });
-        return { drafted: added, approved };
-    } catch { return { drafted: 0, approved: 0 }; }
+        return { drafted: added, approved, approvedDrafts };
+    } catch { return { drafted: 0, approved: 0, approvedDrafts: [] }; }
 }
 // Pending drafts: TTL-fresh, not already covered by a live 🛠️ skill, and NOT decayed
 // (a draft surfaced-and-ignored across ≥ RULE_DRAFT_MAX_SURFACINGS distinct sessions
@@ -3642,7 +3648,38 @@ async function capture(lib) {
     {
         const hadFixCommit = commitCards.some(cc => cc.createdVia === 'commit' && !/🏁/.test(String(cc.text || '')));
         const verified = sessionVerified(shellCmds, errorIds, hadFixCommit);
-        draftRulesFromFixes(lib, cards, verified, sid);
+        const draftRes = draftRulesFromFixes(lib, cards, verified, sid);
+        // Draft-rule provenance (2026-09-29): the shown-then-promoted (and
+        // shown-then-ignored) loop is the one DETERMINISTIC yes/no signal the
+        // hook owns — record both verdicts in the sidecar. Best-effort and
+        // skew-safe: a bundle without provenance.mjs just skips. Repeat
+        // observations of the same decayed draft dedup into count++ (jid).
+        try {
+            const judgments = [];
+            for (const a of (draftRes.approvedDrafts || [])) {
+                judgments.push({
+                    kind: 'rule', direction: 'rule-covers', verdict: 'yes', source: 'draft-promotion',
+                    actor: 'agent', session: sid, from: { text: a.text }, to: { text: a.skillText },
+                });
+            }
+            // A draft surfaced across RULE_DRAFT_MAX_SURFACINGS distinct
+            // sessions and still unpromoted has EARNED its silence — that "no"
+            // is a verdict too (the decay itself only stops the nagging).
+            const nowTs = Date.now();
+            for (const d of readRuleDrafts()) {
+                if (!d || !d.id || !d.text) continue;
+                if ((nowTs - (d.lastSeen || d.firstSeen || 0)) >= RULE_DRAFT_TTL_MS) continue;
+                if ((Array.isArray(d.shownSessions) ? d.shownSessions.length : 0) < RULE_DRAFT_MAX_SURFACINGS) continue;
+                judgments.push({
+                    kind: 'rule', direction: 'silence', verdict: 'no', source: 'draft-decay',
+                    actor: 'agent', session: sid, from: { text: String(d.text || '') },
+                });
+            }
+            if (judgments.length) {
+                const prov = await import(new URL('./provenance.mjs', import.meta.url).href);
+                prov.recordJudgments(BRAIN, judgments);
+            }
+        } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
         // Cross-lane FINDING routing rides the SAME verify gate: a finding this
         // session verified about a file outside its own scope is drafted and
         // routed to whoever declared that file. Nothing is sent. `recentPaths`
@@ -3888,7 +3925,13 @@ async function capture(lib) {
         if (drainedLanded) clearDrained();
         reportBatch();
         try { await refreshAgentsBrief(lib, out); } catch { /* AGENTS.md refresh is best-effort */ }
-        return { ...res.stats, batchScope: scope, ...(batchError ? { batchError: String(batchError.message || batchError).slice(0, 160) } : {}), ...(quarantined.length ? { quarantined } : {}) };
+        // ownCounts marks the OWN/DRAINED boundary for the judgment writer
+        // below: drained batches are APPENDED to the shared cards/resolutions
+        // arrays (and land at the same tail indices), so "index < own length"
+        // is exactly "this session's marker". Without it, scope 'all' stamped
+        // THIS session's prompt hash and actor grade onto verdicts whose
+        // markers came from ANOTHER session's queued batch (2026-09-29 review).
+        return { ...res.stats, batchScope: scope, ownCounts: { cards: ownCards.length, resolutions: ownResolutions.length }, ...(batchError ? { batchError: String(batchError.message || batchError).slice(0, 160) } : {}), ...(quarantined.length ? { quarantined } : {}) };
     };
     // Canonical cross-process lock (heartbeat + token-checked release, shared
     // with the MCP engine and the desktop app). Stale bundles missing the module
@@ -3941,6 +3984,82 @@ async function capture(lib) {
             else if (outcome === 'partial') d.action = 'resolve-partial';
             else if (outcome === 'fallback-milestone') d.action = 'resolve-unmatched';
         }
+    }
+    // Marker-verdict provenance (2026-09-29): what this Stop's markers ACTUALLY
+    // retired — closes: fulfillments (stats.closedCards), archived ✓ resolves
+    // (per-outcome cardIds), and the hint edges a full resolve settled — goes
+    // to the machine-local provenance sidecar with an honest actor grade: a
+    // terminal marker is agent-emittable, so the strongest attainable class is
+    // 'agent-human-adjacent' (a machine-turn-guarded human prompt sat above
+    // it), never 'human'. The prompt itself rides as a hash only.
+    //
+    // ATTRIBUTION BOUNDARY (2026-09-29 review): scope 'all' — the NORMAL
+    // success path — means the landed arrays are this session's markers (the
+    // prefix) PLUS queued batches from EARLIER sessions appended by the drain.
+    // This session's prompt hash, session id and human-adjacency grade may
+    // only ever stamp the own prefix; a drained batch's verdict is recorded
+    // with the honest bare 'agent' grade and NO session/prompt — its human,
+    // if one existed, sat above a different transcript this hook never saw.
+    // Scope 'drained' (own half failed entirely) is skipped outright, as
+    // before. Best-effort + skew-safe.
+    if (stats.batchScope !== 'drained') {
+        try {
+            const ownCardCount = stats.ownCounts ? stats.ownCounts.cards : cards.length;
+            const ownResolutionCount = stats.ownCounts ? stats.ownCounts.resolutions : resolutions.length;
+            const hasDrained = cards.length > ownCardCount || resolutions.length > ownResolutionCount;
+            const ownStamp = { actor: lastUserPrompt ? 'agent-human-adjacent' : 'agent', humanPromptText: lastUserPrompt, session: sid };
+            const drainedStamp = { actor: 'agent' };   // another session's marker: agent-asserted, nothing stronger provable
+            const judgments = [];
+            for (const cc of (stats.closedCards || [])) {
+                // The closing card is the captured card whose closes: named this
+                // target (stats.closedCards carries the closed card, not the
+                // closer). findIndex against the shared array places the closer
+                // on the own/drained side of the boundary; an own closer with
+                // the same closes text as a drained one wins the prefix scan,
+                // which is correct — this session really did carry the marker.
+                const closerIdx = cards.findIndex(c => c && c.closes && String(c.closes).trim().slice(0, 80) === cc.target);
+                if (closerIdx === -1) continue;   // unidentifiable closer (engine skew) — never guess attribution
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'marker-closes',
+                    ...(closerIdx < ownCardCount ? ownStamp : drainedStamp),
+                    from: { id: cc.id, text: cc.title || '' },
+                    to: { text: cards[closerIdx].text },
+                });
+            }
+            const seenResolved = new Set();
+            for (const o of (stats.resolutionOutcomes || [])) {
+                if (o.outcome !== 'archived') continue;
+                const cardId = o.cardId || o.id;
+                if (!cardId || seenResolved.has(cardId)) continue;
+                seenResolved.add(cardId);
+                const r = resolutions[o.i] || {};
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'marker-resolve',
+                    ...(o.i < ownResolutionCount ? ownStamp : drainedStamp),
+                    from: { id: cardId },
+                    to: { text: r.text || '' },
+                });
+            }
+            for (const s of (stats.settledHints || [])) {
+                if (s.via !== 'resolve') continue;   // a byId settle is the reconcile-confirm's record, not the hook's
+                // `ri` joins the settle to the resolution that caused it (the
+                // engine mirrors resolutionOutcomes' indexing). Without the
+                // join — a stale engine bundle — a merged capture cannot place
+                // the settle on either side of the boundary, so it is skipped
+                // rather than guessed.
+                if (!Number.isInteger(s.ri) && hasDrained) continue;
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'hint-settle',
+                    ...((Number.isInteger(s.ri) ? s.ri < ownResolutionCount : true) ? ownStamp : drainedStamp),
+                    from: { id: s.fromId, text: s.fromText || '' },
+                    to: { id: s.toId, text: s.toText || '' },
+                });
+            }
+            if (judgments.length) {
+                const prov = await import(new URL('./provenance.mjs', import.meta.url).href);
+                prov.recordJudgments(BRAIN, judgments);
+            }
+        } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
     }
     // Same honesty for ~: a thin update was APPENDED to its card, not a
     // replacement, and one the card already says changed nothing — a ledger
@@ -4958,11 +5077,15 @@ function staleOpenFooter(stale) {
         const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
         const lines = [];
         if (gaps && gaps.length) {
+            // The id-addressed confirm is the PREFERRED channel (2026-09-29):
+            // it names exact ids, settles the dashed hint to a solid 'closed
+            // by', and records the confirmation trail — the bare ✓ marker
+            // resolves by prose match and stays the human-typed fallback.
             lines.push('', '---',
                 `## 🔧 Self-heal — ${total} open card(s) look DONE (a later milestone covers them)`,
-                `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Confirm + close each:`,
-                '· done → `🧠 BRAIN [Area] ✓: <what it resolved to>` — stamps ✅ + archives the open card (or add `closes: <its title>` to the milestone marker).');
-            for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}`);
+                `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Verify, then confirm + close each:`,
+                '· done → the per-card `brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]` call below — stamps ✅, archives the open card, and settles its hint with a recorded confirmation. Human-typed fallback: `🧠 BRAIN [Area] ✓: <what it resolved to>` (or add `closes: <its title>` to the milestone marker).');
+            for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}\n  confirm: \`brain_reconcile mode:"claims" confirm:[{ id:"${g.open.id}", milestoneId:"${g.by.id}" }]\``);
         }
         // Plan-shaped cards (2026-08-23): the same leak for proposals that never
         // carried a ❓ — recall serves them as current intent ("only a proposal")
