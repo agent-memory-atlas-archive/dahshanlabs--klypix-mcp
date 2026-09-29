@@ -4128,6 +4128,31 @@ async function cachedStruct(lib) {
 // SessionStart already paid for. typeof-guarded: an older engine falls back
 // to the uncached pure function, then to null (renderers compute their own).
 const STATUS_CACHE = CACHE.replace(/\.json$/, '.status.json');
+// ── Unified-lane index cache (1.87) ──────────────────────────────────────────
+// rankHookWords / rankHookFused each build a per-struct index that the engine
+// caches in a WeakMap — useless to THIS one-shot process, which would rebuild
+// both on every prompt (measured on the 2,984-card brain: ~250-300ms of a
+// ~740ms end-to-end prompt; ~470ms with this cache — machine-dependent, the
+// review probe saw ~1s of builds). So the built indexes are persisted next to
+// the struct cache,
+// keyed on the brain file's mtimeMs AND size, and re-seeded into the engine's
+// WeakMaps before ranking. Behaviour-neutral: the doc holds only derived
+// stats re-linked to live cards by id, and ANY problem (stale key, unknown
+// id, parse error, version-skewed engine) falls back to an in-memory rebuild.
+// Named .brief-cache-…hookix.json so pruneCacheDir covers it too.
+const HOOK_IX_CACHE = CACHE.replace(/\.json$/, '.hookix.json');
+function seedHookIndexes(lib, struct) {
+    if (typeof lib.seedHookIndexCache !== 'function' || typeof lib.hookIndexCacheDoc !== 'function') return;
+    let st = null; try { st = fs.statSync(BRAIN); } catch { return; }
+    try {
+        const doc = JSON.parse(fs.readFileSync(HOOK_IX_CACHE, 'utf8'));
+        if (doc && doc.mtimeMs === st.mtimeMs && doc.size === st.size && lib.seedHookIndexCache(struct, doc)) return;
+    } catch { /* miss/corrupt → rebuild below */ }
+    try {
+        const doc = lib.hookIndexCacheDoc(struct);   // builds both indexes once, warming the WeakMaps
+        fs.writeFileSync(HOOK_IX_CACHE, JSON.stringify({ mtimeMs: st.mtimeMs, size: st.size, ...doc }));
+    } catch { /* cache is best-effort — the rankers rebuild in memory */ }
+}
 function cachedOpenStatusSummary(lib, struct, opts = {}) {
     if (!struct) return null;
     try {
@@ -4406,13 +4431,30 @@ async function promptRetrieve(lib) {
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
     const messages = messageFooter(sid, input.transcript_path, lib);   // 📨 durable notes: offer, acknowledge, replay until explicit consumption
-    let hits = [], repeats = [], struct = null;
-    if (tokens.length) {
+    // ── Unified recall (1.87) — the bench-measured two-lane policy ──────────
+    // Ported line-for-line from the 2026-09-28 "unified balanced" bench winner
+    // (dev/held-out split of real founder prompts; parity-proven against the
+    // reference policy). Routing: a STRONG status prompt keeps the computed
+    // digest below; a prompt whose UNIQUE CONTENT tokens reach
+    // HOOK_MODEL_MIN_TOKENS takes the MODEL lane (rankHookFused over the warm
+    // vector cache) when the embedder answers in budget and any card vector
+    // exists, else the WORDS lane (rankHookWords, BM25-idf rarity with an
+    // evidence bar) decides. Git-diff fileToks still feed the WORDS lane for
+    // terse prompts but never count toward the model gate — they are not the
+    // asker's words. A repeat nudge suppresses the model lane (and its
+    // embedder cost) exactly as it suppressed the old semantic fallback.
+    let repeats = [], struct = null, freshHits = [];
+    // lane + its deciding evidence are logged for every HUMAN decision — the
+    // silent rows are precisely the data the bars get re-fitted from in the
+    // field (the 2026-09-16 audit had only "hits: 5" ×165 to go on); machine
+    // turns are skipped at the write below (no refit signal, and they would
+    // rotate real rows out of the cap). Note the health log keeps its 500-row
+    // cap, and per-prompt rows still fill it faster than the old sem-only
+    // rows did — a field audit sees a shorter window per file, and the
+    // vocabulary changed: `lane`/`evidence` succeed `top1` (`sem` still lands).
+    let lane = statusStrong ? 'status-digest' : 'no-tokens', laneEvidence = null;
+    if (!statusStrong && tokens.length) {
         struct = await cachedStruct(lib);
-        // The lexical bar is the engine's measured export (1.86: 4 — one title
-        // word alone no longer injects; see HOOK_LEXICAL_MIN_SCORE). An older
-        // engine keeps the pre-1.86 bar of 3.
-        hits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: Number.isFinite(lib.HOOK_LEXICAL_MIN_SCORE) ? lib.HOOK_LEXICAL_MIN_SCORE : 3 });
         // PRECISION-first repeat nudge ("you already did this in another session"):
         // only on a do/build request, only completed-work cards, only high confidence.
         // Matched on the PROMPT's stated intent (ptoks), not the git-diff fallback. A
@@ -4420,66 +4462,64 @@ async function promptRetrieve(lib) {
         if (looksLikeWorkRequest(humanText || '') && typeof lib.detectRepeatWork === 'function') {
             try { repeats = lib.detectRepeatWork(struct, ptoks, { topK: 2 }); } catch { /* best-effort */ }
         }
-    }
-    const repeatIds = new Set(repeats.map(r => r.card.id));
-    let freshHits = hits.filter(h => !repeatIds.has(h.card.id));
-    // SEMANTIC fallback — runs ONLY on a lexical MISS (paraphrase / no keyword
-    // overlap, where you'd otherwise get zero recall). Gated behind the OPTIONAL
-    // on-device model, timeout-bounded (~1.2s), READ-ONLY (never embeds cards in
-    // this one-shot process — that's a 10s–195s stall). The common lexical-HIT
-    // prompt never enters this lane → zero added latency. Bulletproof: not installed
-    // / timeout / any failure → stays exactly today's pure-lexical behavior. The
-    // helper is optional+deploy-gated, so a missing copy degrades cleanly to lexical.
-    let semMode = 'lexical', semTop = null;
-    // Prompt-side admission (1.86): the fallback is an UNCORROBORATED five-card
-    // guess, and the measured cosines cannot tell an acknowledgement from a
-    // real question — but the prompt can. Fewer than FALLBACK_MIN_CONTENT_TOKENS
-    // content tokens ("build best in class", "continue where needed") skips the
-    // lane; the git-diff file tokens do not count, they are not the asker's words.
-    const fallbackEligible = typeof lib.lexicalMissFallbackEligible === 'function' ? lib.lexicalMissFallbackEligible(ptoks) : true;
-    if (!repeats.length && !freshHits.length && tokens.length && struct && !fallbackEligible) semMode = 'sem-skipped';
-    if (!repeats.length && !freshHits.length && tokens.length && struct && fallbackEligible) {
-        try {
-            const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
-            if (typeof semlib.semanticVecs === 'function') {
-                // Embed the DERIVED human text, never the raw prompt — a mixed
-                // turn's stripped machine block must not re-contaminate the
-                // semantic query (parity with the lexical path above).
-                const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
-                if (!sem) semMode = 'sem-unavailable';
-                else {
-                    // ONE production primitive for this lane (1.86). The ranking
-                    // used to live inline here, which meant the surface every
-                    // session actually receives was the one no harness could
-                    // measure — an eval must IMPORT the ranker, never re-implement
-                    // it. rankLexicalMissFallback in klypix-format.mjs is that
-                    // primitive (scripts/eval-hook-lane.mjs measures it); its
-                    // defaults are the measured ones. An older engine without the
-                    // export degrades to the pre-1.86 inline ranking.
-                    let ranked;
-                    if (typeof lib.rankLexicalMissFallback === 'function') {
-                        const r = lib.rankLexicalMissFallback(struct, sem, { topK: 5 });
-                        ranked = r.hits; semTop = r.topCos;
-                    } else {
-                        const fresh = Date.now() - 30 * 86_400_000;
-                        ranked = struct.cards
-                            .filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''))
-                            .map(c => { const v = sem.vecsMap.get(c.id); return { card: c, s: v ? sem.dot(sem.qv, v) : null }; })
-                            .filter(x => x.s != null && x.s >= 0.30)
-                            .map(x => { let score = x.s * 10; if ((x.card.createdAt || 0) >= fresh) score += 0.5; return { card: x.card, score }; })
-                            .sort((a, b) => b.score - a.score).slice(0, 5);
+        const repeatIds = new Set(repeats.map(r => r.card.id));
+        if (typeof lib.rankHookWords === 'function' && typeof lib.rankHookFused === 'function') {
+            seedHookIndexes(lib, struct);
+            let decided = false;
+            // MODEL lane gate, in this order: repeat-nudge check, then the
+            // unique-content-token bar — semanticVecs (and its embedder load)
+            // is never paid for a terse prompt or a nudged repeat.
+            if (!repeats.length && new Set(ptoks).size >= lib.HOOK_MODEL_MIN_TOKENS) {
+                try {
+                    const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
+                    if (typeof semlib.semanticVecs === 'function') {
+                        // Embed the DERIVED human text, never the raw prompt — a
+                        // mixed turn's stripped machine block must not
+                        // re-contaminate the semantic query. semanticVecs
+                        // lowercases, reads the warm card-vector cache read-only,
+                        // and returns null on ANY failure (not installed /
+                        // timeout / empty cache) → the words lane decides.
+                        const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
+                        if (sem) {
+                            const fused = lib.rankHookFused(struct, sem, tokens, { topK: 5 });
+                            if (fused.hits.length) {   // pool > 0; an empty pool is "no vectors" → words lane
+                                decided = true;
+                                laneEvidence = fused.best;
+                                if (fused.best >= fused.bar) { lane = 'model-shown'; freshHits = fused.hits; }
+                                else lane = 'model-silent';   // below-bar is a DECISION, never rescued by words
+                            }
+                        }
                     }
-                    freshHits = ranked;
-                    semMode = ranked.length ? 'sem-hit' : 'sem-empty';
-                }
+                } catch { /* any model-lane failure degrades to the words lane */ }
             }
-        } catch { semMode = 'sem-error'; }
+            if (!decided) {
+                const w = lib.rankHookWords(struct, tokens, { topK: 5 });
+                laneEvidence = w.evidence;
+                if (w.hits.length && w.evidence >= w.bar) { lane = 'words-shown'; freshHits = w.hits; }
+                else lane = 'words-silent';
+            }
+        } else {
+            // Version-skew fallback (older klypix-format without the 1.87
+            // exports): the pre-unified lexical lane at HOOK_LEXICAL_MIN_SCORE.
+            freshHits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: Number.isFinite(lib.HOOK_LEXICAL_MIN_SCORE) ? lib.HOOK_LEXICAL_MIN_SCORE : 3 });
+            lane = freshHits.length ? 'lexical' : 'lexical-silent';
+        }
+        // Repeat ids are filtered from the SHOWN hits — the nudge block renders
+        // those cards itself, with their correction overlays.
+        freshHits = freshHits.filter(h => !repeatIds.has(h.card.id));
     }
-    // The health row carries the best cosine the lane saw (`top1`) so the
-    // admission rule can be re-fitted from the field later without a
-    // transcript — the 2026-09-16 audit had only "hits: 5" ×165 to go on. A
-    // skipped lane is logged too (`sem-skipped`, with the content-token count).
-    if (semMode !== 'lexical') { try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, hits: freshHits.length, ...(Number.isFinite(semTop) ? { top1: Math.round(semTop * 1000) / 1000 } : {}), ...(semMode === 'sem-skipped' ? { content: ptoks.length } : {}) }, 500); } catch { /* */ } }
+    // Header choice downstream: only a model-lane show is a "semantic match".
+    const semMode = lane === 'model-shown' ? 'sem-hit' : 'lexical';
+    // Health row: HUMAN decisions only. A machine turn (humanText === null —
+    // harness-injected reminders, task notifications) always lands 'no-tokens'
+    // and carries zero refit signal, but an agent-team session generates
+    // hundreds of them a day — logged, they would rotate the evidence-bearing
+    // words-silent/model-silent rows out of the 500-row cap (2026-09-29
+    // review). `sem` is kept for grep continuity with the pre-1.87 rows; the
+    // old `top1` field's successor is `evidence` (the deciding lane value).
+    if (humanText !== null) {
+        try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, lane, hits: freshHits.length, mtok: new Set(ptoks).size, ...(Number.isFinite(laneEvidence) ? { evidence: Math.round(laneEvidence * 1000) / 1000 } : {}) }, 500); } catch { /* health log is best-effort */ }
+    }
     // T8 STATUS-DIGEST INJECTION (2026-07-23): a status-shaped prompt gets the
     // COMPUTED current-state digest INSTEAD of card hits — so an agent that
     // never queried the brain still answers "what is remaining?" from state,
