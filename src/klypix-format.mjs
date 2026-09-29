@@ -2744,8 +2744,11 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
 // that missed lexically — NO cosine bar separates them (`minTop` 0.65 zeroes
 // junk but the sole real row sat at 0.642 with its gold at cosine rank 238).
 // So `minTop` and `margin` ship as null: the harness keeps sweeping them and
-// the hook's health row now records `top1` so the field can supply the
-// evidence this decision lacked. What DOES separate the two classes is the
+// the hook's health row recorded `top1` so the field could supply the
+// evidence this decision lacked. (1.87: the hook's shipping lanes no longer
+// call this fallback, and the health row's vocabulary changed — `lane` +
+// `evidence` succeeded `sem`/`top1`; `sem` is still written for grep
+// continuity. See the unified-lane block below.) What DOES separate the two classes is the
 // PROMPT: acknowledgements carry 1–3 content tokens, real prompts 4+ — see
 // lexicalMissFallbackEligible below, which the hook applies before this lane.
 // `sem` is the hook's { qv, vecsMap, dot } from brain-semantic.semanticVecs.
@@ -2790,6 +2793,10 @@ export function rankLexicalMissFallback(struct, sem, { topK = 5, floor = 0.30, m
 // One title word is no longer enough ("do all best in class" used to inject a
 // card titled "…kill stale-closure CLASS…"); a title word plus corroboration,
 // or a 🛠️ skill, still is. The one-gold cost (29→26 on n=35) is inside noise.
+// NOTE (1.87): the shipping hook no longer reads this bar — its recall lanes
+// are rankHookWords / rankHookFused below (HOOK_WORDS_BAR / HOOK_FUSED_SHOW_BAR).
+// It stays exported for the hook's version-skew fallback and for MCP consumers
+// of scoreCardsAgainstQuery.
 export const HOOK_LEXICAL_MIN_SCORE = 4;
 // FALLBACK_MIN_CONTENT_TOKENS — the semantic fallback only runs for a prompt
 // that carries at least this many content tokens (after stopwords and status
@@ -2802,6 +2809,246 @@ export const FALLBACK_MIN_CONTENT_TOKENS = 4;
 export function lexicalMissFallbackEligible(tokens, { minContentTokens = FALLBACK_MIN_CONTENT_TOKENS } = {}) {
     const n = Array.isArray(tokens) ? tokens.filter(t => typeof t === 'string' && t.trim()).length : 0;
     return n >= minContentTokens;
+}
+
+// ── Unified hook recall (1.87) — the measured two-lane replacement ───────────
+// The per-prompt hook's card recall was re-designed 2026-09-28 on a dev/held-out
+// split of real founder prompts (external bench, "unified balanced" policy):
+//   WORDS lane — rankHookWords: BM25-idf rarity ranking over live cards with a
+//     title/tag boost, abstaining below an evidence bar measured in
+//     "rare-title-word units" (a word found in exactly one card's title scores
+//     the boost). Needs no model; works on every machine.
+//   MODEL lane — rankHookFused: one fused score per card (cosine against the
+//     warm vector cache + a small rarity term for the prompt tokens the card
+//     carries) drives both the ranking and the show/stay-silent decision.
+//     Identical-text merge twins collapse to ONE piece of evidence, reachable
+//     through whichever copy still has a vector, shown as the NEWEST copy.
+//   Routing (in the hook): strong status prompts keep the computed digest;
+//     prompts with fewer than HOOK_MODEL_MIN_TOKENS unique CONTENT tokens
+//     never load the model; the rest take the model lane when a query vector
+//     and warm card vectors exist, else the words lane. No freshness bonus in
+//     the fused score — the tuning set's gold cards were unusually recent, so
+//     a recency reward would have been flattered, not validated.
+// These four numbers ARE the policy: the hook reads them, the harness
+// (scripts/eval-hook-lane.mjs) sweeps around them, tests import them —
+// nothing restates them. HOOK_LEXICAL_MIN_SCORE above is now read only by the
+// hook's version-skew fallback and the harness sweep, not the shipping lane.
+export const HOOK_WORDS_BAR = 1.8;          // words lane: min evidence to show (>= shows)
+export const HOOK_MODEL_MIN_TOKENS = 6;     // unique content tokens before the model lane may load
+export const HOOK_FUSED_SHOW_BAR = 0.65;    // model lane: min fused evidence of the best card (>= shows)
+export const HOOK_FUSED_IDF_WEIGHT = 0.006; // model lane: cosine units per unit of matched-token rarity
+// Words-lane internals (bench values, not re-tunable per call): a title/tag
+// hit is worth TITLE_BOOST body hits; k1/b are BM25 saturation + a softened
+// length penalty; the prompt's own specificity (summed rarity of its tokens
+// the brain knows) contributes at SPECIFICITY_WEIGHT.
+const HOOK_WORDS_TITLE_BOOST = 2;
+const HOOK_WORDS_K1 = 1.2;
+const HOOK_WORDS_B = 0.5;
+const HOOK_WORDS_SPECIFICITY = 0.2;
+// Unicode tokenizer (2+ chars, Arabic folded, stemLight applied) — the words
+// lane matches stem-vs-stem, which makes it the first Arabic-capable card
+// matcher in the hook (scoreCardsAgainstQuery's wordsOf is Latin-only).
+const HOOK_WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}_-]{1,}/gu;
+const hookTermsOf = (text) => (foldArabic(String(text || '')).toLowerCase().match(HOOK_WORD_RE) || []).map(w => stemLight(w));
+const hookTagSlug = (t) => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '');
+// Per-struct index caches: the hook is a one-shot process (one build per
+// prompt, ~0.7s on a 3k-card brain — the accepted latency budget of the
+// measured policy), but harnesses and the MCP server rank many prompts
+// against one parsed struct and must not rebuild per call.
+const hookWordsIndexCache = new WeakMap();
+function hookWordsIndex(struct) {
+    let ix = hookWordsIndexCache.get(struct);
+    if (ix) return ix;
+    const cards = [];
+    const df = new Map();
+    let totalLen = 0;
+    for (const c of struct.cards) {
+        if (c.type === 'container' || /^archive$/i.test(c.area || '') || !(c.text || '').trim()) continue;
+        const head = new Set(hookTermsOf(c.title));
+        for (const t of c.tags || []) { const slug = hookTagSlug(t); if (slug) for (const x of hookTermsOf(slug)) head.add(x); }
+        const seq = hookTermsOf(c.text);
+        const tf = new Map();
+        for (const w of seq) tf.set(w, (tf.get(w) || 0) + 1);
+        for (const w of new Set([...head, ...tf.keys()])) df.set(w, (df.get(w) || 0) + 1);
+        totalLen += seq.length;
+        cards.push({ card: c, head, tf, len: seq.length, createdAt: c.createdAt || 0 });
+    }
+    const N = cards.length;
+    const idf = (d) => Math.log(1 + (N - d + 0.5) / (d + 0.5));
+    ix = { cards, df, N, avgLen: totalLen / Math.max(1, N), idf, idfUnit: idf(1) };
+    hookWordsIndexCache.set(struct, ix);
+    return ix;
+}
+// The words lane. `tokens` are the prompt's content tokens (splitQueryTokens);
+// hits carry full card objects — the hook's overlays and previews consume
+// { card, score } rows. evidence = best score + SPECIFICITY_WEIGHT × summed
+// rarity of the known prompt tokens; the caller shows only at evidence >= bar.
+export function rankHookWords(struct, tokens, { topK = 5 } = {}) {
+    const bar = HOOK_WORDS_BAR;
+    if (!struct || !Array.isArray(struct.cards) || !Array.isArray(tokens) || !tokens.length) return { hits: [], evidence: 0, top: 0, specificity: 0, bar };
+    const ix = hookWordsIndex(struct);
+    const terms = [...new Set(tokens.map(t => stemLight(t)))];
+    const known = [];
+    for (const t of terms) { const d = ix.df.get(t) || 0; if (d > 0) known.push({ t, w: ix.idf(d) / ix.idfUnit }); }
+    const specificity = known.reduce((s, x) => s + x.w, 0);
+    const ranked = [];
+    if (known.length) {
+        const k1 = HOOK_WORDS_K1, b = HOOK_WORDS_B;
+        for (const e of ix.cards) {
+            let s = 0, hit = false;
+            for (const x of known) {
+                const inHead = e.head.has(x.t);
+                const tf = e.tf.get(x.t) || 0;
+                if (!inHead && !tf) continue;
+                hit = true;
+                const body = tf ? (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (e.len / ix.avgLen))) : 0;
+                s += x.w * Math.max(inHead ? HOOK_WORDS_TITLE_BOOST : 0, body);
+            }
+            if (hit) ranked.push({ card: e.card, score: s, createdAt: e.createdAt });
+        }
+        ranked.sort((a, b2) => b2.score - a.score || b2.createdAt - a.createdAt);
+    }
+    const top = ranked.length ? ranked[0].score : 0;
+    return { hits: ranked.slice(0, Math.max(0, topK)).map(({ card, score }) => ({ card, score })), evidence: top + HOOK_WORDS_SPECIFICITY * specificity, top, specificity, bar };
+}
+const hookFusedIndexCache = new WeakMap();
+function hookFusedIndex(struct) {
+    let ix = hookFusedIndexCache.get(struct);
+    if (ix) return ix;
+    const byText = new Map();
+    for (const c of struct.cards || []) {
+        if (c.type === 'container' || !(c.text || '').trim() || /^archive$/i.test(c.area || '')) continue;
+        const key = String(c.text).replace(/\s+/g, ' ').trim().toLowerCase();
+        const g = byText.get(key);
+        if (g) g.push(c); else byText.set(key, [c]);
+    }
+    const cards = [];
+    const df = new Map();
+    for (const group of byText.values()) {
+        // identical text = one piece of evidence; the newest copy stands for the group
+        group.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const c = group[0];
+        const words = wordsOf(c.title);
+        for (const w of wordsOf(c.text)) words.add(w);
+        for (const t of c.tags || []) { const stem = hookTagSlug(t); if (stem) words.add(stem); }
+        for (const w of words) df.set(w, (df.get(w) || 0) + 1);
+        cards.push({ card: c, ids: group.map(x => x.id), words });
+    }
+    ix = { cards, df, N: cards.length };
+    hookFusedIndexCache.set(struct, ix);
+    return ix;
+}
+// The model lane. `sem` is { qv, vecsMap, dot } exactly as
+// brain-semantic.semanticVecs returns. Returns the ranked top-K whenever ANY
+// group carries a vector (pool > 0) — the caller shows at best >= bar,
+// stays silent below it, and treats pool 0 (or a null best) as "no vectors":
+// degrade to the words lane, never model-silent.
+export function rankHookFused(struct, sem, tokens, { topK = 5 } = {}) {
+    const bar = HOOK_FUSED_SHOW_BAR;
+    if (!struct || !Array.isArray(struct.cards) || !sem || !sem.vecsMap || !sem.qv || typeof sem.dot !== 'function'
+        || !Array.isArray(tokens) || !tokens.length) return { hits: [], best: null, bar, pool: 0 };
+    const ix = hookFusedIndex(struct);
+    // rarity(token) = ln((N + 1) / (df + 1)) over collapsed live groups — a
+    // deliberately different curve from the words lane's normalized BM25 idf:
+    // here rarity is a small tiebreaker in cosine units, not the ranking.
+    const idf = tokens.map(t => Math.log((ix.N + 1) / ((ix.df.get(t) || 0) + 1)));
+    const scored = [];
+    for (const e of ix.cards) {
+        // a duplicate group is reachable through whichever copy carries a vector
+        let cos = null;
+        for (const id of e.ids) {
+            const v = sem.vecsMap.get(id);
+            if (!v) continue;
+            const c = sem.dot(sem.qv, v);
+            if (Number.isFinite(c)) { cos = c; break; }
+        }
+        if (cos == null) continue;
+        let rare = 0;
+        for (let i = 0; i < tokens.length; i++) if (e.words.has(tokens[i])) rare += idf[i];
+        scored.push({ card: e.card, score: cos + HOOK_FUSED_IDF_WEIGHT * rare, createdAt: e.card.createdAt || 0 });
+    }
+    scored.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt);
+    return { hits: scored.slice(0, Math.max(0, topK)).map(({ card, score }) => ({ card, score })), best: scored.length ? scored[0].score : null, bar, pool: scored.length };
+}
+// Disk-cacheable index snapshot — the hook is a ONE-SHOT process, so the
+// per-struct WeakMap above never survives to the next prompt; building both
+// indexes costs ~250ms-1s on a 3k-card brain (machine-dependent; measured
+// words ~150-750ms + fused ~85-370ms), paid on EVERY prompt without this. The
+// hook persists this doc next to its
+// struct cache (keyed on the brain's mtimeMs + size) and re-seeds the WeakMaps
+// through seedHookIndexCache. BEHAVIOUR-NEUTRAL by construction: only derived
+// stats (df tables, per-card term stats, word sets) and the original card
+// ORDER are stored; card objects are re-linked by id from the live struct, and
+// any mismatch (unknown id, wrong count, wrong version, wrong content
+// fingerprint) rejects the seed so the rankers rebuild from scratch. df
+// tables are lookup-only, so their map order cannot affect a score; the cards
+// arrays keep build order, so the sort tie-breaks are identical to a fresh build.
+//
+// The mtimeMs+size key the hook stores beside this doc is only a PROXY for
+// content, and it can lie in two field-reachable ways (2026-09-29 review):
+//   1. TOCTOU — a Stop-hook capture writes the brain between the hook's
+//      struct read and its key stat, so a doc derived from the OLD struct is
+//      keyed to the NEW file state; every later prompt would seed the stale
+//      index and the freshly captured card would be invisible to both lanes
+//      until the next brain write.
+//   2. Same-key different-content — an mtime-restored equal-size edit, or two
+//      saves inside one timestamp-granularity window (exFAT/FAT), while the
+//      struct cache misses but this doc survives: fresh cards ranked with
+//      stale term statistics, silently wrong scores.
+// So the doc carries a FINGERPRINT of everything the indexes derive from —
+// id, type, area, createdAt, title, text, tags of every card, in struct.cards
+// order (order feeds the tie-breaks) — and seedHookIndexCache recomputes it
+// over the live struct and refuses a doc that disagrees (measured 12-19 ms on
+// the 2,984-card brain, inside a ~95 ms seed that replaces a ~375 ms build).
+// A mismatched pair rebuilds instead of seeding — one wasted build, never a
+// wrong ranking.
+export function hookIndexFingerprint(struct) {
+    const h = crypto.createHash('sha1');
+    const cards = (struct && Array.isArray(struct.cards)) ? struct.cards : [];
+    h.update(String(cards.length));
+    for (const c of cards) {
+        h.update('\u0000' + String(c.id || '') + '\u0001' + String(c.type || '') + '\u0001' + String(c.area || '')
+            + '\u0001' + String(c.createdAt || 0) + '\u0001' + String(c.title || '') + '\u0001' + String(c.text || '')
+            + '\u0001' + String((c.tags || []).join(',')));
+    }
+    return h.digest('hex');
+}
+export function hookIndexCacheDoc(struct) {
+    const w = hookWordsIndex(struct);
+    const f = hookFusedIndex(struct);
+    return {
+        v: 1,
+        fp: hookIndexFingerprint(struct),
+        words: { N: w.N, avgLen: w.avgLen, df: [...w.df], cards: w.cards.map(e => [e.card.id, [...e.head], [...e.tf], e.len, e.createdAt]) },
+        fused: { N: f.N, df: [...f.df], cards: f.cards.map(e => [e.card.id, e.ids, [...e.words]]) },
+    };
+}
+export function seedHookIndexCache(struct, doc) {
+    try {
+        if (!struct || !Array.isArray(struct.cards) || !doc || doc.v !== 1 || !doc.words || !doc.fused
+            || !Array.isArray(doc.words.cards) || !Array.isArray(doc.fused.cards)) return false;
+        if (typeof doc.fp !== 'string' || doc.fp !== hookIndexFingerprint(struct)) return false;
+        const byId = new Map(struct.cards.map(c => [c.id, c]));
+        const wc = [];
+        for (const [id, head, tf, len, createdAt] of doc.words.cards) {
+            const card = byId.get(id);
+            if (!card) return false;
+            wc.push({ card, head: new Set(head), tf: new Map(tf), len, createdAt });
+        }
+        if (doc.words.N !== wc.length || !Number.isFinite(doc.words.avgLen)) return false;
+        const N = doc.words.N;
+        const idf = (d) => Math.log(1 + (N - d + 0.5) / (d + 0.5));
+        const fc = [];
+        for (const [id, ids, words] of doc.fused.cards) {
+            const card = byId.get(id);
+            if (!card || !Array.isArray(ids)) return false;
+            fc.push({ card, ids, words: new Set(words) });
+        }
+        if (doc.fused.N !== fc.length) return false;
+        hookWordsIndexCache.set(struct, { cards: wc, df: new Map(doc.words.df), N, avgLen: doc.words.avgLen, idf, idfUnit: idf(1) });
+        hookFusedIndexCache.set(struct, { cards: fc, df: new Map(doc.fused.df), N: doc.fused.N });
+        return true;
+    } catch { return false; }
 }
 
 // ── Ask-the-brain — whole-brain, correction-aware retrieval for a question ───
