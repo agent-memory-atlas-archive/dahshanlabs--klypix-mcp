@@ -39,7 +39,7 @@ import {
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
 } from './klypix-format.mjs';
-import { findProjectBrain, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
@@ -1780,15 +1780,26 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
   // than minting a different sender on every call.
   const logicalSender = String(from || sessionId || '').trim().slice(0, 160)
     || `legacy-${crypto.createHash('sha1').update(`${t.file}|${String(via || 'mcp').toLowerCase()}`).digest('hex').slice(0, 16)}`;
+  const target = String(to || 'all');
   const result = postPresenceMessage({
     brainPath: t.file,
     from: logicalSender,
-    to: String(to || 'all'),
+    to: target,
     text: body,
+    // Mailbox (1.88.0): a directed id that names a session the lane REMEMBERS
+    // but that is not running queues the note for its next start instead of
+    // refusing — the human stops being the courier between two agents.
+    allowKnownOfflineTarget: true,
   });
   if (!result.posted || !result.message) {
     if (result.reason === 'target-not-unique') {
-      return err('brain_message refused: the target did not identify exactly one other live session. Use its full id, a unique prefix of at least 8 characters, an exact unique branch, or "all". Nothing was posted.');
+      return err(`brain_message refused: "${target}" did not identify exactly one other session (live or recently seen). Use its full id, a unique prefix of at least 8 characters, an exact unique branch, or "all". Nothing was posted.`);
+    }
+    if (result.reason === 'target-unknown') {
+      return err(`brain_message refused: no live session matches "${target}", and it is not a session id the lane remembers. Use a session id (or a unique prefix of at least 8 characters) from the peer list — brain_sync, or npx klypix-mcp doctor — or "all" for the sessions live right now; a branch name only addresses a live session. Nothing was posted.`);
+    }
+    if (result.reason === 'no-live-recipients') {
+      return err('brain_message refused: no other session is live on this project right now, so a broadcast has nobody to reach. Address one session by id — a session that has closed still receives a directed note when it next starts. Nothing was posted.');
     }
     if (result.reason === 'duplicate' && result.message) {
       return err(`brain_message already queued as ${result.message.id}; the duplicate was not posted again.`);
@@ -1796,10 +1807,61 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
     return err(`brain_message deferred: ${result.reason || 'the coordination lane is busy'}. Nothing was posted — retry in a moment.`);
   }
   const message = result.message;
-  const candidates = Array.isArray(message.candidateIds) ? message.candidateIds.length : 0;
+  const recipients = Array.isArray(result.recipients) ? result.recipients : [];
+  const now = Date.now();
+  const clientWord = (client) => {
+    const key = String(client || '').toLowerCase();
+    if (key === 'claude-code' || key === 'claude') return 'Claude Code';
+    if (key === 'codex') return 'Codex';
+    return key ? key.replace(/(^|[-_ ])([a-z])/g, (_m, p, c) => `${p}${c.toUpperCase()}`) : 'Unknown';
+  };
+  const ageWord = (ms) => {
+    const m = Math.max(0, Math.round(Number(ms || 0) / 60_000));
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.round(m / 60);
+    return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+  };
+  // A peer's intent comes off the same-user-writable lane and lands in THIS
+  // model's context: it must never carry a live capture marker.
+  const labelOf = (r) => `${clientWord(r.client)} ${String(r.id).slice(0, 8)}${r.intent ? ` ("${neutralizeMarkers(String(r.intent).slice(0, 80))}")` : ''}`;
+  const RECEIPT = 'A later action of theirs acknowledges it; they then either record uptake with brain_message_receipt ("acted on it") or a further independent action auto-consumes it without a receipt — your receipt line names which, and neither is proof a human read it. Not a brain card — use brain_note for durable decisions.';
+  if (result.queuedOffline && recipients[0]) {
+    const r = recipients[0];
+    // Ten minutes without a heartbeat means closed OR idle with no KLYPIX
+    // activity; only a SessionEnd proves "closed". Say what is known.
+    const quiet = r.lastSeen ? ageWord(now - r.lastSeen).replace(/ ago$/, '') : '';
+    const state = r.endedAt
+      ? `closed (last seen ${ageWord(now - (r.lastSeen || r.endedAt))})`
+      : (quiet ? `not on the lane — not seen for ${quiet} (closed, or idle with no KLYPIX heartbeat)` : 'not running');
+    const resume = r.resumeCommand ? ` If it was closed and they want it handled sooner, they can reopen it (${r.resumeCommand}).` : '';
+    return {
+      blocks: [text(`📬 Queued for ${labelOf(r)} — that session is ${state}. KLYPIX delivers the note the moment that session next acts, and drops it after 7 days if it never does. Tell the human it is QUEUED, not delivered, and that they do not need to relay anything.${resume} (id: ${message.id}) ${RECEIPT}`)],
+      message,
+      recipients,
+    };
+  }
+  const statusPhrase = (r) => {
+    // 'pull-only' = KLYPIX parked that session's MCP worker; the agent session
+    // itself is simply quiet — nothing here wakes it.
+    if (r.deliveryReachability === 'pull-only') return 'connected and quiet — it sees the note at its next KLYPIX tool call or prompt';
+    if (r.statusLabel === 'working') return 'working now — it sees the note at its next KLYPIX tool call or prompt';
+    if (r.hostStatus) return `${r.statusLabel || 'idle'} — it reads the note the next time the human prompts it`;
+    return 'live — it sees the note at its next KLYPIX tool call or prompt';
+  };
+  if (recipients.length === 1) {
+    const r = recipients[0];
+    return {
+      blocks: [text(`📨 Sent to ${labelOf(r)} — ${statusPhrase(r)}. You do not need to ask the human to relay anything. (id: ${message.id}) ${RECEIPT}`)],
+      message,
+      recipients,
+    };
+  }
+  const listed = recipients.slice(0, 6).map((r) => `${labelOf(r)}${r.statusLabel ? ` (${r.statusLabel})` : ''}`).join('; ');
   return {
-    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context, and it replays until the offer is acknowledged. AFTER acknowledgement it retires one of two ways: the receiver calls brain_message_receipt with the exact message id and offer token ("acted on it"), or a further independent action AUTO-CONSUMES it without any receipt. Your receipt line names which. Auto-consumption is not proof the note was acted on, and no path here is proof a human read it. Not a brain card — use brain_note for durable project decisions.`)],
+    blocks: [text(`📨 Sent to ${recipients.length} live session(s): ${listed}${recipients.length > 6 ? '; …' : ''}. Each sees it at its next KLYPIX tool call or prompt; you do not need to ask the human to relay anything. (id: ${message.id}) ${RECEIPT}`)],
     message,
+    recipients,
   };
 }
 
