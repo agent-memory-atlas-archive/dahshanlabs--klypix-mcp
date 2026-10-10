@@ -1143,6 +1143,13 @@ independently validated.
   0.43, top-1 33%. The stratum that matters most is the honest one: **paraphrase questions that share
   no words with their card reach recall@5 44%**; status, temporal and multi-hop questions sit at
   81–93% because they still share vocabulary. Lexical-only scores 0% on the same set.
+- **The caller's words (`brain_ask`, 1.96).** A question can end with one more line,
+  `Also: <words a card answering it would likely use>`; the calling agent is itself a model, so it
+  can guess the card's wording at no extra cost. The words join the meaning query only. Measured
+  2026-10-11 on the same brain grown to 3,829 cards (102 of the frozen questions still answerable),
+  with words written by Gemini 2.5 Flash as a stand-in for the calling agent: recall@5 54% → 59%
+  (8 found, 3 lost), recall@8 61% → 68%, recall@20 68% → 76%, MRR 0.375 → 0.424. Without the
+  line, ranking is unchanged byte for byte.
 - **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
   paraphrases, first cross-brain run): recall@5 **42%** (CI 23–64), top-1 11%, MRR 0.25. Paraphrase
   recall transfers between brains; the ranker is not tuned to the brain it was built on. It is

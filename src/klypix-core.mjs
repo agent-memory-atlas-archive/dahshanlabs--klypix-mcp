@@ -30,7 +30,7 @@ import {
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
   findDuplicatePartialNotes, collapseDuplicatePartialNotes,
-  rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
+  rankForQuestion, splitAskWords, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
@@ -766,7 +766,9 @@ export async function opBrainTaskContext({
 }
 
 export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
-  const q = String(question || '').trim();
+  // A last line `Also: <words>` is the caller's guess at the card's wording; it
+  // joins the meaning query only (splitAskWords in klypix-format.mjs).
+  const { question: q, words } = splitAskWords(question);
   if (!q) return err('brain_ask needs a question.');
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
@@ -783,9 +785,9 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   try {
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
-      const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
+      const [qv] = await embedTexts(pipe, [words ? `${q}\n${words}` : q], { kind: 'query' });
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = 'semantic+lexical (on-device)'; }
+      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = `semantic+lexical (on-device)${words ? ' + your Also words' : ''}`; }
     }
   } catch { semantic = null; cardVecs = null; }
   // Parity with search_all_brains (8445e9c): never say "warming — retry" to a
