@@ -4042,6 +4042,33 @@ export const deathDateOfCard = (card) => {
     const m = /(?:↩︎ superseded|↩ superseded|✅|⤵ consolidated) (\d{4}-\d{2}-\d{2})/.exec(String(c.text || ''));
     return m ? Date.parse(m[1]) : null;
 };
+// THE CALLER'S WORDS (1.96.0). A question is worded the asker's way; the card
+// that answers it was worded the day it was written ("magnification controls"
+// vs a card that says "zoom"). The calling agent is itself a model, so brain_ask
+// invites it to add one last line `Also: <words a card answering this would
+// likely use>`. Those words join the MEANING query only (embedded together with
+// the question, one vector); the keyword anchor test, status shape and the
+// rendered question all stay the question's own. Measured 2026-10-11 on the
+// real 3,829-card brain, frozen v2 set (102 answerable), production embedder +
+// warm enrichment-aware vectors, model-written words: recall@5 55 → 60
+// (+8 −3), @8 62 → 69, @20 69 → 78, MRR .375 → .424. Fusing a separate words
+// vector by rank instead did less (+5 −2 at equal weight). Carried inside
+// `question` because no existing tool's input schema may change (see
+// test/tool-schema-freeze.mjs) — a new property would force every host to
+// reconnect; a line in the text works the moment the worker hot-swaps.
+export const ASK_WORDS_MAX = 240;
+export function splitAskWords(question) {
+    const whole = String(question || '').trim();
+    const lines = whole.split(/\r?\n/);
+    const last = lines.length > 1 ? /^\s*also\s*:\s*(.*)$/i.exec(lines[lines.length - 1]) : null;
+    const rest = last ? lines.slice(0, -1).join('\n').trim() : '';
+    // No words line, or nothing above it: the text is the question, untouched.
+    if (!last || !rest) return { question: whole, words: '' };
+    const words = last[1].replace(/\s+/g, ' ').trim().slice(0, ASK_WORDS_MAX).trim();
+    // An empty `Also:` line is dropped; words equal to the question add nothing.
+    return { question: rest, words: words.toLowerCase() === rest.toLowerCase() ? '' : words };
+}
+
 export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
