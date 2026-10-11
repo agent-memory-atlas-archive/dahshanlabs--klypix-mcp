@@ -58,6 +58,33 @@ ok(splitAskWords('Where are we on zoom?\nAlso: where are we on ZOOM?').words ===
 ok(splitAskWords('Plan:\nalso: we keep zoom\nWhat changed?').words === '', 'split: an `also:` line in the middle is part of the question');
 ok(splitAskWords(`Where?\nAlso: ${'x'.repeat(500)}`).words.length === ASK_WORDS_MAX, 'split: the words are capped');
 
+// ── The ranker without a meaning model (fresh install, the Claude plugin) ──
+{
+  const { buildKlypix, parseKlypix, rankForQuestion, ASK_WORDS_LEXICAL_WEIGHT } = await import('../src/klypix-format.mjs');
+  const { struct } = await parseKlypix(await buildKlypix({
+    title: 'brain',
+    cards: [
+      { text: 'Canvas navigation: the zoom buttons moved to the bottom-right toolbar' },
+      { text: 'Magnification controls for pasted images are out of scope' },
+      { text: 'Weekly lunch menu for the team' },
+    ],
+  }));
+  const ids = (r) => r.hits.map(h => h.card.text.slice(0, 20));
+  const q = 'Where did the magnification controls end up?';
+  const plain = rankForQuestion(struct, q, { k: 5 });
+  const withWords = rankForQuestion(struct, q, { k: 5, words: 'zoom toolbar buttons' });
+  ok(!ids(plain).some(t => t.startsWith('Canvas navigation')), 'keyword-only: without words the differently worded card is not found');
+  ok(ids(withWords).some(t => t.startsWith('Canvas navigation')), 'keyword-only: the words find it');
+  ok(ids(withWords)[0].startsWith('Magnification'), 'keyword-only: the question\'s own match still ranks first');
+  ok(ASK_WORDS_LEXICAL_WEIGHT === 0.5, 'keyword-only: the words count half');
+  ok(JSON.stringify(rankForQuestion(struct, q, { k: 5, words: '' })) === JSON.stringify(plain), 'keyword-only: empty words change nothing');
+  const semantic = new Map(struct.cards.map((c, i) => [c.id, 1 - i / 10]));
+  ok(JSON.stringify(rankForQuestion(struct, q, { k: 5, semantic, words: 'zoom toolbar buttons' })) === JSON.stringify(rankForQuestion(struct, q, { k: 5, semantic })),
+    'with a meaning model the ranker ignores the words (they ride the query vector instead)');
+  const onlyWords = rankForQuestion(struct, 'Where did it go?', { k: 5, words: 'zoom toolbar' });
+  ok(onlyWords.hits.length > 0, 'keyword-only: a question with no usable words of its own still searches with the caller\'s');
+}
+
 // ── opBrainAsk end to end, sandboxed ────────────────────────────────────────
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-ask-words-'));
 const brain = path.join(root, 'project', 'brain.klypix');

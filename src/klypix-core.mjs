@@ -801,6 +801,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   if (!semantic) {
     fallbackNotice = semanticFallbackNotice(false);
     if (fallbackNotice) mode = fallbackNotice.startsWith('LEXICAL ONLY') ? 'lexical-only (no semantic runtime)' : 'lexical (semantic warming)';
+    if (words) mode += ' + your Also words';
   }
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
@@ -813,7 +814,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // vectors that rank the question, reused; null degrades pairing to its
   // lexical anchor/coverage fallback (works on every host, embeddings or not).
   const pairSim = cardVecs ? (a, b) => { const va = cardVecs.get(a), vb = cardVecs.get(b); return va && vb ? dot(va, vb) : null; } : null;
-  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim });
+  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim, words });
   if (wantRerank && result.hits.length > 1) {
     try {
       const reranked = await withRerankerForUse(log, 8_000, rr => rerankHits(rr, q, result.hits));

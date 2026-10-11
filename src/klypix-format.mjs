@@ -4057,6 +4057,11 @@ export const deathDateOfCard = (card) => {
 // test/tool-schema-freeze.mjs) — a new property would force every host to
 // reconnect; a line in the text works the moment the worker hot-swaps.
 export const ASK_WORDS_MAX = 240;
+// Keyword-only mode (no meaning model), same brain and set, words as extra
+// tokens, through splitAskWords: recall@5 19 → 24 of 102 at half weight with
+// none lost (@10 26 → 32); full weight lost a question the question alone
+// found. Measured 2026-10-11.
+export const ASK_WORDS_LEXICAL_WEIGHT = 0.5;
 export function splitAskWords(question) {
     const whole = String(question || '').trim();
     const lines = whole.split(/\r?\n/);
@@ -4069,14 +4074,19 @@ export function splitAskWords(question) {
     return { question: rest, words: words.toLowerCase() === rest.toLowerCase() ? '' : words };
 }
 
-export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null } = {}) {
+export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null, words = '' } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
     const { content: tokens, statusShaped, strong: statusStrong, areaFamilies = [] } = splitQueryTokens(question);
+    // The caller's Also words (splitAskWords). With the meaning model they ride
+    // the query vector (opBrainAsk); WITHOUT it — a fresh install, the Claude
+    // plugin — they are extra keyword tokens at ASK_WORDS_LEXICAL_WEIGHT, after
+    // the question's own, so the question still leads.
+    const extra = words && !semantic ? splitQueryTokens(words).content.filter(t => !tokens.includes(t)) : [];
     // Area scope (1.85.0): this function HAS the struct, so it resolves the
     // prompt's static families to exact area titles for the status renderer.
     const areas = statusStrong ? areaHintsFromPrompt(struct, question) : null;
-    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong, areaFamilies, areas };
+    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !extra.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong, areaFamilies, areas };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const asOfTs = as_of ? Date.parse(as_of) : null;
     const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
@@ -4113,6 +4123,10 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
             if (wordMatches(titleW, titleStems, tok)) lex += 3;
             else if (wordMatches(tagWords, tagStems, tok)) lex += 3;
             else if (wordMatches(bodyW, bodyStems, tok)) lex += lenNorm;
+        }
+        for (const tok of extra) {
+            if (wordMatches(titleW, titleStems, tok) || wordMatches(tagWords, tagStems, tok)) lex += 3 * ASK_WORDS_LEXICAL_WEIGHT;
+            else if (wordMatches(bodyW, bodyStems, tok)) lex += lenNorm * ASK_WORDS_LEXICAL_WEIGHT;
         }
         const sem = semantic ? (semantic.get(c.id) ?? null) : null;
         if (!semantic && lex <= 0) continue;

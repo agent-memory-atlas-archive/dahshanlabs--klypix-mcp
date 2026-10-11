@@ -1148,8 +1148,10 @@ independently validated.
   can guess the card's wording at no extra cost. The words join the meaning query only. Measured
   2026-10-11 on the same brain grown to 3,829 cards (102 of the frozen questions still answerable),
   with words written by Gemini 2.5 Flash as a stand-in for the calling agent: recall@5 54% → 59%
-  (8 found, 3 lost), recall@8 61% → 68%, recall@20 68% → 76%, MRR 0.375 → 0.424. Without the
-  line, ranking is unchanged byte for byte.
+  (8 found, 3 lost), recall@8 61% → 68%, recall@20 68% → 76%, MRR 0.375 → 0.424. With no local
+  model (a fresh install, the Claude plugin) the words count as extra keywords at half weight:
+  recall@5 19% → 24% (5 found, none lost), recall@10 25% → 31%. Without the line, ranking is
+  unchanged byte for byte.
 - **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
   paraphrases, first cross-brain run): recall@5 **42%** (CI 23–64), top-1 11%, MRR 0.25. Paraphrase
   recall transfers between brains; the ranker is not tuned to the brain it was built on. It is
