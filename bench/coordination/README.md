@@ -32,7 +32,7 @@ so the agent cannot read or game them. There is no LLM judge.
 | `relay` | A human pasted the facts into the prompt. **Upper bound**: counts one human relay per fact. |
 | `agents-md-kept` | The other session edited `AGENTS.md` / `CLAUDE.md` tidily (the out-of-date line replaced). |
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
-| `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, a closed session's note as a directed message. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. |
+| `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, and a finding left by a session that has ended as a card too. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. |
 
 The instructions-file conditions are deliberately generous: the other session
 always writes the facts, in the right file, committed. Real teams forget.
@@ -51,7 +51,7 @@ verified against a pinned version before any number is published.
   `--ignore-user-config --ephemeral`. Both get the condition's MCP servers and
   nothing else.
 - A channel's delivery is **read back**, not assumed: if the brain, lane or
-  message write did not land, the run is recorded with `delivered: 0`.
+  write did not land, the run is recorded with `delivered: 0`.
 - Every number is printed with its `n` and a 95% Wilson interval. A difference
   is called out only when the intervals do not overlap; anything else is a tie.
 - Agent CLI versions are recorded on every row.
@@ -63,16 +63,26 @@ verified against a pinned version before any number is published.
 node bench/coordination/run.mjs --dry-run
 
 # Real agents. Spends model usage on YOUR account; asks before starting.
-node bench/coordination/run.mjs --live --agent claude --runs 10 --out results.jsonl
-node bench/coordination/run.mjs --live --agent codex  --runs 10 --out results.jsonl \
-  --scenario s1,s3 --condition none,agents-md-kept,klypix
+# Pin the models for reproducible numbers; keep each agent's raw output for auditing.
+node bench/coordination/run.mjs --live --agent claude --claude-model 'opus[1m]' --runs 10 \
+  --transcripts transcripts/ --out results.jsonl
+node bench/coordination/run.mjs --live --agent codex --codex-model gpt-6-astra --runs 10 \
+  --scenario s1,s3 --condition none,agents-md-kept,klypix --transcripts transcripts/ --out results.jsonl
 
 # Table with intervals.
 node bench/coordination/report.mjs results.jsonl > results.md
 ```
 
 `--keep` leaves each run's repo on disk for inspection. `--timeout` is per run,
-in seconds (default 600).
+in seconds (default 600). `--max-budget` caps Claude's dollars per run (default 2).
+
+Live runs leave your own setup alone. The CLIs start directly, never through
+`cmd.exe`, and get the prompt on stdin. The agent's environment carries nothing
+from the session that launched the bench. Claude runs with
+`--no-session-persistence` and Codex with `--ephemeral`. Every KLYPIX file of a
+run (lane, project registry) lives in a throwaway home that is deleted
+afterwards. On Windows, Codex gets `windows.sandbox="elevated"`, the one user
+setting it cannot write without.
 
 The self-test (`node test/coordination-bench.mjs`) runs the dry run, proves each
 grader separates the right answer from the naive one, and starts the real
@@ -80,6 +90,13 @@ klypix-mcp server the way an agent would to check that its first `brain_sync`
 shows the agent what the other session knew.
 
 ## Honest limits
+
+- **The mailbox is not measured here.** KLYPIX's directed notes reach a session the sender
+  already knew, and resume with it. Every agent here is a brand-new session, so a finding left by
+  an ended session travels as a brain card, the way KLYPIX tells a closing session to leave it.
+  On Codex, the server even identifies itself by Codex's own thread id.
+- **Codex's sandbox keeps `.git` read-only,** so Codex cannot commit. The harness commits whatever
+  any agent leaves in the working tree, and grades every agent the same way.
 
 - **Scripted actors.** The "other session" is a script, so every condition
   faces the same history. That isolates the channel; it does not measure how
