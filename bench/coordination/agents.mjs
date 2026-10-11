@@ -102,15 +102,44 @@ export const oracle = {
   },
 };
 
-/** Claude Code's permission list: the edit/test tools, plus every tool of each condition server. */
+/**
+ * Claude Code's permission list: the edit/test tools, plus every tool of each
+ * condition server. On Windows Claude Code runs shell commands through its
+ * PowerShell tool, so the same git/node/test rules are granted there too —
+ * without them every git and node call was denied (4–5 denials per run in the
+ * first pilot, 2026-10-11), an unfair handicap no other agent had.
+ */
 export function claudeAllowedTools(mcpServers = {}) {
-  return ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash(git *)', 'Bash(node *)', 'Bash(npm test*)',
+  const shell = ['git *', 'node *', 'npm test*'];
+  return ['Read', 'Edit', 'Write', 'Glob', 'Grep',
+    ...shell.map((c) => `Bash(${c})`), ...shell.map((c) => `PowerShell(${c})`),
     ...Object.keys(mcpServers).map((name) => `mcp__${name}`)];
 }
 
+const bump = (bag, key) => { bag[key] = (bag[key] || 0) + 1; return bag; };
+
+/**
+ * Claude's stream-json output: every event, then a final `result` event.
+ * `mcpCalls` counts the agent's MCP tool calls by tool name — whether it
+ * consulted the condition's channel at all is what explains a pass or a fail.
+ */
 export function parseClaudeResult(stdout) {
   let out = null;
-  try { out = JSON.parse(String(stdout).trim().split('\n').filter(Boolean).pop()); } catch { out = null; }
+  let channelUp = null;
+  const mcpCalls = {};
+  for (const line of String(stdout).split('\n')) {
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev?.type === 'result') out = ev;
+    // The init event says whether each condition server actually came up.
+    if (ev?.type === 'system' && ev.subtype === 'init' && Array.isArray(ev.mcp_servers) && ev.mcp_servers.length) {
+      channelUp = ev.mcp_servers.every((s) => s?.status === 'connected');
+    }
+    if (ev?.type === 'assistant') {
+      for (const block of ev.message?.content || []) {
+        if (block?.type === 'tool_use' && /^mcp__/.test(String(block.name || ''))) bump(mcpCalls, String(block.name).replace(/^mcp__[^_]+(?:-[^_]+)*__/, ''));
+      }
+    }
+  }
   const u = out?.usage;
   const models = out?.modelUsage ? Object.keys(out.modelUsage) : [];
   return {
@@ -118,10 +147,17 @@ export function parseClaudeResult(stdout) {
     tokens: u ? Number(u.input_tokens || 0) + Number(u.output_tokens || 0) + Number(u.cache_read_input_tokens || 0) + Number(u.cache_creation_input_tokens || 0) : null,
     turns: Number.isFinite(out?.num_turns) ? out.num_turns : null,
     model: models.join('+') || null,
-    resultError: out?.is_error ? String(out.subtype || out.result || 'error').slice(0, 300) : null,
+    resultError: !out ? 'no result event' : (out.is_error ? String(out.subtype || out.result || 'error').slice(0, 300) : null),
     permissionDenials: Array.isArray(out?.permission_denials) ? out.permission_denials.length : null,
+    mcpCalls,
+    channelUp,
   };
 }
+
+// A run whose condition server never came up measured nothing about that
+// channel. It is recorded as INVALID (kept, shown, excluded from rates) — never
+// as the channel failing.
+export const CHANNEL_DOWN = 'mcp-server-not-connected';
 
 export const claude = {
   id: 'claude',
@@ -134,21 +170,24 @@ export const claude = {
   async run({ repo, prompt, mcpServers = {}, sessionId, timeoutMs, model = null, maxBudgetUsd = null }) {
     const cfg = path.join(path.dirname(repo.dir), `${path.basename(repo.dir)}.mcp.json`);
     fs.writeFileSync(cfg, JSON.stringify({ mcpServers }, null, 2));
-    const args = ['-p', '--output-format', 'json', '--session-id', sessionId, '--no-session-persistence',
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--session-id', sessionId, '--no-session-persistence',
       '--setting-sources', 'project', '--strict-mcp-config', '--mcp-config', cfg,
       '--permission-mode', 'acceptEdits', '--allowedTools', claudeAllowedTools(mcpServers).join(','),
       ...(model ? ['--model', model] : []),
       ...(maxBudgetUsd ? ['--max-budget-usd', String(maxBudgetUsd)] : [])];
-    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
+    const env = { ...cleanAgentEnv(), MCP_TIMEOUT: String(MCP_STARTUP_TIMEOUT_SEC * 1000) };
+    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env, timeoutMs, input: prompt });
     try { fs.rmSync(cfg, { force: true }); } catch { /* */ }
     const p = parseClaudeResult(r.stdout);
     return {
-      ok: r.code === 0 && !r.timedOut && !p.resultError,
-      costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials,
+      ok: r.code === 0 && !r.timedOut && !p.resultError && p.channelUp !== false,
+      costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
+      channelUp: p.channelUp,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
-      error: r.code === 0 && !p.resultError ? null : (p.resultError || r.stderr || r.stdout).slice(-600),
+      error: p.channelUp === false ? CHANNEL_DOWN
+        : (r.code === 0 && !p.resultError ? null : (p.resultError || r.stderr || r.stdout).slice(-600)),
     };
   },
 };
@@ -158,10 +197,18 @@ const tomlArray = (a) => `[${a.map(tomlString).join(', ')}]`;
 const tomlInline = (o) => `{ ${Object.entries(o).map(([k, v]) => `${k} = ${tomlString(v)}`).join(', ')} }`;
 
 /** The condition's MCP servers as `codex -c key=value` overrides (values are TOML). */
+// How long an agent waits for a condition's MCP server to start. Codex's
+// default is 10 s; on a loaded machine a cold start (modules read from disk
+// while the antivirus scans them) can take longer, and the agent then works
+// without the channel — a run that measures nothing. KLYPIX's own Codex config
+// uses the same 120 s (src/agent-rules.mjs).
+export const MCP_STARTUP_TIMEOUT_SEC = 120;
+
 export function codexMcpOverrides(mcpServers = {}) {
   return Object.entries(mcpServers).flatMap(([name, s]) => [
     '-c', `mcp_servers.${name}.command=${tomlString(s.command)}`,
     '-c', `mcp_servers.${name}.args=${tomlArray(s.args || [])}`,
+    '-c', `mcp_servers.${name}.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`,
     ...(s.env ? ['-c', `mcp_servers.${name}.env=${tomlInline(s.env)}`] : []),
   ]);
 }
@@ -176,11 +223,40 @@ export function codexPlatformOverrides(platform = process.platform) {
   return platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : [];
 }
 
+/**
+ * Codex's workspace-write sandbox keeps `.git` read-only, so it could neither
+ * commit nor `git merge` — S2 (build on the other branch) was impossible for
+ * Codex in EVERY condition (pilot, 2026-10-11: "`.git` is read-only, so
+ * `git merge a/currency` failed"). Only this run's throwaway repo's `.git` is
+ * added as writable; nothing else on the machine is.
+ */
+export function codexGitWritable(repoDir) {
+  const gitDir = path.join(repoDir, '.git').split(path.sep).join('/');
+  return ['-c', `sandbox_workspace_write.writable_roots=${tomlArray([gitDir])}`];
+}
+
+/**
+ * Codex does not report its MCP servers' state. A completed call to one proves
+ * it was up; a start-up failure Codex logged for one proves it was not;
+ * anything else is unknown (null) — never assumed up.
+ */
+export function codexChannelUp(serverNames = [], mcpCalls = {}, stderr = '') {
+  if (!serverNames.length) return null;
+  if (Object.keys(mcpCalls || {}).length) return true;
+  const failed = serverNames.some((name) => {
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`${n}[^\\n]*(fail|timed? ?out|error)|(fail|timed? ?out)[^\\n]*${n}`, 'i').test(String(stderr));
+  });
+  return failed ? false : null;
+}
+
 export function parseCodexEvents(stdout) {
   let tokens = null; let turns = 0; let model = null; let failure = null;
+  const mcpCalls = {};
   for (const line of String(stdout).split('\n')) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
     const type = String(ev?.type || ev?.msg?.type || '');
+    if (type === 'item.completed' && ev.item?.type === 'mcp_tool_call') bump(mcpCalls, String(ev.item.tool || 'unknown'));
     const usage = ev?.usage || ev?.msg?.usage || ev?.info?.total_token_usage;
     if (usage) tokens = Number(usage.input_tokens || 0) + Number(usage.output_tokens || 0) + Number(usage.cached_input_tokens || 0);
     if (/turn\.completed|task_complete/.test(type)) turns++;
@@ -188,7 +264,7 @@ export function parseCodexEvents(stdout) {
     const m = ev?.model || ev?.msg?.model || ev?.session?.model;
     if (typeof m === 'string' && m) model = m;
   }
-  return { tokens, turns: turns || null, model, failure };
+  return { tokens, turns: turns || null, model, failure, mcpCalls };
 }
 
 export const codex = {
@@ -201,18 +277,20 @@ export const codex = {
   },
   async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null }) {
     const args = ['exec', '--json', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
-      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexMcpOverrides(mcpServers), '-'];
+      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
     const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
     const p = parseCodexEvents(r.stdout);
+    const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);
     return {
-      ok: r.code === 0 && !r.timedOut && !p.failure,
+      ok: r.code === 0 && !r.timedOut && !p.failure && channelUp !== false,
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
-      tokens: p.tokens, turns: p.turns, model: p.model || model,
+      tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
-      error: r.code === 0 && !p.failure ? null : (p.failure || r.stderr || r.stdout).slice(-600),
+      error: channelUp === false ? CHANNEL_DOWN
+        : (r.code === 0 && !p.failure ? null : (p.failure || r.stderr || r.stdout).slice(-600)),
     };
   },
 };

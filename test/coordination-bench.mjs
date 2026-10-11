@@ -34,10 +34,10 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
-const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents } = await import('../bench/coordination/agents.mjs');
+const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN } = await import('../bench/coordination/agents.mjs');
 const { runOne } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
-const { makeRepo } = await import('../bench/coordination/lib/repo.mjs');
+const { makeRepo, runNodeTests } = await import('../bench/coordination/lib/repo.mjs');
 const { wilson } = await import('../bench/coordination/lib/stats.mjs');
 const { laneFileFor } = await import('../src/agent-presence.mjs');
 const { parseKlypix } = await import('../src/klypix-format.mjs');
@@ -101,7 +101,7 @@ const expectations = {
     'its peer list shows the session rewriting lib/price.js on a/currency'],
   's3-note-from-closed-session': [(sc) => /backfill:emails/.test(hitsText(sc)) && /migrate:002/.test(hitsText(sc)),
     'its context carries the finding the ended session left in the brain'],
-  's4-root-cause-from-other-vendor': [(sc) => /req\.userId/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
+  's4-root-cause-from-other-vendor': [(sc) => /req\.session\.uid/.test(hitsText(sc)) && /CDN/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
 };
 const syncAs = async (server, repo, sessionId, task) => {
   const c = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
@@ -130,6 +130,9 @@ for (const s of SCENARIOS) {
     }
     const server = prep.mcpServers['klypix-canvas'];
     ok(prep.delivered.length === s.facts.length, `B3 ${s.id}: the condition reads every fact back from its channel`);
+    ok(!fs.existsSync(path.join(repo.dir, '.mcp.json')) && !fs.existsSync(path.join(repo.dir, '.codex', 'config.toml'))
+      && /brain_sync/.test(fs.readFileSync(path.join(repo.dir, 'AGENTS.md'), 'utf8')),
+    `B3 ${s.id}: the repo gets the project rules but no MCP config pointing at the machine's own install`);
     const { isError, sc } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
     ok(!isError && check(sc), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
@@ -187,6 +190,52 @@ ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report list
     'B5: the agent starts clean — no parent Claude session, KLYPIX id or Electron flag leaks in (credentials stay)');
   ok(claudeAllowedTools({ 'klypix-canvas': {} }).includes('mcp__klypix-canvas') && !claudeAllowedTools({}).some((t) => t.startsWith('mcp__')),
     'B5: Claude may use every tool of the condition\'s server, and no MCP tool otherwise');
+  ok(['Bash(git *)', 'PowerShell(git *)', 'PowerShell(node *)', 'PowerShell(npm test*)'].every((t) => claudeAllowedTools({}).includes(t)),
+    'B5: Claude\'s git/node/test rules cover its PowerShell tool too (Windows runs shell commands there)');
+  const stream = [
+    '{"type":"system","subtype":"init"}',
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__klypix-canvas__brain_sync"},{"type":"tool_use","name":"Read"}]}}',
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"x"},{"type":"tool_use","name":"mcp__klypix-canvas__brain_ask"},{"type":"tool_use","name":"mcp__klypix-canvas__brain_sync"}]}}',
+    '{"type":"result","is_error":false,"num_turns":3,"total_cost_usd":0.1,"usage":{"input_tokens":1,"output_tokens":2},"modelUsage":{"m":{}},"permission_denials":[]}',
+  ].join('\n');
+  const sr = parseClaudeResult(stream);
+  ok(sr.mcpCalls.brain_sync === 2 && sr.mcpCalls.brain_ask === 1 && !('Read' in sr.mcpCalls) && sr.turns === 3 && sr.permissionDenials === 0,
+    'B5: Claude\'s event stream yields which KLYPIX tools it called, and how often');
+  ok(parseClaudeResult('{"type":"assistant","message":{"content":[]}}').resultError === 'no result event', 'B5: a Claude stream that never reached its result is an error row');
+  const xm = parseCodexEvents(['{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"brain_sync"}}', '{"type":"item.started","item":{"type":"mcp_tool_call","tool":"brain_sync"}}', '{"type":"item.completed","item":{"type":"command_execution"}}'].join('\n'));
+  ok(xm.mcpCalls.brain_sync === 1 && Object.keys(xm.mcpCalls).length === 1, 'B5: Codex events yield its completed KLYPIX tool calls');
+
+  // A run whose channel never came up is INVALID, never a KLYPIX fail.
+  const down = parseClaudeResult(['{"type":"system","subtype":"init","mcp_servers":[{"name":"klypix-canvas","status":"failed"}]}', '{"type":"result","is_error":false,"num_turns":1}'].join('\n'));
+  const up = parseClaudeResult(['{"type":"system","subtype":"init","mcp_servers":[{"name":"klypix-canvas","status":"connected"}]}', '{"type":"result","is_error":false,"num_turns":1}'].join('\n'));
+  const none = parseClaudeResult(['{"type":"system","subtype":"init","mcp_servers":[]}', '{"type":"result","is_error":false,"num_turns":1}'].join('\n'));
+  ok(down.channelUp === false && up.channelUp === true && none.channelUp === null, 'B5: Claude\'s init event says whether the condition server came up');
+  ok(codexChannelUp(['klypix-canvas'], { brain_sync: 1 }, '') === true
+    && codexChannelUp(['klypix-canvas'], {}, 'ERROR mcp: klypix-canvas failed to start: timed out') === false
+    && codexChannelUp(['klypix-canvas'], {}, 'ERROR codex_skills: failed to install system skills') === null
+    && codexChannelUp([], {}, '') === null,
+  'B5: Codex counts as up only after a KLYPIX call, as down only on a start-up failure naming it, otherwise unknown');
+  ok(codexMcpOverrides({ 'klypix-canvas': { command: 'node', args: [] } }).includes(`mcp_servers.klypix-canvas.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`) && MCP_STARTUP_TIMEOUT_SEC >= 120,
+    'B5: both agents wait up to two minutes for the server to start (Codex defaults to 10 s)');
+  const gw = codexGitWritable(path.join(os.tmpdir(), 'klypix-cobench-x'));
+  ok(gw[0] === '-c' && /^sandbox_workspace_write\.writable_roots=\["[^"]*klypix-cobench-x\/\.git"\]$/.test(gw[1]),
+    'B5: Codex may write only the run repo\'s .git (it could not commit or merge otherwise)');
+
+  // S4 must not be solvable from the repository alone: its visible test
+  // passes before any fix, so the cause can only come from the other session.
+  {
+    const s4 = SCENARIOS.find((s) => s.id === 's4-root-cause-from-other-vendor');
+    const repo4 = makeRepo('klypix-cobench-s4v-');
+    try {
+      s4.build(repo4);
+      ok(runNodeTests(repo4.dir, ['test/cache.test.js']).pass, 'B5: S4\'s visible test already passes — the repository holds no clue to the cause');
+    } finally { repo4.remove(); }
+  }
+  const invalidMd = toMarkdown(summarize([
+    { scenario: 's1-changed-decision', condition: 'klypix', agent: 'claude', run: 1, success: false, staleAction: true, invalid: true, error: CHANNEL_DOWN },
+    { scenario: 's1-changed-decision', condition: 'klypix', agent: 'claude', run: 2, success: true, staleAction: false, mcpCalls: { brain_sync: 1 } },
+  ]));
+  ok(/\| 1 \(\+1 invalid\) \| 100%/.test(invalidMd) && /\| 1\/1 \|/.test(invalidMd), 'B5: the report leaves an invalid run out of the rate and shows it beside n');
 
   const cr = parseClaudeResult('{"type":"result","is_error":false,"num_turns":7,"total_cost_usd":0.4123,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":40},"modelUsage":{"claude-opus-5-5":{}}}\n');
   ok(cr.costUsd === 0.4123 && cr.tokens === 370 && cr.turns === 7 && cr.model === 'claude-opus-5-5' && cr.resultError === null, 'B5: Claude\'s JSON result yields cost, tokens, turns and the model used');
