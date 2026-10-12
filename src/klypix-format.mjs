@@ -2388,7 +2388,7 @@ export async function tidyBrain(buffer, opts = {}) {
             meta.set(c.id, { h: Math.max(40, Number(p.h) || 40), w: Math.max(40, Number(p.w) || G.CARD_W), keepSize: true, createdAt });
             continue;
         }
-        const wrapped = wrapText(String(c.text ?? ''));
+        const wrapped = wrapText(repairRawMarker(String(c.text ?? '')));
         let createdAt = 0;
         try { const f = zip.file(ip); if (f) { const j = JSON.parse(await f.async('string')); createdAt = Number(j.createdAt) || 0; j.fontSize = G.FONT; j.content = wrapped; delete j.authoredInParent; zip.file(ip, JSON.stringify(j)); } } catch { /* leave as-is */ }
         meta.set(c.id, { h: measureCardH(wrapped), createdAt });
@@ -9404,7 +9404,54 @@ export async function ensureGuardSidecar(brainPath, { home = os.homedir(), build
     } catch { return { guards: null, stale: true }; }
 }
 
+// The marker written AFTER the colon — "🧠 BRAIN [Drive]: ! Drive storage …",
+// or brain_note text "! …" with no marker — was stored as a plain decision
+// carrying a literal "! " (166 such cards on the KLYPIX brain by 2026-10-12, so
+// milestones read as decisions and questions never counted as open). A bare
+// marker glyph followed by a space at the very start of the text IS the
+// marker; an explicit marker always wins.
+const LEADING_MARKER_RE = /^([?!✓~+])\s+(?=\S)/u;
+export function liftLeadingMarker(marker, text) {
+    const t = String(text ?? '');
+    if (marker) return { marker, text: t };
+    const lead = t.trimStart();
+    const m = LEADING_MARKER_RE.exec(lead);
+    return m ? { marker: m[1], text: lead.slice(m[0].length) } : { marker: '', text: t };
+}
+
+// Cards captured that way BEFORE the fix read "Area: ! text". Restore the glyph
+// the capture meant for the kinds whose intent is unambiguous on the card
+// itself — ! → 🏁, + → 🛠️, ? → ❓. A ✓ or ~ asked for an action on ANOTHER card
+// at the time; replaying a months-old resolve or amend is guesswork, so those
+// stay as written. tidyBrain runs this on every capture, so a brain heals on
+// its next write. The card is stored hard-wrapped and the glyph is longer than
+// the marker, so the first paragraph is rejoined (wrapText's own soft-break
+// rule, as in parseVerifySuffix) and wrapped again rather than left with a
+// one-word orphan line. Returns the text unchanged when there is nothing to do.
+const RAW_MARKER_CARD_RE = /^([^:\n]{1,30}):\s+([!+?])\s+(?=\S)/u;
+const RAW_MARKER_GLYPH = { '!': '🏁 ', '+': '🛠️ ', '?': '❓ ' };
+export function repairRawMarker(text) {
+    const raw = String(text ?? '');
+    const m = RAW_MARKER_CARD_RE.exec(raw);
+    if (!m) return raw;
+    const cpl = brainCPL();
+    const lines = raw.split('\n');
+    let lead = lines[0], prev = lines[0], i = 1;
+    for (; i < lines.length; i++) {
+        const line = lines[i], t = line.trim();
+        if (!t || /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(t)) break;
+        const firstWord = (/^\S*/.exec(t) || [''])[0];
+        const midWord = prev.length === cpl && !/\s/.test(prev.trim());
+        if (!(prev.length <= cpl && line.length <= cpl && (midWord || prev.length + 1 + firstWord.length > cpl))) break;
+        lead = `${lead.trimEnd()}${midWord ? '' : ' '}${t}`;
+        prev = line;
+    }
+    lead = `${m[1]}: ${RAW_MARKER_GLYPH[m[2]]}${lead.slice(m[0].length)}`;
+    return wrapText([lead, ...lines.slice(i)].join('\n'), cpl);
+}
+
 export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp' } = {}) {
+    ({ marker, text } = liftLeadingMarker(marker, text));
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();

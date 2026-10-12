@@ -28,7 +28,7 @@ import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, insightsAreasToMarkdown, insightsStatusToMarkdown,
   areaStatusDigest, addBrainConnections, proposeStructuralConnections, atomicWrite,
-  findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
+  findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput, liftLeadingMarker,
   selectGardenCandidates, applyGarden, detectContradictions,
   findDuplicatePartialNotes, collapseDuplicatePartialNotes,
   rankForQuestion, splitAskWords, questionContextToMarkdown, findLegacyShipCards,
@@ -1932,6 +1932,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
+  ({ marker, text: noteText } = liftLeadingMarker(marker, noteText));
   if (looksLikeUnfilledDraft(noteText)) return err('Complete or discard the draft rationale before capturing it; the brain cannot record an unfilled WHY THIS MATTERS placeholder.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   // Guard cards (2026-08-24): a guard is authored on a '+' skill (or amended
