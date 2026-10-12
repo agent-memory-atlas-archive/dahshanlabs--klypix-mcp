@@ -20,6 +20,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { prepareBrainEvidence, inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
 import { looksLikeUnfilledDraft } from './capture-gap.mjs';
 import { z } from 'zod';
@@ -27,27 +28,37 @@ import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, insightsAreasToMarkdown, insightsStatusToMarkdown,
   areaStatusDigest, addBrainConnections, proposeStructuralConnections, atomicWrite,
-  findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
+  findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput, liftLeadingMarker,
   selectGardenCandidates, applyGarden, detectContradictions,
   findDuplicatePartialNotes, collapseDuplicatePartialNotes,
-  rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
+  rankForQuestion, splitAskWords, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
-  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
+  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, supersededByNote, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
-  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
+  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst, rewriteCardById, handoffTitle,
+  scopeLockedView, scopeLockLine, derivedReading, readManifestCheap, escapeInstructionLines,
 } from './klypix-format.mjs';
-import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
+import {
+  leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
+} from './app-lease.mjs';
+import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, resumeCommandFor } from './agent-presence.mjs';
+import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
+// Plugin mode helpers (KLYPIX_PLUGIN=1). A namespace import: every bundle that
+// ships this engine ships mcp-auto-update.mjs beside it, and a missing export
+// (older copy mid-install) degrades to normal mode instead of failing to link.
+import * as autoUpdateLib from './mcp-auto-update.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
   rerankHits, semanticFallbackNotice, semanticMemorySnapshot,
   semanticRuntimeInstalled, shouldPrewarmSemantic, vectorsForBrain,
-  cachedVectorsForBrain,
+  cachedVectorsForBrain, startBrainPreparation, preparationNotice,
 } from './semantic-memory.mjs';
 
 // The MCP and A2A faces prewarm through this protocol-neutral module. Bounded
@@ -85,7 +96,6 @@ export const IS_CANVAS = /\.(klypix|any)$/i;
 const SKIP_DIRS = new Set(['node_modules', '.git', '.cache', 'AppData', '$Recycle.Bin', 'Windows']);
 const MAX_FILES = 400;
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
-const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
 
 // Resolve the vault folder the same way every face does: explicit > env > ~/Documents.
 export function resolveVault(explicit) {
@@ -110,18 +120,53 @@ export function walkVault(vault) {
   return out;
 }
 
+// The title KLYPIX shows for a canvas file (manifest.title), read cheaply from
+// the ZIP's central directory and cached by path + size + mtime, so resolving a
+// name never inflates a whole canvas. Legacy .any files (no manifest) → null.
+const titleCache = new Map();
+export function canvasTitleOf(file) {
+  let st;
+  try { st = fs.statSync(file); } catch { return null; }
+  const key = path.resolve(file);
+  const hit = titleCache.get(key);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.title;
+  const manifest = readManifestCheap(file);
+  const title = manifest && typeof manifest.title === 'string' && manifest.title.trim() ? manifest.title.trim() : null;
+  if (titleCache.size > 2000) titleCache.clear();
+  titleCache.set(key, { size: st.size, mtimeMs: st.mtimeMs, title });
+  return title;
+}
+
 // Resolve a user-supplied canvas reference: absolute path, vault-relative path,
-// or a bare filename (matched against the walked list, case-insensitively).
-export function resolveCanvas(vault, ref) {
-  if (!ref) return null;
-  if (path.isAbsolute(ref) && fs.existsSync(ref)) return ref;
+// a bare filename (matched against the walked list, case-insensitively), and —
+// when no file name matches — the title KLYPIX shows (manifest.title), first
+// exactly, then ignoring case. Two canvases with that title are ambiguous: the
+// caller gets both paths instead of a guess.
+//   → { file } · { ambiguous: [paths] } · { file: null }
+export function resolveCanvasDetailed(vault, ref) {
+  if (!ref || typeof ref !== 'string') return { file: null };
+  if (path.isAbsolute(ref) && fs.existsSync(ref)) return { file: ref };
   const rel = path.join(vault, ref);
-  if (fs.existsSync(rel)) return rel;
+  if (fs.existsSync(rel)) return { file: rel };
+  const all = walkVault(vault);
   const want = path.basename(ref).toLowerCase();
-  const matches = walkVault(vault).filter(f => path.basename(f).toLowerCase() === want
+  const byName = all.filter(f => path.basename(f).toLowerCase() === want
     || path.basename(f).toLowerCase() === want + '.klypix'
     || path.basename(f).toLowerCase() === want + '.any');
-  return matches[0] || null;
+  if (byName.length) return { file: byName[0] };
+  const wanted = ref.trim();
+  if (!wanted) return { file: null };
+  const titled = all.map(f => ({ f, title: canvasTitleOf(f) })).filter(x => x.title);
+  for (const same of [(t) => t === wanted, (t) => t.toLowerCase() === wanted.toLowerCase()]) {
+    const matches = titled.filter(x => same(x.title)).map(x => x.f);
+    if (matches.length === 1) return { file: matches[0] };
+    if (matches.length > 1) return { ambiguous: matches };
+  }
+  return { file: null };
+}
+
+export function resolveCanvas(vault, ref) {
+  return resolveCanvasDetailed(vault, ref).file || null;
 }
 
 // Resolve the DEFAULT project brain for the brain-* ops, INDEPENDENT of the
@@ -225,46 +270,134 @@ function cardDetailBlock(struct, onlyIds) {
 
 // ── Operations ───────────────────────────────────────────────────────────────
 
+// The result envelope's error half (P0 agent parity): the first line states the
+// outcome, the LAST line is KLYPIX's one sentence for the person, and the
+// structured half carries the code. Only KLYPIX speaks in tell_user.
+function notFoundResult(ref, vault, ambiguous = null) {
+  const sentence = tellUser('NOT_FOUND');
+  const first = ambiguous
+    ? `More than one canvas is titled "${ref}" — pass one of these paths:\n${ambiguous.map(p => `  - ${p}`).join('\n')}`
+    : `Canvas not found: ${ref} (vault: ${vault}). Names match a file name or the title KLYPIX shows.`;
+  return {
+    blocks: [text(first), text(`Tell the user: ${sentence}`)],
+    isError: true,
+    structured: { ok: false, mode: 'file', code: 'NOT_FOUND', tell_user: sentence, ...(ambiguous ? { candidates: ambiguous } : {}) },
+  };
+}
+
+const ymdOf = (ms) => (Number(ms) > 0 ? new Date(Number(ms)).toISOString().slice(0, 10) : null);
+
+/**
+ * The images of a canvas's photo cards, IN CARD ORDER, each tied to its card,
+ * sized for what AI apps accept in ONE tool result (src/card-files.mjs):
+ *   • the original when it fits its share of `budget` (base64 characters);
+ *   • otherwise a smaller copy of a JPEG (the app never saves a smaller copy of
+ *     a photo in the file — its thumbnail is rebuilt on open);
+ *   • otherwise not attached, with the plain reason, so the caller can point the
+ *     AI at read_card_contents (which also hands over the original's path).
+ * Scope-locked cards never appear (callers pass the visible cards).
+ * → { attached: [{ cardId, name, data, mime, path, bytes, downscaled, width?, height? }],
+ *     notAttached: [{ cardId, name, reason, bytes? }] }
+ */
+export async function canvasImages(parsed, visibleCards, { max = 4, budget = LIMITS.imageResultBudget, onlyIds = null } = {}) {
+  const items = parsed?.items || {};
+  const wanted = [];
+  for (const c of visibleCards || []) {
+    if (onlyIds && !onlyIds.has(c.id)) continue;
+    const it = items[c.id];
+    if (!it) continue;
+    const imageFile = it.type === 'file' && !it.isFolder && IMG_RE.test(`.${String(it.extension || '').toLowerCase()}`);
+    if (it.type !== 'image' && !imageFile) continue;
+    wanted.push({ c, it });
+  }
+  const attached = [];
+  const notAttached = [];
+  let remaining = Math.max(0, budget);
+  for (let i = 0; i < wanted.length; i++) {
+    const { c, it } = wanted[i];
+    const name = c.title || it.fileName || 'image';
+    if (attached.length >= max) { notAttached.push({ cardId: c.id, name, reason: 'count' }); continue; }
+    let buf = null;
+    let where = null;
+    const got = it.assetId ? await assetBytes(parsed, it.assetId) : { missing: true };
+    if (got.buf) { buf = got.buf; where = locateAsset(parsed, it.assetId); }
+    else if (typeof it.src === 'string' && it.src.startsWith('data:image/')) { buf = dataUrlImage(it.src); where = `${c.id}.inline`; }
+    if (!buf) {
+      notAttached.push({ cardId: c.id, name, reason: got.tooLarge ? 'too-large' : it.phoneAsset ? 'phone' : 'missing', ...(got.size ? { bytes: got.size } : {}) });
+      continue;
+    }
+    const share = Math.floor(remaining / Math.max(1, Math.min(wanted.length - i, max - attached.length)));
+    if (share < LIMITS.minImageB64) { notAttached.push({ cardId: c.id, name, reason: 'budget', bytes: buf.length }); continue; }
+    const fit = await fitImage(buf, share);
+    if (!fit.ok) { notAttached.push({ cardId: c.id, name, reason: fit.reason, mime: fit.mime, bytes: buf.length }); continue; }
+    remaining -= fit.data.length;
+    attached.push({ cardId: c.id, name, data: fit.data, mime: fit.mime, path: where, bytes: buf.length, downscaled: fit.downscaled, ...(fit.downscaled ? { width: fit.width, height: fit.height } : {}) });
+  }
+  return { attached, notAttached };
+}
+
+/** Back-compatible shape: just the attached images (thumbnail is always false now). */
+export async function cardImages(parsed, visibleCards, { max = 8, onlyIds = null, budget } = {}) {
+  const { attached } = await canvasImages(parsed, visibleCards, { max, onlyIds, ...(budget != null ? { budget } : {}) });
+  return attached.map(a => ({ ...a, thumbnail: false }));
+}
+
 export async function opListCanvases({ vault }) {
   const files = walkVault(vault);
   if (files.length === 0) {
     return { blocks: [text(`No .klypix/.any files found under vault: ${vault}\nSet --vault or KLYPIX_VAULT to your canvas folder.`)] };
   }
+  // "open in KLYPIX" comes from the lease a running KLYPIX writes (app-lease.mjs).
+  // No lease → nothing is marked; it never guesses.
+  const lease = readEndpoint();
+  const openHashes = lease.status === 'live' && lease.endpoint ? new Set(lease.endpoint.openFiles) : new Set();
   const rows = [];
+  let openCount = 0;
   for (const f of files) {
     try {
       const { struct } = await parseKlypix(fs.readFileSync(f));
       const st = fs.statSync(f);
-      rows.push(`- ${path.relative(vault, f)} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections · ${new Date(st.mtimeMs).toISOString().slice(0, 10)}`);
+      const open = openHashes.size && openHashes.has(pathHash(f));
+      if (open) openCount++;
+      rows.push(`- ${path.relative(vault, f)} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections · ${new Date(st.mtimeMs).toISOString().slice(0, 10)}${open ? ' · open in KLYPIX' : ''}`);
     } catch {
       rows.push(`- ${path.relative(vault, f)} — (unreadable)`);
     }
   }
-  return { blocks: [text(`# Canvases in ${vault}\n\n${rows.join('\n')}`)] };
+  const note = openCount ? `\n\n${openCount} of these ${openCount === 1 ? 'is' : 'are'} open in KLYPIX right now: add_to_canvas refuses ${openCount === 1 ? 'it' : 'them'} until the tab is closed.` : '';
+  return { blocks: [text(`# Canvases in ${vault}\n\nRead one by its title or file name.\n\n${rows.join('\n')}${note}`)] };
 }
 
 export async function opReadCanvas({ vault, canvas }) {
-  const file = resolveCanvas(vault, canvas);
-  if (!file) return err(`Canvas not found: ${canvas} (vault: ${vault})`);
+  const resolved = resolveCanvasDetailed(vault, canvas);
+  if (!resolved.file) return notFoundResult(canvas, vault, resolved.ambiguous);
+  const file = resolved.file;
   try {
-    const { struct, zip, assetPaths } = await parseKlypix(fs.readFileSync(file));
-    const blocks = [text(structToMarkdown(struct))];
-    // Return image assets as actual image blocks so a vision-capable model SEES
-    // them — the whole point of a multimodal canvas. Capped (count + size).
-    let included = 0;
-    for (const p of assetPaths) {
-      if (included >= 8) break;
-      if (!IMG_RE.test(p)) continue;
-      try {
-        const b64 = await zip.file(p).async('base64');
-        if (!b64 || b64.length > 7_000_000) continue; // skip > ~5MB
-        const ext = p.split('.').pop().toLowerCase();
-        blocks.push({ kind: 'image', data: b64, mime: IMG_MIME[ext] || 'image/png', name: p });
-        included++;
-      } catch { /* skip unreadable asset */ }
+    const parsed = await parseKlypix(fs.readFileSync(file));
+    // Scope lock: cards inside a box a person locked from AI tools are not
+    // printed, not searched, and their images are not attached.
+    const view = scopeLockedView(parsed);
+    const blocks = [text(structToMarkdown(view.struct, { parsed, lockedBoxes: view.boxes, mcp: true }))];
+    // Return photo cards as actual image blocks so a vision-capable model SEES
+    // them — the whole point of a multimodal canvas. In card order, each after
+    // the card it belongs to, and sized for what AI apps accept in ONE result
+    // (Claude Desktop refuses a tool result over 1 MB): originals when they fit,
+    // a smaller copy of a large JPEG otherwise, never a silent failure.
+    const markdownChars = blocks[0].text.length;
+    const { attached, notAttached } = await canvasImages(parsed, view.struct.cards, {
+      max: 4, budget: Math.min(LIMITS.imageResultBudget, Math.max(0, 900_000 - markdownChars)),
+    });
+    for (const img of attached) {
+      blocks.push(text(`Image for card ${img.cardId} '${img.name}'${img.downscaled ? ` (a smaller copy, ${img.width}×${img.height} px, of the ${mb(img.bytes)} original — read_card_contents gives the original's file path)` : ''}`));
+      blocks.push({ kind: 'image', data: img.data, mime: img.mime, name: img.path });
     }
-    if (included > 0) blocks.push(text(`\n(${included} image${included > 1 ? 's' : ''} from this canvas are attached above — read them directly.)`));
-    return { blocks, struct };
+    if (attached.length > 0) blocks.push(text(`\n(${attached.length} image${attached.length > 1 ? 's' : ''} from this canvas ${attached.length > 1 ? 'are' : 'is'} attached above, each after the card it belongs to — read ${attached.length > 1 ? 'them' : 'it'} directly.)`));
+    if (notAttached.length > 0) {
+      const why = (n) => (n.reason === 'phone' ? 'an iPhone photo whose bytes are not stored in this canvas file'
+        : n.reason === 'missing' ? 'its bytes are not in this canvas file' : imageSkipReason(n.reason, n.mime));
+      blocks.push(text(`Not attached here: ${notAttached.map(n => `card ${n.cardId} '${n.name}' (${why(n)})`).join('; ')}. Call read_card_contents with those card ids to get each photo (and its original's file path).`));
+    }
+    return { blocks, struct: view.struct };
   } catch (e) {
     return err(`Failed to read ${file}: ${e.message}`);
   }
@@ -279,26 +412,52 @@ export async function opSearchCanvases({ vault, query }) {
   const hit = (s) => { const v = String(s || '').toLowerCase(); return terms.some(t => v.includes(t)); };
   const hits = [];
   for (const f of walkVault(vault)) {
-    let struct;
-    try { ({ struct } = await parseKlypix(fs.readFileSync(f))); } catch { continue; }
+    let parsed;
+    try { parsed = await parseKlypix(fs.readFileSync(f)); } catch { continue; }
+    // Scope lock: a locked box's cards never match, and never show.
+    const { struct } = scopeLockedView(parsed);
+    const items = parsed.items || {};
     const rel = path.relative(vault, f);
+    let saved = null;
+    try { saved = ymdOf(fs.statSync(f).mtimeMs); } catch { /* */ }
     const nameMatch = hit(struct.title) || hit(rel);
+    const readingOf = (c) => derivedReading(items[c.id]);
+    const itemTags = (c) => (Array.isArray(items[c.id]?.tags) ? items[c.id].tags.map(String) : []);
+    const inReading = (c) => { const r = readingOf(c); return !!r && hit(r.text); };
     const matched = struct.cards.filter(c =>
       hit(c.title) ||
       hit(c.text) ||
-      (c.tags || []).some(t => hit('#' + t)));
+      (c.tags || []).some(t => hit('#' + t)) ||
+      itemTags(c).some(t => hit('#' + t) || hit(t)) ||
+      inReading(c));
     if (nameMatch || matched.length) {
       // Matching stays recall-first (an archived card CAN be the right answer to
       // "what did we try?"), but an archived hit is now labelled. Unlabelled, a
       // superseded or retired decision read exactly like a current one.
       const isArchived = (c) => /^archive$/i.test(c.area || '');
       const n = struct.counts;
-      const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+      const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${saved ? ` · saved ${saved}` : ''}${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+      // A stale hit names its replacement (1.98.0) — never a bare "archived".
+      let successors = new Map();
+      try { successors = correctionOverlaysFor(struct, matched.slice(0, 8)); } catch { successors = new Map(); }
       const body = matched.slice(0, 8).map(c => {
         const pos = (c.pos && c.pos.x != null) ? ` @(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '';
-        const tags = (c.tags && c.tags.length) ? ' ' + c.tags.map(t => '#' + t).join(' ') : '';
+        const allTags = [...new Set([...(c.tags || []), ...itemTags(c)])];
+        const tags = allTags.length ? ' ' + allTags.map(t => '#' + t).join(' ') : '';
         const arch = isArchived(c) ? ' ⛔ archived' : '';
-        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${tags}${arch}\n    ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+        const it = items[c.id] || {};
+        const date = ymdOf(it.editedAt) || ymdOf(it.createdAt);
+        const ownText = String(c.text || '').replace(/\s+/g, ' ').slice(0, 240);
+        const reading = readingOf(c);
+        // A match found only in KLYPIX's saved reading says so, and shows the
+        // reading (escaped — it is reel/page/file text, not instructions).
+        const fromReading = reading && !hit(c.title) && !hit(c.text) && hit(reading.text)
+          ? `\n    in KLYPIX's saved reading: ${escapeInstructionLines(reading.text.replace(/\s+/g, ' ').slice(0, 240))}`
+          : '';
+        const replaced = successors.has(c.id)
+          ? `\n    ↪ ${supersededByNote(successors.get(c.id))} — read that card for the current state`
+          : '';
+        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${date ? ` · ${date}` : ''}${tags}${arch}\n    ${escapeInstructionLines(ownText)}${fromReading}${replaced}`;
       }).join('\n');
       hits.push(matched.length ? `${head}\n${body}` : head);
     }
@@ -309,9 +468,26 @@ export async function opSearchCanvases({ vault, query }) {
 export async function opSearchAllBrains({ vault, query, as_of, log = () => {} }) {
   const q = String(query || '').trim().toLowerCase();
   if (!q) return err('Provide a non-empty query.');
-  const reg = path.join(PB_DIR, 'registry.json');
+  // Plugin mode registers projects in its own machine-state folder
+  // (KLYPIX_PLUGIN_DATA); it reads that list AND the shared one other KLYPIX
+  // sessions on this machine maintain. Reads only.
+  const registries = [path.join(PB_DIR, 'registry.json')];
+  if (typeof autoUpdateLib.pluginDataDir === 'function' && autoUpdateLib.pluginDataDir()) {
+    registries.unshift(path.join(autoUpdateLib.pluginDataDir(), 'registry.json'));
+  }
   let brains = [];
-  try { brains = (JSON.parse(fs.readFileSync(reg, 'utf8')).brains || []).filter(b => b && b.path); } catch { /* no registry yet */ }
+  const seenBrains = new Set();
+  for (const reg of registries) {
+    let listed = [];
+    try { listed = (JSON.parse(fs.readFileSync(reg, 'utf8')).brains || []).filter(b => b && b.path); } catch { /* no registry yet */ }
+    for (const b of listed) {
+      const resolved = path.resolve(String(b.path));
+      const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+      if (seenBrains.has(key)) continue;
+      seenBrains.add(key);
+      brains.push(b);
+    }
+  }
   if (!brains.length) return { blocks: [text('No brains registered yet — the brain hook registers each project as you work in it.')] };
   const terms = q.split(/[^\p{L}\p{N}#]+/u).filter(t => t.length >= 3);
   if (!terms.length) return err('Query too short — use words of 3+ characters.');
@@ -335,7 +511,13 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
     let struct;
     try { ({ struct } = await parseKlypix(fs.readFileSync(b.path))); } catch { continue; }
     let vecs = null;
-    if (qv) { try { vecs = await vectorsForBrain(pipe, b.path, struct.cards); } catch { /* lexical for this brain */ } }
+    if (qv) { try { const r = await questionVectors(pipe, b.path, struct.cards); vecs = r.usable ? r.vecs : null; } catch { /* lexical for this brain */ } }
+    // Replacement per stale card (1.98.0), only when this brain HAS lifecycle
+    // edges; skipped under as_of (a correction is a present-day fact).
+    let successors = new Map();
+    if (asOfTs == null && (struct.connections || []).some(cn => cn.label === 'superseded by' || cn.label === 'closed by')) {
+      try { successors = correctionOverlaysFor(struct, struct.cards); } catch { successors = new Map(); }
+    }
     for (const c of struct.cards) {
       if (c.type === 'container') continue;
       const t = String(c.text || '').toLowerCase();
@@ -361,7 +543,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
         if (isArchived) score -= 1;
         if (isCur) score += sem != null ? 1.5 : 1; // current-project locality prior
       }
-      scored.push({ score, sem, cur: isCur, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c });
+      scored.push({ score, sem, cur: isCur, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c, successor: successors.get(c.id) || null });
     }
   }
   if (!scored.length) return { blocks: [text(`No matches for "${query}" across ${brains.length} registered brain(s).`)] };
@@ -369,7 +551,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const top = scored.slice(0, 20);
   const lines = top.map(h => {
     const when = h.c.createdAt ? new Date(h.c.createdAt).toISOString().slice(0, 10) : '';
-    return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+    return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}${h.successor ? `\n    ↪ ${supersededByNote(h.successor)}` : ''}`;
   });
   // Never say "warming — retry" to someone who simply has not installed the
   // runtime: for them that advice is wrong forever, and their results are the
@@ -597,8 +779,25 @@ export async function opBrainTaskContext({
   };
 }
 
+// Card meanings for a question, never waiting on a preparation (1.97.0): at
+// most a few seconds of embedding inline; whatever is still missing is handed
+// to the background preparation (startBrainPreparation) and the answer says
+// so (preparationNotice). Meaning ranking is used once at least
+// MEANING_READY_SHARE of the cards are ready — below that the keyword path
+// covers every card, which a mostly-unprepared meaning ranking would not.
+const MEANING_READY_SHARE = 0.5;
+async function questionVectors(pipe, file, cards) {
+  const stats = {};
+  const vecs = await vectorsForBrain(pipe, file, cards, { stats });
+  if (stats.pending > 0) startBrainPreparation(file);
+  const usable = Boolean(vecs && vecs.size) && (!stats.wanted || stats.ready / stats.wanted >= MEANING_READY_SHARE);
+  return { vecs, stats, usable };
+}
+
 export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
-  const q = String(question || '').trim();
+  // A last line `Also: <words>` is the caller's guess at the card's wording; it
+  // joins the meaning query only (splitAskWords in klypix-format.mjs).
+  const { question: q, words } = splitAskWords(question);
   if (!q) return err('brain_ask needs a question.');
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
@@ -611,13 +810,14 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // Semantic blend (best-effort, time-bounded): embed the question + the brain's
   // cards on-device, hand rankForQuestion a Map<cardId, cosine>. A missing/warming
   // model degrades cleanly to pure lexical.
-  let semantic = null, mode = 'lexical', cardVecs = null;
+  let semantic = null, mode = 'lexical', cardVecs = null, prep = null;
   try {
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
-      const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
-      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = 'semantic+lexical (on-device)'; }
+      const [qv] = await embedTexts(pipe, [words ? `${q}\n${words}` : q], { kind: 'query' });
+      const { vecs, stats, usable } = await questionVectors(pipe, t.file, struct.cards);
+      prep = stats;
+      if (qv && usable) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = `semantic+lexical (on-device)${words ? ' + your Also words' : ''}`; }
     }
   } catch { semantic = null; cardVecs = null; }
   // Parity with search_all_brains (8445e9c): never say "warming — retry" to a
@@ -631,6 +831,8 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   if (!semantic) {
     fallbackNotice = semanticFallbackNotice(false);
     if (fallbackNotice) mode = fallbackNotice.startsWith('LEXICAL ONLY') ? 'lexical-only (no semantic runtime)' : 'lexical (semantic warming)';
+    if (prep?.pending > 0) mode = 'lexical (preparing search by meaning)';
+    if (words) mode += ' + your Also words';
   }
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
@@ -643,7 +845,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // vectors that rank the question, reused; null degrades pairing to its
   // lexical anchor/coverage fallback (works on every host, embeddings or not).
   const pairSim = cardVecs ? (a, b) => { const va = cardVecs.get(a), vb = cardVecs.get(b); return va && vb ? dot(va, vb) : null; } : null;
-  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim });
+  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim, words });
   if (wantRerank && result.hits.length > 1) {
     try {
       const reranked = await withRerankerForUse(log, 8_000, rr => rerankHits(rr, q, result.hits));
@@ -678,7 +880,11 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
       mode += ' + status-mode';
     } catch { statusMd = ''; }
   }
-  const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
+  // While the brain is still being prepared, that is the one thing to say: the
+  // runtime IS installed, so the "warming — retry" fallback line would only
+  // repeat it less precisely.
+  const prepNotice = preparationNotice(t.file, prep, { usedMeaning: Boolean(semantic) });
+  const noticeMd = prepNotice ? `> ${prepNotice}\n\n` : (fallbackNotice ? `> ${fallbackNotice}\n\n` : '');
   const evidenceCache = new Map();
   const evidenceForCard = (card) => formatCardEvidence(inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }));
   return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null, evidenceForCard }))] };
@@ -703,8 +909,8 @@ export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log =
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
-      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
+      const { vecs, usable } = await questionVectors(pipe, t.file, struct.cards);
+      if (qv && usable) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
     }
   } catch { semantic = null; }
   const result = challengeBrain(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 8)) });
@@ -723,12 +929,16 @@ export async function opCanvasView({ vault, canvas }) {
   if (!t.file) return err(`No canvas found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   let parsed;
   try { parsed = await parseKlypix(fs.readFileSync(t.file)); } catch (e) { return err(`Read failed: ${e.message}`); }
-  const { struct, canvas: canvasJson, zip } = parsed;
-  const renderSpec = await buildRenderSpec({ struct, canvas: canvasJson, zip });
+  const { canvas: canvasJson, zip } = parsed;
+  // Scope lock in BOTH places this tool reads: the render spec walks the raw
+  // order + item files, and the summary walks the struct.
+  const { struct, hiddenIds, boxes } = scopeLockedView(parsed);
+  const renderSpec = await buildRenderSpec({ struct, canvas: canvasJson, zip }, { hiddenIds });
   const stamp = brainStamp(t.file, struct, t.how);
   const summary = `${stamp}Rendered “${struct.title}” — ${renderSpec.items.length} items · ${renderSpec.connections.length} connections`
     + `${renderSpec.counts.truncated ? ` · ${renderSpec.counts.truncated} truncated for budget` : ''}`
     + `${renderSpec.counts.strokes ? ` · ${renderSpec.counts.strokes} ink strokes not shown` : ''}\n\n`
+    + boxes.map(box => `> 🔒 ${scopeLockLine(box)}\n\n`).join('')
     + structToBrief(struct, { maxRecent: 10, maxMilestones: 4, maxConnections: 0, maxSkills: 6 });
   return { blocks: [text(summary)], structured: { renderSpec } };
 }
@@ -988,7 +1198,11 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', ref 
         if (mode === 'plans' && cold && installed) {
           try {
             const pipe = await getEmbedderForUse(log, 20_000);
-            if (pipe) vecs = await vectorsForBrain(pipe, file, struct.cards);
+            if (pipe) {
+              const stats = {};
+              vecs = await vectorsForBrain(pipe, file, struct.cards, { stats });
+              if (stats.pending > 0) startBrainPreparation(file);
+            }
           } catch (e) { embedErr = e; }
         }
         let pairSim = null, how;
@@ -1364,9 +1578,15 @@ const lockBusy = (kind) => err(
   'Nothing was overwritten; retry the same operation.'
 );
 
+// Every canvas write takes a cross-process lock, not only brains. Brains keep
+// the folder lock the hooks and the desktop app share
+// (<folder>/.claude/brain-capture.lock). An ordinary canvas locks in the
+// profile (~/.claude/project-brain/locks/<sha256 of its canonical path>.lock)
+// through the same protocol: acquiring the folder lock creates a `.claude`
+// folder, which would appear beside a canvas on the Desktop or in Documents.
 const withCanvasWriteLock = (file, fn, { brain = false } = {}) =>
   withWriteLock(path.resolve(file), () => {
-    if (!brain) return fn();
+    if (!brain) return withAdvisoryWriteLock(canvasWriteLockPath(file), (locked) => locked ? fn() : lockBusy('Canvas'));
     return withAdvisoryWriteLock(brainCaptureLockPath(file), (locked) => locked ? fn() : lockBusy('Brain'));
   });
 
@@ -1410,7 +1630,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
         const { buffer, stats } = await collapseDuplicatePartialNotes(fs.readFileSync(file));
         if (!stats.cards) return { blocks: [text('✓ Nothing to repair — no card carries a repeated ✔ partial note.')] };
         await atomicWrite(file, buffer);
-        return { blocks: [text(`🧹 Repaired ${stats.cards} card(s): ${stats.notes} duplicate ✔ partial note(s) removed, the earliest of each kept. Nothing was archived or deleted. Reopen the brain in the KLYPIX app to see it.`)] };
+        return { blocks: [text(`🧹 Repaired ${stats.cards} card(s): ${stats.notes} duplicate ✔ partial note(s) removed, the earliest of each kept. Nothing was archived or deleted. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).`)] };
       } catch (e) {
         return err(`Repair failed (brain unchanged): ${e.message}`);
       }
@@ -1439,7 +1659,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
       if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
       let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
       await atomicWrite(file, out);
-      return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in the KLYPIX app to see it.${skippedNote}`)] };
+      return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${skippedNote}`)] };
     } catch (e) {
       return err(`Garden apply failed (brain unchanged): ${e.message}`);
     }
@@ -1518,7 +1738,9 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → structural */ }
   if (pipe) {
     try {
-      const vecs = await vectorsForBrain(pipe, file, struct.cards);
+      const stats = {};
+      const vecs = await vectorsForBrain(pipe, file, struct.cards, { stats });
+      if (stats.pending > 0) startBrainPreparation(file);
       const items = live.filter(c => vecs.get(c.id));
       const sources = normalizedScope === 'orphans' ? items.filter(c => orphanIds.has(c.id)) : items;
       for (const a of sources) {
@@ -1580,14 +1802,17 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   }, { brain: true });
 }
 
-export async function opCreateCanvas({ vault, title, cards, connections, groups, filename }) {
+export async function opCreateCanvas({ vault, title, cards, connections, groups, filename, via }) {
   if (!fs.existsSync(vault)) { try { fs.mkdirSync(vault, { recursive: true }); } catch { /* ignore */ } }
   // Locked on the VAULT: safeName picks a free name by probing the directory, so
   // two concurrent creates of the same title would both see it free and the second
   // atomicWrite would silently replace the first canvas.
   return withVaultCreateLock(vault, async () => {
     try {
-      const buf = await buildKlypix({ title, cards, connections, groups });
+      // Provenance: WHICH AI tool made these cards (the MCP client's name), the
+      // same stamp add_to_canvas writes — KLYPIX shows it as the card's chip.
+      const stamped = via ? (cards || []).map(c => ({ ...c, createdVia: via })) : cards;
+      const buf = await buildKlypix({ title, cards: stamped, connections, groups });
       const name = filename ? safeName(vault, filename.replace(IS_CANVAS, '')) : safeName(vault, title);
       const out = path.join(vault, name);
       await atomicWrite(out, buf);
@@ -1605,8 +1830,10 @@ export async function opCreateCanvas({ vault, title, cards, connections, groups,
 }
 
 export async function opAddToCanvas({ vault, canvas, cards, connections, via }) {
-  const file = resolveCanvas(vault, canvas);
-  if (!file) return err(`Canvas not found: ${canvas}`);
+  const resolved = resolveCanvasDetailed(vault, canvas);
+  if (!resolved.file) return notFoundResult(canvas, vault, resolved.ambiguous);
+  const file = resolved.file;
+  const failed = (message, extra = {}) => ({ blocks: [text(message)], isError: true, structured: { ok: false, mode: 'file', ...extra } });
   // add_to_canvas is generic, so infer the document kind before choosing the
   // cross-process layer. Filename is the legacy signal; manifest.kind keeps a
   // renamed brain protected. The actual read-modify-write still happens only
@@ -1619,25 +1846,75 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
   // The read MUST be inside the lock: reading first and appending later is exactly
   // the interleaving that loses the other writer's cards.
   return withCanvasWriteLock(file, async () => {
+    // The lease (app-lease.mjs): a canvas KLYPIX has OPEN is never rewritten —
+    // the app's next save would replace the file, and KLYPIX builds before the
+    // lease drop cards they did not hold. Brains are exempt: KLYPIX merges them
+    // and shows an agent's brain cards live. Checked inside the lock, right
+    // before the read, so the window in which KLYPIX could open the file
+    // between check and write is as small as this process can make it.
+    const verdict = isBrain ? { action: 'write', code: null } : leaseVerdict(file);
+    const shownTitle = canvasTitleOf(file) || path.basename(file).replace(IS_CANVAS, '');
+    if (verdict.action === 'refuse') {
+      const sentence = tellUser('OPEN_IN_APP', { canvas: shownTitle });
+      return {
+        blocks: [
+          text(`Nothing was written: '${shownTitle}' is open in KLYPIX right now, and KLYPIX's next save would replace the file.`),
+          text(`Tell the user: ${sentence}`),
+        ],
+        isError: true,
+        structured: { ok: false, mode: 'file', code: 'OPEN_IN_APP', tell_user: sentence, canvas: file },
+      };
+    }
     try {
       const original = fs.readFileSync(file);
       let beforeIds = new Set();
       try { const b = await parseKlypix(original); beforeIds = new Set(b.struct.cards.map(c => c.id)); } catch { /* new/legacy → treat all as new */ }
       // Provenance: stamp WHICH agent wrote these cards (cursor / claude / cline / a2a).
       const stamped = via ? cards.map(c => ({ ...c, createdVia: via })) : cards;
-      const buf = await appendToKlypix(original, { cards: stamped, connections });
-      await atomicWrite(file, buf);
-      let detail = '', struct;
+      let buf;
+      try {
+        buf = await appendToKlypix(original, { cards: stamped, connections });
+      } catch (e) {
+        // A group naming a box the person locked from AI tools, or froze:
+        // refused before anything was written.
+        if (e?.code === 'SCOPE_LOCKED' || e?.code === 'FROZEN') {
+          const sentence = tellUser(e.code);
+          return {
+            blocks: [text(`Nothing was written: ${e.message}`), text(`Tell the user: ${sentence}`)],
+            isError: true,
+            structured: { ok: false, mode: 'file', code: e.code, tell_user: sentence, canvas: file },
+          };
+        }
+        throw e;
+      }
+      // Restore point before the bytes are replaced: brains always, an ordinary
+      // canvas too (machine-local, size-capped; `npx klypix-mcp brain-history`).
+      await atomicWrite(file, buf, { isBrain, restorePoint: !isBrain, reason: 'add_to_canvas' });
+      let detail = '', struct, cardIds = [], boxIds = [];
       try {
         ({ struct } = await parseKlypix(buf));
-        detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
+        const fresh = struct.cards.filter(c => !beforeIds.has(c.id));
+        cardIds = fresh.filter(c => c.type !== 'container').map(c => c.id);
+        boxIds = fresh.filter(c => c.type === 'container').map(c => c.id);
+        detail = cardDetailBlock(struct, new Set(fresh.map(c => c.id)));
       } catch { /* detail is optional */ }
-      return {
-        blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in the KLYPIX app to see them.${detail}`)],
-        file: { name: path.basename(file), buffer: buf }, struct,
-      };
+      const title = struct?.title || shownTitle;
+      const seen = isBrain
+        ? 'It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).'
+        : 'They appear when the canvas is next opened in KLYPIX.';
+      const blocks = [text(`Added ${cards.length} card${cards.length === 1 ? '' : 's'} to '${title}'. ${seen}${detail}`)];
+      const structured = { ok: true, mode: 'file', canvas: file, card_ids: cardIds, ...(boxIds.length ? { box_ids: boxIds } : {}) };
+      // KLYPIX on this PC cannot say whether it has the canvas open (no lease:
+      // closed, or a build from before the lease) — written, with the one step
+      // that keeps the cards if it IS open.
+      if (verdict.action === 'warn') {
+        const sentence = tellUser('MAY_BE_OPEN', { canvas: title, version: LEASE_SINCE_APP_VERSION });
+        blocks.push(text(`Tell the user: ${sentence}`));
+        Object.assign(structured, { code: 'MAY_BE_OPEN', tell_user: sentence });
+      }
+      return { blocks, structured, file: { name: path.basename(file), buffer: buf }, struct };
     } catch (e) {
-      return err(`Add failed: ${e.message}`);
+      return failed(`Add failed: ${e.message}`);
     }
   }, { brain: isBrain });
 }
@@ -1655,6 +1932,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
+  ({ marker, text: noteText } = liftLeadingMarker(marker, noteText));
   if (looksLikeUnfilledDraft(noteText)) return err('Complete or discard the draft rationale before capturing it; the brain cannot record an unfilled WHY THIS MATTERS placeholder.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   // Guard cards (2026-08-24): a guard is authored on a '+' skill (or amended
@@ -1677,13 +1955,18 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   // review, CONFIRMED). Cards ride the same capture batch, so they also pass
   // through the fulfillment cross-check. Queue is cleared only after the write.
   const projectDir = path.dirname(file);
+  // Plugin mode keeps that queue outside the project (pluginShipObsPaths).
+  const shipQueue = typeof autoUpdateLib.isPluginMode === 'function' && autoUpdateLib.isPluginMode()
+    && typeof autoUpdateLib.pluginShipObsPaths === 'function'
+    ? { paths: autoUpdateLib.pluginShipObsPaths(projectDir) }
+    : {};
   // The pending-ships drain reads a queue, folds it into THIS batch and clears it
   // only after the write — so it has to sit inside the lock too, or two concurrent
   // notes both drain the same queue and one batch of ship cards is lost with the
   // write that carried it.
   return withCanvasWriteLock(file, async () => {
   let pendingShips = [];
-  try { pendingShips = readPendingShips(projectDir); } catch { pendingShips = []; }
+  try { pendingShips = readPendingShips(projectDir, shipQueue); } catch { pendingShips = []; }
   if (pendingShips.length) {
     for (const c of pendingShipCards(pendingShips, {})) {
       input.cards.push({ text: `${c.area}: 🏁 ${c.summary}\n#${String(c.area).toLowerCase()} #auto`, area: c.area, createdVia: 'ship-observed', borderColor: 'rgba(59,130,246,0.8)' });
@@ -1693,7 +1976,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const res = await captureIntoBrain(fs.readFileSync(file), input);
     let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
     await atomicWrite(file, out);
-    if (pendingShips.length) clearPendingShips(projectDir);   // durable now — safe to consume
+    if (pendingShips.length) clearPendingShips(projectDir, shipQueue);   // durable now — safe to consume
     // Question enrichment (1.77): the caller session's declared intent is the
     // natural-language question that produced this card — recorded to the
     // retrieval sidecar so brain_ask finds the card in the asker's vocabulary.
@@ -1761,7 +2044,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     try {
       if (guardField || fs.existsSync(guardSidecarPathFor(file))) await ensureGuardSidecar(file);
     } catch { /* best-effort — the hook's currency check is the backstop */ }
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}${rc}`)] };
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${corr}${rc}`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }
@@ -1872,3 +2155,198 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).
 export { buildKlypixMap, parseKlypix };
+
+// ── brain_handoff (1.99.0): a session hands its unfinished work to the next ──
+// Two layers (see session-handoff.mjs): the AUTOMATIC lane record every Stop
+// hook writes, and the DELIBERATE 🤝 card a session writes into the brain when
+// it knows it is stopping. One verb covers both: write (card), take / done (a
+// card by id, or a lane record by session), list (both). Card writes go
+// through the capture engine (dedup, evidence fingerprints, enrichment) and
+// the brain lock; stamps are exact-id rewrites. Nothing here starts, wakes or
+// routes a session.
+function gitHeadInfo(dir) {
+  const out = { branch: '', head: '' };
+  try {
+    const run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
+    out.branch = branch && branch !== 'HEAD' ? branch : '';
+    out.head = run(['rev-parse', '--short=7', 'HEAD']);
+  } catch { /* not a repo, or no git — the card just carries no branch */ }
+  return out;
+}
+const handoffAgo = (ms) => { const m = Math.max(0, Math.round(Number(ms || 0) / 60000)); if (m < 1) return 'just now'; if (m < 60) return `${m}m ago`; const h = Math.round(m / 60); return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`; };
+const handoffFlat = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+const handoffStatusOf = (file) => {
+  const now = Date.now();
+  let live = [];
+  let known = [];
+  try { live = listActiveSessions({ brainPath: file, now }); } catch { live = []; }
+  try { known = listKnownSessions({ brainPath: file, now }); } catch { known = []; }
+  return (sessionId) => {
+    const key = String(sessionId || '').toLowerCase();
+    if (!key) return '';
+    const row = live.find((s) => [s.id, s.logicalSessionId, ...(s.aliases || [])].filter(Boolean).some((v) => String(v).toLowerCase() === key || String(v).toLowerCase().startsWith(key)));
+    if (row) return sessionStatusLabel(row, now) || 'live';
+    const entry = known.find((e) => String(e.id).toLowerCase() === key || String(e.id).toLowerCase().startsWith(key));
+    return entry ? entry.status : '';
+  };
+};
+
+export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, continues, continuedBy, ...fields }) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const file = t.file;
+  const projectDir = path.dirname(file);
+  const me = { sessionId: String(from.sessionId || '').slice(0, 160), client: String(from.client || via || 'unknown').slice(0, 40) };
+  const stamp = (ms) => { try { return new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; } catch { return ''; } };
+  const reply = (textOut, extra = {}, isError = false) => ({ blocks: [text(textOut)], structured: { schemaVersion: 1, action, brain: file, ...extra }, ...(isError ? { isError: true } : {}) });
+
+  if (action === 'list') {
+    let struct = null;
+    try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`brain_handoff list failed: ${e.message}`); }
+    const now = Date.now();
+    const cards = listOpenHandoffCards(struct, { now });
+    const lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId });
+    const titles = new Map(cards.map((h) => [h.id, h.title]));
+    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8 }), formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
+    const out = blocks.length ? blocks.join('\n\n') : 'No handoff card is open in this brain and no other session left unfinished work on this project (sessions quiet for 10 minutes or closed, intent never completed, last 14 days).';
+    return reply(brainStamp(file, struct, t.how) + out, { handoffs: cards, unfinished: lane });
+  }
+
+  if (action === 'write') {
+    const v = normalizeHandoffInput(fields);
+    if (!v.ok) return err(`brain_handoff write refused: ${v.error}`);
+    const value = v.value;
+    const at = Date.now();
+    const repo = gitHeadInfo(projectDir);
+    const resume = resumeCommandFor(me.client, me.sessionId);
+    const body = renderHandoffCard(value, { from: me, at, repo, resume });
+    const evidence = value.files.map((ref) => ({ kind: 'file', ref }));
+    // A handoff that CONTINUES an earlier one closes it FIRST: an open ❓ with
+    // a near-identical title would otherwise be the capture engine's merge
+    // target (a rephrased open question updates its twin in place), and the
+    // new card would never exist. Closed → archived → no longer a live twin.
+    let continuedNote = '';
+    if (continues) {
+      try {
+        const r = await opBrainHandoff({ vault, canvas: file, action: 'done', id: continues, from: me, via, summary: 'continued by a new handoff' });
+        continuedNote = r.isError ? `\nThe earlier handoff ${continues} was NOT closed: ${r.blocks?.[0]?.text || 'unknown error'}` : `\nEarlier handoff ${continues} closed as continued by this one.`;
+      } catch (e) { continuedNote = `\nThe earlier handoff ${continues} was NOT closed: ${e.message}`; }
+    }
+    const noteResult = await opBrainNote({
+      vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client,
+      evidence: evidence.length ? evidence : undefined,
+      verify: value.verify || undefined,
+      enrichmentQuestion: [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],
+    });
+    if (noteResult.isError) return noteResult;
+    // Find the card the engine just wrote (exact line 1) and stamp its machine twin.
+    let cardId = null;
+    try {
+      await withCanvasWriteLock(file, async () => {
+        const buf = fs.readFileSync(file);
+        const { struct } = await parseKlypix(buf);
+        const mine = struct.cards
+          .filter((c) => c.type !== 'container' && isHandoffLine1(c.text) && handoffTitle(c) === value.title && !(c.handoff && c.handoff.from))
+          .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        if (!mine.length) return;
+        cardId = mine[0].id;
+        const res = await rewriteCardById(buf, cardId, (j) => { j.handoff = handoffMachineField(value, { from: me, at, repo, continues }); }, { now: at });
+        if (res.changed) await atomicWrite(file, res.buffer);
+      }, { brain: true });
+    } catch { /* the card landed; only the machine twin is missing — prose still parses */ }
+    // The lane: this session's automatic record now points at its card.
+    let laneStamp = null;
+    if (me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId } }); } catch { laneStamp = null; } }
+    // Name the successor on the closed card (archived above), so its history
+    // says where the work went.
+    if (continues && cardId && !continuedNote.includes('NOT closed')) {
+      try {
+        await withCanvasWriteLock(file, async () => {
+          const res = await rewriteCardById(fs.readFileSync(file), continues, (j) => { if (!j.handoff || typeof j.handoff !== 'object') return false; j.handoff.continuedBy = cardId; }, { now: at });
+          if (res.changed) await atomicWrite(file, res.buffer);
+        }, { brain: true });
+      } catch { /* history only */ }
+    }
+    const next = `\nThe next session on this project — any agent — sees it at its first brain_sync / session start${cardId ? ` as [${cardId}]` : ''} and takes it with brain_handoff {action:"take", id:"${cardId || '<id>'}"}. Tell the human it is recorded in the brain; do not ask them to paste anything.`;
+    return reply(`✓ Handoff recorded in ${path.basename(file)}: “${value.title}” (${HANDOFF_REASONS[value.reason]}) — ${value.next.length} next step(s), ${value.done.length} done, ${value.files.length} file(s)${value.verify ? ', verify given' : ''}.${laneStamp?.ok ? '' : ' (lane record not linked)'}${next}${continuedNote}\n\n${body}`, { id: cardId, title: value.title, laneLinked: Boolean(laneStamp?.ok) });
+  }
+
+  if (action === 'take' || action === 'done') {
+    const now = Date.now();
+    const verb = action === 'take' ? 'Taken' : 'Finished';
+    const extraNote = handoffFlat(summary || note || '').slice(0, 400);
+    const stampLine = `${verb}: ${handoffClientWord(me.client)} ${me.sessionId.slice(0, 8)} · ${stamp(now)}${extraNote ? ` · ${extraNote}` : ''}`;
+    // ── a lane record (automatic layer) ──
+    if (!id && session) {
+      const patch = action === 'take'
+        ? { takenBy: { id: me.sessionId, client: me.client, at: now } }
+        : { doneAt: now, doneBy: me.sessionId };
+      const r = stampSessionWork({ brainPath: file, sessionId: String(session), patch, now });
+      if (!r.ok) {
+        const why = {
+          'target-unknown': `no session KLYPIX remembers matches "${String(session).slice(0, 40)}" — use the id from the unfinished-work list`,
+          'target-not-unique': `"${String(session).slice(0, 40)}" matches more than one session — use more characters of its id`,
+          'lane-locked': 'the coordination lane is busy — retry',
+        }[r.reason] || r.reason;
+        return err(`brain_handoff ${action} refused: ${why}.`);
+      }
+      const rec = listUnfinishedWork({ brainPath: file, now, includeWorking: true }).find((x) => x.id === r.id) || null;
+      if (action === 'take') {
+        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
+      }
+      return reply(`✓ Marked done: the work ${String(r.id).slice(0, 8)} left no longer shows as unfinished.${extraNote ? ` Note kept: ${extraNote}` : ''}`, { session: r.id });
+    }
+    if (!id) return err(`brain_handoff ${action} needs \`id\` (a handoff card id) or \`session\` (a session id from the unfinished-work list).`);
+    // ── a handoff card (deliberate layer) ──
+    return withCanvasWriteLock(file, async () => {
+      let buf = fs.readFileSync(file);
+      const { struct } = await parseKlypix(buf);
+      const card = struct.cards.find((c) => c.id === id && c.type !== 'container');
+      if (!card) return err(`brain_handoff ${action} refused: no card ${id} in ${path.basename(file)}.`);
+      if (!isHandoffLine1(card.text)) return err(`brain_handoff ${action} refused: ${id} is not a handoff card (no 🤝 HANDOFF on its first line).`);
+      const h = parseHandoffCard(card, { now });
+      if (h.state === 'done' || /^archive$/i.test(card.area || '')) return err(`brain_handoff ${action} refused: handoff ${id} (“${h.title}”) is already finished${h.finished ? ` by ${h.finished.client} ${String(h.finished.sessionId).slice(0, 8)}` : ''}.`);
+      const statusOf = handoffStatusOf(file);
+      if (action === 'take' && h.taken && h.taken.sessionId && h.taken.sessionId !== me.sessionId) {
+        const st = statusOf(h.taken.sessionId);
+        if (st === 'working') return err(`brain_handoff take refused: handoff ${id} (“${h.title}”) was taken by ${h.taken.client} ${String(h.taken.sessionId).slice(0, 8)} ${h.taken.at ? handoffAgo(now - h.taken.at) : ''} and that session is working now — coordinate with brain_message instead of duplicating it.`);
+      }
+      const res = await rewriteCardById(buf, id, (j) => {
+        const lines = String(j.content || '').replace(/\r/g, '').split('\n');
+        const tagAt = lines.findIndex((l, i) => i > 0 && /^#[\w-]/.test(l.trim()));
+        const insertAt = tagAt > 0 ? tagAt : lines.length;
+        lines.splice(insertAt, 0, stampLine);
+        j.content = lines.join('\n');
+        const machine = j.handoff && typeof j.handoff === 'object' ? j.handoff : { v: 1, state: 'open', title: h.title, from: { client: h.from.client, sessionId: h.from.sessionId }, at: h.at || null, taken: null, done: null };
+        if (action === 'take') { machine.state = 'taken'; machine.taken = { client: handoffClientWord(me.client), sessionId: me.sessionId, at: now, ...(extraNote ? { note: extraNote } : {}) }; }
+        else { machine.state = 'done'; machine.done = { client: handoffClientWord(me.client), sessionId: me.sessionId, at: now, ...(extraNote ? { summary: extraNote } : {}) }; if (continuedBy) machine.continuedBy = String(continuedBy).slice(0, 64); }
+        j.handoff = machine;
+      }, { now });
+      if (!res.changed) return err(`brain_handoff ${action} failed: ${res.reason}.`);
+      buf = res.buffer;
+      let archived = false;
+      if (action === 'done') {
+        // The card is an open ❓: resolve it by exact id (the same archive
+        // path a ✓ takes), so the brief and every lister stop showing it.
+        try {
+          const cap = await captureIntoBrain(buf, { resolutions: [{ id, whole: true, text: `${h.title} — ${extraNote || 'finished'}` }] });
+          buf = cap.buffer;
+          archived = (cap.stats?.idResolutions || []).some((o) => o.id === id && o.outcome !== 'refused');
+        } catch { archived = false; }
+        try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep */ }
+      }
+      await atomicWrite(file, buf);
+      // The lane: the writer's automatic record follows the card.
+      if (h.from.sessionId) {
+        try { stampSessionWork({ brainPath: file, sessionId: h.from.sessionId, patch: action === 'take' ? { takenBy: { id: me.sessionId, client: me.client, at: now } } : { doneAt: now, doneBy: me.sessionId }, now }); } catch { /* best-effort */ }
+      }
+      if (action === 'take') {
+        return reply(`✓ Taken over: handoff ${id} “${h.title}” (left by ${h.from.client} ${String(h.from.sessionId).slice(0, 8)}${h.at ? ` ${handoffAgo(now - h.at)}` : ''}) is yours — every peer sees it as taken. Now call brain_sync with intent “${h.title}”${h.files.length ? ` and files ${h.files.join(', ')}` : ''}; work the Next list in order; when it is finished, brain_handoff {action:"done", id:"${id}", summary:"…"}.\n\n${handoffFlat(card.text).slice(0, 1400)}`, { id, handoff: h });
+      }
+      return reply(`✓ Finished: handoff ${id} “${h.title}” is marked done${archived ? ' and archived' : ' (it stays visible until the next tidy archives it)'}.${extraNote ? ` Summary kept: ${extraNote}` : ''} Record what shipped with brain_note (a 🏁 milestone) if it is worth remembering.`, { id, archived });
+    }, { brain: true });
+  }
+  return err(`brain_handoff: unknown action "${action}" — use write, take, done or list.`);
+}

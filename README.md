@@ -119,11 +119,15 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 15 required coordination behaviours — not the 23 tools, and not the retrieval engine.
+It verifies 15 required coordination behaviours — not every tool, and not the retrieval engine.
 
 ---
 
 ## Quick start
+
+**You need Node.js 20 or newer** (`node -v` to check). Every way of connecting runs the server with
+`node` — `npx`, the installed bundle, and the entry KLYPIX's Settings buttons write — and none of them
+checks for Node first.
 
 Run this **inside your project**:
 
@@ -142,7 +146,7 @@ git repo, and then **proves the result** before it exits:
   editors   Claude Code · Cursor · Codex · Gemini CLI · Antigravity · VS Code
   wired     9 file(s) · 9 updated   (skipped 5 for tools you don't have)
   git       .klypix merge driver registered
-  verified  ✓ 23 tools reachable via .mcp.json (892ms)
+  verified  ✓ 25 tools reachable via .mcp.json (892ms)
 ```
 
 That last line is the point. MCP config fails **silently** — a wrong entry means the server never
@@ -231,13 +235,23 @@ not a filing convention.
   session's brief. That is brief priority, not a retrieval-ranking boost.
 - **You can ask what the project believed then.** `brain_ask` with `as_of: 2026-03-01` reweights
   ranking by card lifecycle dates, so corrections made later do not leak backwards.
-- **Retrieval is local.** Lexical by default. If the optional on-device model is installed,
-  `brain_ask` and `search_all_brains` use BGE semantic ranking with lexical help for exact
-  identifiers, paths, and versions — still entirely on your machine. The previous cross-encoder
-  is available for experiments with `KLYPIX_RERANK=1`, but is off by default because it reduced
-  precision and added latency on the frozen human-paraphrase evaluation. Without the embedding
-  model, retrieval degrades cleanly to lexical. `npx klypix-mcp install` deliberately does not
-  install that model, so a fresh install is lexical.
+- **Retrieval is local.** With the on-device model ("search by meaning"), `brain_ask` and
+  `search_all_brains` use BGE semantic ranking with lexical help for exact identifiers, paths, and
+  versions — still entirely on your machine. Without it, retrieval is keyword-only. The previous
+  cross-encoder is available for experiments with `KLYPIX_RERANK=1`, but is off by default because
+  it reduced precision and added latency on the frozen human-paraphrase evaluation.
+- **Search by meaning is installed for you (1.97).** `npx klypix-mcp install` run by a person in a
+  terminal installs it: about 150 MB to download once, about 110 MB on disk after the files Node
+  never loads are removed. Skip it with `--no-semantic` (or `KLYPIX_SEMANTIC=0`). Installs with no
+  terminal — CI, scripts, an AI agent running the install — get it only with `--semantic`. The
+  Claude plugin never downloads it. Measured on the frozen 102-question set: the right card in the
+  top 5 for 54 questions with it, 19 without.
+- **Preparing a brain never makes a question wait.** Each card is turned into a meaning vector once
+  (about 45 ms a card on a laptop CPU, one card at a time, ~305 MB peak), newest cards first, by a
+  low-priority background job that saves as it goes. A question on a brain that is not ready yet
+  answers right away from what is ready plus keywords, and says how far along the preparation is
+  ("Getting this brain ready for search by meaning: 900 of 3,670 cards so far, about 5 min left").
+  After that, only new or edited cards are prepared.
 
 ### Bounded semantic-memory runtime
 
@@ -315,15 +329,17 @@ behaviour is unverified.
 | **Gemini CLI / Antigravity** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Windsurf** | Rules file only | `link` | Reaches the tools through Windsurf's own global MCP config | Model must call `brain_note` | Via its own MCP config |
 | **Aider** | Rules file only (no MCP) | `link` | CLI path: `npx -y -p klypix-mcp klypix-read` | CLI path: `npx -y -p klypix-mcp klypix-append` | — |
-| **Claude Desktop** | One-time manual config edit | you | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
+| **Claude Desktop** | One-time config: KLYPIX's Settings button, or a manual edit | KLYPIX app or you | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 
 `install` and `link` are different things and are not interchangeable: `install` sets up the
 machine engine and hooks, then wires supported hosts detected for this project (see *Quick start*).
 `link` is the explicit per-project repair/projection path for all 14 managed files, regardless of
 which hosts are installed.
 
-**Claude Desktop** — add this to `claude_desktop_config.json` by hand; nothing writes that file
-for you:
+**Claude Desktop** — in the KLYPIX desktop app, Settings → Project → **Connect Claude Desktop**
+writes this entry for you; or add it to `claude_desktop_config.json` by hand. Either way it needs
+Node.js on the PC, and Claude Desktop must be quit completely (tray icon → Quit) and reopened before
+it lists the tools:
 
 ```json
 {
@@ -335,6 +351,82 @@ for you:
   }
 }
 ```
+
+---
+
+## Running as a Claude plugin
+
+The KLYPIX Claude plugin starts this server as `npx -y klypix-mcp@1.93.0`: one exact version, never
+a range or `latest`. It sets three variables: `KLYPIX_PLUGIN=1`,
+`KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` and `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}`.
+`KLYPIX_PLUGIN=1` turns on **plugin mode**, which changes how the MCP server behaves and nothing
+else. Every `npx klypix-mcp` command (`install`, `link`, `doctor`, `sessions` and the rest) works
+exactly as described elsewhere in this README. Only `KLYPIX_PLUGIN=1` turns plugin mode on;
+`CLAUDE_PLUGIN_ROOT` on its own does not.
+
+**What plugin mode never does**
+
+- **Update itself.** It never asks npm for a newer release and never installs one, whatever
+  `KLYPIX_AUTO_UPDATE` is set to. You run the version the plugin pins, and a newer version reaches
+  you only in a new plugin release.
+- **Run code from outside the package.** It runs only the worker inside the pinned package. It
+  never starts or switches to the copy that `npx klypix-mcp install` puts in
+  `~/.claude/project-brain`, and it never loads the optional on-device semantic model from that
+  folder. Search is keyword-only, so it never downloads model weights.
+- **Write project config files.** It never creates or rewrites rules files, editor MCP configs
+  (`.mcp.json`, `.cursor/`, `.codex/config.toml` and the rest) or the `AGENTS.md` brief block, in
+  this project or any other. Outside plugin mode, `brain_sync` and the updater do write these files;
+  *Security and permissions* explains when.
+- **Change Claude's settings.** It never writes `~/.claude/settings.json`, hooks, permissions or any
+  other host configuration.
+- **Collect data or read credentials.** It sends no telemetry or usage data, reads no API keys or
+  account tokens, and opens no network port. The one token it reads is the local bridge token the
+  KLYPIX app writes for AI tools while it runs (below); it is never logged or returned.
+
+**Network.** Plugin mode makes two kinds of request, and both go to the public npm registry. The
+first is npx downloading the pinned package when the plugin starts the server. The second is one
+`npm view klypix-mcp version`, and it runs only when an agent calls `brain_doctor` with
+`check_npm: true`. There are no other requests.
+
+**Programs it runs on your computer.** Read-only `git` commands in your project (current branch,
+tags, log) for coordination and release checks. Also `brain_reopen`, described at the end of this
+section. And on Windows, `show_in_klypix` with `bring_to_front: true` while KLYPIX is closed asks
+Windows to open that canvas file in KLYPIX (PowerShell `Start-Process`), at most once every 30
+seconds; it never does so while KLYPIX is running.
+
+**The KLYPIX app, when it is running (local, not the network).** On Windows, a tool call that needs
+the KLYPIX app (*App mode*, under *Human control in Klypix*) talks to the app over a local named
+pipe: inter-process communication on this PC. Plugin mode allows it, exactly as outside plugin
+mode. Nothing connects when the server starts; on such a call it reads
+`%APPDATA%\klypix\agent-bridge\endpoint.json` and the bridge token KLYPIX writes in
+`%LOCALAPPDATA%\klypix\agent-bridge`. With KLYPIX closed, or its *AI tools on this PC* switch
+off, nothing connects at all.
+
+**What it reads.** In your project: `brain.klypix`, the `.klypix` canvases, the `version` field of
+`package.json` and your git tags. On your computer: the coordination files in the table below. If
+the KLYPIX desktop app is installed, it also reads the app's data folder (`%APPDATA%\klypix`),
+read-only, to see whether the app is running, which canvases it has open, and the readings it saved
+on cards, and, on a call that needs the running app, the app's bridge token (above). It never reads chat history, transcripts or Claude's memory.
+
+**What it writes, and where**
+
+| Where | What | Why |
+|---|---|---|
+| Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none. The lock file is deleted after the write; the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. | The KLYPIX app and every other session that writes the brain use the same locks, so two writers never overwrite each other. |
+| The plugin's data folder (`KLYPIX_PLUGIN_DATA`) | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), and the last version and git tag seen in each project (`ship-observations/`). Also `extracted/`: copies of the PDFs, Office and other files `read_card_contents` hands to your AI tool as a local path, taken from the canvas you asked about. | Only this server uses these files. If `KLYPIX_PLUGIN_DATA` is not set, or still contains a `${...}` that was never filled in, it uses `CLAUDE_PLUGIN_DATA`. If neither is usable, the files go in `~/.claude/project-brain`, except `extracted/`, which then goes in `<system temp>/klypix-mcp/extracted` (where it always goes outside plugin mode). |
+| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. | Your other KLYPIX sessions on this computer (Claude Code, Codex, Cursor, the app) use the same files on purpose. Through them, a plugin session and a terminal session on the same project see each other, get warnings when they plan to edit the same files, and pass notes. Restore points are kept here so that `npx klypix-mcp brain-history` can still undo a brain write after you remove the plugin. |
+
+**`brain_reopen`.** Sometimes a session leaves a note for another session that has already closed.
+An agent can then call `brain_reopen`, and KLYPIX asks you first: in chat with *Reopen* and *Not
+now* buttons, or in a small dialog (PowerShell on Windows, osascript on macOS, zenity or kdialog on
+Linux). Only if you choose *Reopen* does it open a new, visible terminal that runs the app's own
+resume command, `claude --resume <id>` or `codex resume <id>`. *Reopen on your OK* has the details.
+
+**After you uninstall the plugin.** Claude Code removes the plugin and deletes its data folder.
+These stay: your brain and canvases, which belong to you; any `.claude/` folder a brain write
+created in a project; and the presence lanes, write locks and restore points in
+`~/.claude/project-brain`. Other KLYPIX tools on this computer share that folder. If you use none,
+you can delete it.
 
 ---
 
@@ -436,12 +528,22 @@ Future hosts get baseline support merely by connecting the MCP server. A deeper 
 
 ## Overlap warnings
 
-When two sessions declare overlapping expected files, `brain_sync` surfaces it: the peer, its
-declared task, and the exact paths in common. A one-time alert is queued to whichever session got
-there first, so a late arrival is not the only one who knows.
+`brain_sync` reports three kinds of overlap with other live sessions on the same brain:
 
-This warns. It does not prevent. Nothing blocks an edit, matching is exact-path, and both sides
-have to have declared their files for the overlap to be visible at all.
+- **Same file.** Both sessions declared, or were observed editing, the same path. You see the peer,
+  its task and the paths in common, and a one-time alert is queued to whichever session got there
+  first, so a late arrival is not the only one who knows.
+- **Would conflict at merge.** The two sessions are on different branches, and a test merge of the
+  two branch tips (`git merge-tree`, git 2.38 or newer) conflicts in named files, even though no
+  declared file overlaps. This sees committed work only: an uncommitted edit is invisible to git.
+  It also gets a one-time alert. Files the brain tooling regenerates on every branch (AGENTS.md,
+  rule files, `.mcp.json`, `brain.klypix`) are not counted.
+- **Same folder (advisory).** Both sessions work in one folder with no file in common yet. No alert
+  is sent. A folder that at least three sessions, and more than half of them, touch is treated as
+  noise and not reported.
+
+This warns. It does not prevent. Nothing blocks an edit. A session that never declared its files
+and was never observed editing is invisible to the file and folder checks.
 
 ## Handoffs and messages
 
@@ -488,8 +590,36 @@ receives the waiting note at its first action and the sender sees the receipt as
   waiting for them; `npx klypix-mcp sessions reopen <id>` reopens one (`--quiet` lets it wait for
   you instead of starting on the note).
 
-Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
-as cards, each stamped with the agent that wrote it.
+### Session handoff — continue in the next session, with any agent
+
+The case this exists for: a Claude Code session stops at its usage limit in the middle of a task,
+and the person opens Codex (or a fresh Claude Code) and says *continue*. Until 1.99.0 the only
+handoff was whatever the person pasted. Now there are two layers, and the person does not have
+to ask for either.
+
+**Automatic.** At every turn end the hooks record the session's last state on the lane that already
+remembers sessions for two weeks: the last human prompt, the tail of the last reply (where "done /
+next" usually is), the files it touched, and its *own* commits (the shas its `git commit` printed —
+never a branch range, because twenty sessions can share one checkout). When that session goes quiet
+for ten minutes or closes with its task uncompleted, every new session on the project sees
+**⏸️ Unfinished work left by other sessions** at its first `brain_sync` and at session start — in
+Claude Code, Codex, and any MCP host — with a status (*closed*, *idle 83m*), the files, the commits,
+the last words, and the resume command should the person want the old transcript. The agent takes it
+over with `brain_handoff {action:"take", session:"<id>"}` so peers see it is taken, continues from
+the record, and marks it `done`. Machine-local, like the rest of the lane.
+
+**Deliberate.** When a session knows it is stopping — the person asks for a handoff, the context or
+usage limit is near, the day ends, it is blocked, it is switching tool — it calls
+`brain_handoff {action:"write"}` with the task, what is done, what is **next in order**, the files
+and how to verify. That becomes a 🤝 HANDOFF card in the project brain: an open card the person can
+see and correct on the canvas, with the files as evidence anchors, that travels with the repo and
+syncs like every other card. It leads the session-start brief and the `brain_sync` start response
+until a session takes it (`{action:"take", id}`) and finishes it (`{action:"done", id}`, which
+archives it). A later handoff can name the earlier one it `continues`. The per-prompt hook nudges
+the agent to write one when the person says *handoff* or names the limit.
+
+Durable decisions still go in the brain as cards — a handoff is the one card about *work in
+flight*, and it closes when the work lands.
 
 ## Evidence-gated completion
 
@@ -528,6 +658,124 @@ The app is a separate, proprietary Windows product. The format, this server and 
 Apache-2.0 and work with no app installed. The app's interface is available in English and Arabic
 (some newer panels are still English-only).
 
+### KLYPIX canvases and your AI tool
+
+Beyond project brains, the same connection reads and writes the KLYPIX canvases (spaces) saved on
+your PC. **Your AI tool reads what KLYPIX has already read, and the files a saved canvas holds:**
+
+- `read_canvas` prints every card with its id; `read_card_contents` returns what is inside a card.
+  From what KLYPIX saved: the transcript on a video card, the text card **Read contents** made for a
+  reel or web page, an OCR card for a photo, a folder's file list. From the files embedded in the
+  saved canvas, with KLYPIX closed: a text file's words, a photo (a smaller copy when it is large),
+  and PDFs, Office and other files as a local path with the previews KLYPIX saved — see *Reading
+  what is inside cards* below. Audio and video come back as a path only; what they say comes from a
+  reading KLYPIX saved. For a reel, a web page or a video, choose Read contents in KLYPIX first
+  (select the card, press Enter), let the canvas save, then ask your AI tool — or, with KLYPIX open
+  on Windows, let your AI tool ask KLYPIX to read it (*App mode* below).
+- What a person set up in KLYPIX is respected: cards inside a box **locked from AI tools** are left
+  out of every read; frozen cards are marked read-only; collapsed boxes, comments and tags are shown.
+- `klypix_status` tells your AI tool what KLYPIX can do on this PC right now, and which step the person
+  has to take.
+- **A canvas that is open in KLYPIX is not written.** KLYPIX builds that write the open-canvas lease
+  (`%APPDATA%\klypix\agent-bridge\endpoint.json`, no secret in it) make `add_to_canvas` refuse
+  that canvas and say why; project brains are the exception, because KLYPIX merges them. With an older
+  KLYPIX, `add_to_canvas` writes and its reply tells the person to close the canvas's tab and open it
+  again.
+- Text that comes back from cards, pages, reels and files is fenced as data, never instructions.
+
+### App mode: your AI tool uses KLYPIX while it is open
+
+On Windows, while the KLYPIX app is open and **Settings → Project → AI tools on this PC** is on (it is
+on by default), the same connection reaches the running app. KLYPIX then runs its own code for the
+request, so its keys, consents, caps, freeze and undo apply. With KLYPIX closed or the switch off,
+every tool works in file mode as described above, and a step that needs the app says so in one
+sentence (`APP_NOT_RUNNING`, `ACCESS_OFF`, `BLOCKED`, `NEEDS_APP` …).
+
+| Tool | With KLYPIX open (app mode) | Otherwise (file mode) |
+|---|---|---|
+| `read_card_contents` | On a canvas open in KLYPIX, KLYPIX reads the cards itself, the way its Read contents does; each result says who paid (`paid_by`) | Readings KLYPIX already saved, and the files embedded in the canvas |
+| `read_canvas` | A canvas open in KLYPIX is read live: unsaved changes, the person's view (lens, filters, collapsed boxes), and for each card whether it is on screen, hidden by a filter, inside a collapsed box or off screen. View filters never remove a card | The saved file; when the canvas is open in KLYPIX the answer says changes not yet saved are not included |
+| `add_to_canvas` | On a canvas open in KLYPIX the cards appear at once, marked with the tool's name, in one undo step, and KLYPIX saves them | Writes the file; refuses a canvas open in KLYPIX. Project brains are always written as files, which KLYPIX merges |
+| `show_in_klypix` (Windows only) | Selects and frames cards in that canvas's tab, with an optional one-line banner labelled with the tool's name | `APP_NOT_RUNNING`; with `bring_to_front: true`, Windows opens the canvas file in KLYPIX |
+| `brain_lens` | Freshness, provenance, activity, orrery and unresolved come from KLYPIX's own lens code: the picture the person sees | Computed from the saved file |
+| `klypix_status` | Also the canvas in front of the person, their selection, their view, what KLYPIX is ready to read, and how many Gemini readings this tool has left today | What the saved files and the lease say |
+
+Who pays for a new reading (`paid_by`):
+
+| Card | What KLYPIX does | `paid_by` |
+|---|---|---|
+| Web page link | Fetches and extracts the page from this PC, never through the logged-in debug-port browser | `none` |
+| Photo | Hands your AI tool the original image, for its own model, plus KLYPIX's OCR text when OCR is on | `ai_tool` |
+| PDF, Office or text file, folder | Reads the file embedded in the canvas, on this PC | `none` |
+| YouTube link, reel | Gemini watches it: the person's own key, else KLYPIX's included AI. A reel's video only if the person already allowed KLYPIX's video helper; otherwise its caption and cover, marked partial | `own_gemini_key` or `included_ai` |
+| Video or audio file | Transcription on this PC when it is installed, otherwise Gemini as above | `none`, or as above |
+
+- A saved reading comes back first and spends nothing; `refresh: true` asks for a new one.
+- Gemini readings for AI tools are bounded by caps, never by a prompt: 20 a day per tool, 40 a day
+  across all AI tools, at most 5 cards per call and 3 reads running per tool.
+- New readings are pinned beside their card with an arrow and the tool's name, emerald for a full
+  reading and amber for a partial one; one Ctrl+Z in KLYPIX removes them. The person's selection and
+  view do not move.
+- Every answer comes within about 45 seconds. A read still running returns `still_reading` with
+  `retry_after_seconds`; asking again with the same arguments picks up the same read and spends
+  nothing extra.
+- No input schema changed. `read_card_contents` still requires `canvas` and `card_ids`: to read what
+  the person selected in KLYPIX, call `klypix_status` first, which lists the canvas in front of
+  them and the selected card ids.
+- KLYPIX's `since`, `storage` and `weight` lenses have no name in `brain_lens`'s `view` list, which
+  is frozen; `klypix_status` reports the lens the person has open.
+
+**Control.** AI tools are on by default. The person turns them off, or blocks one tool, in KLYPIX's
+Settings → Project, where every request is listed: time, tool, what it asked for, canvas and
+outcome, never card text, links or tokens. Tool names are what each AI tool reports about itself,
+so they are labels, not proof of identity.
+
+**How the connection works.** While the switch is on, KLYPIX listens on a named pipe with a new
+random name at every start and writes a new random token to
+`%LOCALAPPDATA%\klypix\agent-bridge\token`, in your Windows profile. On each call that needs
+the app (never at startup) klypix-mcp reads `endpoint.json` and the token again, and both sides
+prove they hold the token before a request is sent; klypix-mcp sends nothing to a pipe that cannot
+prove itself. The token and the pipe name are never logged, returned to the AI tool or shown by
+`brain_doctor`. Any program running under your Windows account can read the token.
+
+### Reading what is inside cards
+
+A canvas saved by KLYPIX keeps a copy of every file dropped on it. `read_card_contents` hands those
+files to your AI tool as they are, so it reads them with its own model and its own file tools —
+KLYPIX itself extracts nothing here (no OCR, transcription or document-text extraction; those run in
+the KLYPIX app). Pass the ids `read_canvas` prints; every card with something inside has an
+`Inside:` line saying what comes back.
+
+| Card | What your AI tool gets |
+|---|---|
+| Text file (`.txt`, `.md`, `.csv`, `.json`, source code, …) | Its words, fenced as data (up to `max_chars` per card, 48,000 characters per answer). A longer file is cut, marked `truncated`, and the whole file is given as a local path. |
+| Photo | The photo itself. A photo too large for one answer comes as a smaller JPEG copy (long edge 1,568 px or less, turned upright from its EXIF orientation), and the full-size original as a local path. Formats vision models do not take (BMP, HEIC, TIFF) come as a path, with the reason. |
+| PDF | A local path to the PDF — Claude Code's Read tool opens it — and KLYPIX's saved image of page 1. |
+| Word, Excel, PowerPoint and other files | A local path to the file, plus the preview KLYPIX saved: a document's opening text, a sheet's first rows. |
+| Folder | Its file list. Add `entry_paths` (up to 8 file paths from the list) to get those files the same way. Paths that would leave the folder are refused; an entry over 64 MB, or one that inflates more than 200 times its stored size, is refused with its size. A folder kept on disk (not embedded) is read from where it is, never outside it. |
+| Audio, video | The reading KLYPIX saved, when there is one. Otherwise a local path and a plain statement that nothing in the answer says what it contains; a video's saved poster frame is attached and labelled as one frame. |
+
+A PDF, Office or text file that KLYPIX has already read also comes back with the text KLYPIX
+saved from it, first (`method: document_text`), and the file by path beside it. That text is
+used only while the card still holds the file it was read from: a reading of an earlier version
+of the file is never served, shown by `read_canvas` or matched by `search_canvases`, and the
+file itself is handed over as above.
+
+Limits, and why:
+
+- **One answer stays under 1 MB.** Claude Desktop refuses a whole tool result over 1 MB, so the images
+  in one answer share a budget of 800,000 base64 characters (up to 4 images in `read_card_contents`
+  and in `read_canvas`). A photo that does not fit even as a smaller copy is named with the reason.
+- **Files go by path, not as embedded blobs.** An MCP embedded resource carrying a PDF is rejected by
+  claude.ai's connector layer today, so PDFs and Office files are copied once to a cache folder and
+  given as a path: `extracted/` in the plugin's data folder when running as a Claude plugin, otherwise
+  `<system temp>/klypix-mcp/extracted`, named `<sha-256 prefix>-<original name>`. A file over 150 MB
+  is not copied out. An AI tool without a file-reading tool (Claude Desktop without a filesystem
+  connector) gets the previews and the path, not the whole PDF.
+- **An iPhone photo or file** added to a shared space is not stored in the canvas file (KLYPIX fetches
+  it while it runs), so it cannot be handed over from the saved canvas; the answer says so.
+- Cards inside a box locked from AI tools are never read, copied or attached.
+
 ## Measure it yourself
 
 Claims about a shared brain — "nothing is lost", "it stays fast" — are unfalsifiable until a
@@ -546,6 +794,15 @@ machine those unlocked writers lost 17 of 22 cards; the same contention through 
 lost 0 of 46. If the control ever loses nothing, the run reports **inconclusive** instead of a pass.
 
 Latest results, with hardware and date: [BENCHMARKS.md](BENCHMARKS.md).
+
+**Does it change what agents do?** That needs real agents, so it lives in the repository rather than
+the package: [`bench/coordination/`](bench/coordination/README.md) runs Claude Code or Codex on four
+small repos where another session knows something the agent needs (a decision changed today, work
+overlapping on another branch, a note from a session that has ended, a root cause another vendor's
+session found). Each run is graded by a test written after the agent finishes, against no shared
+channel, a human copy-paste, `AGENTS.md` kept tidy or appended, and KLYPIX over MCP only. Every number
+is printed with its sample size and interval; tools it has not measured are listed as not measured.
+`--dry-run` costs nothing and proves the graders.
 
 ## Git and concurrency
 
@@ -662,7 +919,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 23 verbs
+## The verbs: 26, and 27 on Windows
 
 | Tool | What it does |
 |---|---|
@@ -671,11 +928,12 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_note` | Capture with the full lifecycle — supersede / re-adopt / ✓ resolve / ~ update / 🛠 skill / `closes:` |
 | `brain_reconcile` | Proposes stale-vs-correction pairs, unrecorded migrations, and the open cards a release ref's commits look to have closed — then closes the exact pairs you confirm |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
-| `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
+| `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views; on a canvas open in KLYPIX (Windows), the first five come from KLYPIX's own lens code |
 | `brain_garden` | Maintenance pass — proposes first; consolidation cannot apply without an approval code the human generates. The separate `repair:"duplicate-partials"` pass is dry-run first and needs no code (it removes only exact repeats and archives nothing) |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
+| `brain_handoff` | The session handoff. `write` puts a 🤝 card in the brain — task, done, next in order, files, verify — when a session stops before the work is done; the next session of any agent sees it at its first `brain_sync` and `take`s it, then marks it `done`. `list` also shows the **unfinished work** KLYPIX recorded automatically for every session (its last reply, files and own commits), which can be taken over by session id |
 | `brain_reopen` | Reopen a closed Claude Code or Codex session so a note waiting for it gets there now — only after the person answers *Reopen* in an in-chat prompt or KLYPIX's own dialog; opens a new, visible terminal in that session's folder with the host's resume command |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |
@@ -683,14 +941,17 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `project_map_scan` | KLYPIX's own zero-install scanner: gitignore-aware file inventory + file-level import edges (relative, tsconfig-alias, and monorepo-workspace imports resolved) written to `klypix-map/graph.json` — which then serves `project_map_context` automatically |
 | `project_map_drift` | Read-only drift report: brain cards whose referenced files are gone or moved (with rename candidates), plus a headline when the checkout itself is behind its origin default branch |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
-| `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
-| `search_canvases` | Search across canvases by name and content |
+| `read_canvas` | A canvas open in KLYPIX (Windows) is read live from the app: unsaved changes, the person's view, and each card's visibility. Otherwise a canvas as markdown: every card with its id, the connection graph, `[[links]]`, `#tags` and tag pills, status, comments, reactions, frozen and collapsed boxes, and the readings KLYPIX already saved on link, video and photo cards; photo cards' images attached (a smaller copy when large), each labelled with its card; every card with something inside names the `read_card_contents` call that returns it. Cards inside a box a person locked from AI tools are left out, and counted. Titles as KLYPIX shows them work as names |
+| `read_card_contents` | What is inside up to 5 cards — a reel, YouTube video, web page, video or audio file, photo, PDF, Office or text file, or folder. On a canvas open in KLYPIX (Windows), KLYPIX reads them itself with its own readers and says who paid (`paid_by`). Otherwise: readings KLYPIX already saved (transcripts on the card, its Read contents and OCR result cards, folder listings) — fenced as data, marked full or partial, with where they were made (this PC or cloud AI) — and the files embedded in the saved canvas: a text file's words; a photo (a smaller copy when it is large, plus the original's local path); PDFs, Office and other files as a cached local path with KLYPIX's saved previews (a PDF's first page, a document's opening text, a sheet's first rows); folder entries named in `entry_paths`, by the same rules. Audio and video come back as a path, and what they say only from a reading KLYPIX saved. One answer stays under Claude Desktop's 1 MB limit. A card that needs a reading KLYPIX cannot make right now comes back with the one step the person takes; klypix-mcp itself extracts no text |
+| `klypix_status` | What KLYPIX can do on this PC right now: whether the app is running and which canvases it has open, where canvases are read from, and what each feature still needs from the person. With KLYPIX open: the canvas in front of the person, their selection and view, what KLYPIX is ready to read, and the Gemini readings this tool has left today |
+| `show_in_klypix` | Windows only. Selects and frames cards in the running KLYPIX app, with an optional one-line banner labelled with the tool's name; KLYPIX never comes to the front for an AI tool. With KLYPIX closed and `bring_to_front: true`, Windows opens the canvas file in KLYPIX |
+| `search_canvases` | Search across canvases by name, content, tags and tag pills, and the readings KLYPIX saved on cards; returns card ids and dates. Never searches inside a box a person locked from AI tools |
 | `search_all_brains` | Cross-project memory search across every registered brain on this machine |
 | `create_canvas` | New `.klypix` from cards + connections |
-| `add_to_canvas` | Append cards/connections (positions preserved) |
+| `add_to_canvas` | Append cards/connections (positions preserved), bordered and readable on KLYPIX's dark and Paper themes; a card's `group` puts it in that titled box. On a canvas open in KLYPIX (Windows) the cards go to KLYPIX itself: live, attributed, one undo. When KLYPIX cannot take them it refuses (`OPEN_IN_APP`, `ACCESS_OFF`, `BLOCKED`), a box locked from AI tools (`SCOPE_LOCKED`) or a frozen box (`FROZEN`), and writes nothing; project brains are the exception to the first. Returns the new card ids |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 26 on Linux and macOS and 27 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
@@ -863,7 +1124,23 @@ keep lazy first-use indexing instead.
   writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
   entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you
   run it in; `link --check` audits them without writing.
+- **The MCP server writes those project files too, outside plugin mode.** `link` and `install` are
+  not the only writers of the 14 files. Each time `brain_sync` starts a task (`phase: "start"`) in
+  a project that has a `brain.klypix`, the server does two things. It adds that project to the
+  machine's registry, `~/.claude/project-brain/registry.json` (the Claude Code hook adds projects
+  there as well). Then it checks the project's KLYPIX-managed files and creates or rewrites any that
+  are missing or out of date. That check covers all 14 files, whichever editors you have. It
+  includes `.mcp.json`, whose entry starts the installed bundle or, when there is none,
+  `npx -y klypix-mcp` with no version pinned, and `.codex/config.toml`. The automatic updater does
+  the same for every registered project seen in the last 14 days, right after it installs an update
+  and otherwise at most once a day. `KLYPIX_AUTO_UPDATE=0` stops the updater's pass. Plugin mode
+  (`KLYPIX_PLUGIN=1`) stops both passes and keeps its registry in the plugin's data folder; see
+  *Running as a Claude plugin*.
 - **Codex hooks require Codex's own trust approval** and are opt-in via `--codex-hooks`.
+- **The KLYPIX app bridge is local IPC.** On Windows, a tool call that needs the running KLYPIX app
+  connects over a named pipe on this PC (see *App mode*). Nothing connects at startup or while KLYPIX
+  is closed or its AI-tools switch is off; the client proves the app holds the per-start token before
+  it sends a request, and never logs or returns the token or the pipe name.
 
 ## Current limitations
 
@@ -876,9 +1153,10 @@ Read this section before you build on any of it.
   loop prevention, stable message IDs and per-recipient-machine acknowledgement primitives), but no
   transport: carrying frames between machines is the desktop app's job. With `klypix-mcp` alone,
   coordination is machine-local.
-- **Overlap matching is exact-path, and both sides must declare.** A session that never declares
-  its expected files is invisible to overlap detection, and `src/auth/token.ts` does not match a
-  rename or a parent directory.
+- **File overlap is exact-path.** A session needs declared files or observed edits to be checked;
+  `src/auth/token.ts` does not match a rename. Folder overlap is advisory. The merge test sees
+  committed work only, needs git 2.38 or newer, and runs only for sessions on different local
+  branches of the same repository.
 - **Overlap warnings are advisory.** Nothing is blocked. One severity string in the payload reads
   `blocking`; the mechanism is not.
 - **Codex has no automatic capture**, with or without `--codex-hooks`. The Codex hook never writes
@@ -889,9 +1167,11 @@ Read this section before you build on any of it.
 - **Drift detection is single-host and opt-in per card.** It needs an `ev:` anchor written by the
   card's author, and it runs only in the Claude Code hook path — the MCP tools do not compute
   freshness.
-- **`search_all_brains` finds nothing for a Cursor-only or Codex-only setup.** The cross-project
-  registry is written by the Claude Code hook and only by it. This is a silent empty result, not an
-  error.
+- **`search_all_brains` only finds registered projects.** The cross-project registry is written by
+  the Claude Code hook and by `brain_sync` when it starts a task, from any MCP host. A project where
+  neither has happened is missing from the results, and nothing reports it: the search just comes
+  back empty. In plugin mode the server keeps its own list in the plugin's data folder and searches
+  that list together with the shared one.
 - **`npx klypix-mcp link` does not manage `CLAUDE.md`.** It manages `AGENTS.md` and seven other
   rules files. Only the desktop app writes `CLAUDE.md`.
 - **A fresh `npx klypix-mcp install` gets lexical retrieval.** The optional on-device model is
@@ -901,6 +1181,9 @@ Read this section before you build on any of it.
   *does* gate on it — a `gate` job runs `npm ci`, asserts the test chain is intact, runs `npm test`,
   validates the version/tag, and checks the packed tarball; `publish` declares `needs: gate`, so a
   red gate means npm never sees a tarball.
+- **App mode is Windows-only and needs the running KLYPIX app** with AI tools allowed. Everywhere
+  else the tools work in file mode. Tool names in KLYPIX are what each AI tool reports, not a
+  verified identity: any program running as you can read the bridge token.
 - **`canvas_view`'s MCP Apps UI has never been verified on a real Apps host.**
 
 ## Numbers and methodology
@@ -919,6 +1202,15 @@ independently validated.
   0.43, top-1 33%. The stratum that matters most is the honest one: **paraphrase questions that share
   no words with their card reach recall@5 44%**; status, temporal and multi-hop questions sit at
   81–93% because they still share vocabulary. Lexical-only scores 0% on the same set.
+- **The caller's words (`brain_ask`, 1.96).** A question can end with one more line,
+  `Also: <words a card answering it would likely use>`; the calling agent is itself a model, so it
+  can guess the card's wording at no extra cost. The words join the meaning query only. Measured
+  2026-10-11 on the same brain grown to 3,829 cards (102 of the frozen questions still answerable),
+  with words written by Gemini 2.5 Flash as a stand-in for the calling agent: recall@5 54% → 59%
+  (8 found, 3 lost), recall@8 61% → 68%, recall@20 68% → 76%, MRR 0.375 → 0.424. With no local
+  model (a fresh install, the Claude plugin) the words count as extra keywords at half weight:
+  recall@5 19% → 24% (5 found, none lost), recall@10 25% → 31%. Without the line, ranking is
+  unchanged byte for byte.
 - **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
   paraphrases, first cross-brain run): recall@5 **42%** (CI 23–64), top-1 11%, MRR 0.25. Paraphrase
   recall transfers between brains; the ranker is not tuned to the brain it was built on. It is

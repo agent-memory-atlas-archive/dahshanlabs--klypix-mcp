@@ -1,0 +1,124 @@
+#!/usr/bin/env node
+// Turn results.jsonl into the published table.
+//   node bench/coordination/report.mjs results.jsonl [--json]
+//
+// Every number carries its n and a 95% Wilson interval. A "difference" is only
+// called out when the two intervals do not overlap — anything else is a tie,
+// and the report says so.
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { wilson, median, pct } from './lib/stats.mjs';
+import { SCENARIOS } from './scenarios.mjs';
+import { CONDITIONS } from './conditions.mjs';
+
+export function summarize(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    const key = `${r.scenario}|${r.condition}|${r.agent}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  const cells = [];
+  for (const [key, all] of groups) {
+    const [scenario, condition, agent] = key.split('|');
+    // A run whose channel never came up, or whose mid-task fact landed after
+    // the agent's last action, measured nothing about the channel: shown as
+    // invalid, never counted as a pass or a fail. A condition the scenario
+    // cannot apply to is shown as n/a with its reason.
+    const na = all.find((r) => r.notApplicable)?.notApplicable || null;
+    const rs = all.filter((r) => !r.invalid && !r.notApplicable);
+    const invalidRuns = all.filter((r) => r.invalid).length;
+    if (!rs.length) { cells.push({ scenario, condition, agent, n: 0, invalidRuns, notApplicable: na, success: { k: 0, ...wilson(0, 0) }, staleActions: { k: 0, ...wilson(0, 0) }, relaysPerTask: 0, medianCostUsd: null, medianTokens: null, medianMinutes: null, errors: 0, consulted: 0, handled: 0, handledKnown: 0, versions: [], models: [] }); continue; }
+    const n = rs.length;
+    const ok = rs.filter((r) => r.success).length;
+    // "Acted on stale information" is judged only over runs that completed: a
+    // timed-out or budget-capped run leaves files untouched, which is not deference.
+    const completed = rs.filter((r) => !r.error);
+    const stale = completed.filter((r) => r.staleAction).length;
+    const errors = rs.filter((r) => r.error).length;
+    cells.push({
+      scenario, condition, agent, n, invalidRuns,
+      success: { k: ok, ...wilson(ok, n) },
+      staleActions: { k: stale, n: completed.length, ...wilson(stale, completed.length) },
+      relaysPerTask: rs.reduce((a, r) => a + (r.relays || 0), 0) / n,
+      medianCostUsd: median(rs.map((r) => r.costUsd)),
+      medianTokens: median(rs.map((r) => r.tokens)),
+      medianMinutes: median(rs.map((r) => (r.durationMs || 0) / 60000)),
+      errors,
+      // Runs in which the agent called the condition's MCP server at all.
+      consulted: rs.filter((r) => r.mcpCalls && Object.keys(r.mcpCalls).length > 0).length,
+      // Scenarios that define it (S2): the overlap was handled — merged away,
+      // or named in the agent's final message. A flagged conflict is not an
+      // unnoticed one, even when the strict grade fails it.
+      handled: rs.filter((r) => r.handled === true).length,
+      handledKnown: rs.filter((r) => r.handled === true || r.handled === false).length,
+      versions: [...new Set(rs.map((r) => r.versions).filter(Boolean))],
+      models: [...new Set(rs.map((r) => r.model).filter(Boolean))],
+    });
+  }
+  return cells;
+}
+
+const overlaps = (a, b) => a.low != null && b.low != null && !(a.high < b.low || b.high < a.low);
+
+export function toMarkdown(cells, rows = []) {
+  const out = ['# KLYPIX coordination bench — results', ''];
+  const agents = [...new Set(cells.map((c) => c.agent))];
+  for (const agent of agents) {
+    const mine = cells.filter((c) => c.agent === agent);
+    const versions = [...new Set(mine.flatMap((c) => c.versions))];
+    const models = [...new Set(mine.flatMap((c) => c.models))];
+    out.push(`## Agent: ${agent}`, '');
+    if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
+    if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
+    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Handled overlap | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
+    for (const s of SCENARIOS) {
+      for (const c of CONDITIONS) {
+        const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
+        if (!cell) continue;
+        if (cell.notApplicable) { out.push(`| ${s.title} | ${c.label} | — | n/a: ${cell.notApplicable} | — | — | — | — | — | — |`); continue; }
+        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+      }
+    }
+    out.push('');
+    out.push('**Clear differences** (95% intervals do not overlap):');
+    let any = false;
+    for (const s of SCENARIOS) {
+      const forS = cells.filter((x) => x.agent === agent && x.scenario === s.id);
+      const k = forS.find((x) => x.condition === 'klypix');
+      if (!k) continue;
+      for (const other of forS) {
+        if (other.condition === 'klypix' || other.condition === 'relay') continue;
+        if (!overlaps(k.success, other.success) && k.success.p > other.success.p) {
+          out.push(`- ${s.title}: KLYPIX ${pct(k.success.p)} vs ${other.condition} ${pct(other.success.p)}`);
+          any = true;
+        }
+      }
+    }
+    if (!any) out.push('- none at this sample size — report these as ties.');
+    out.push('');
+  }
+  const notRun = CONDITIONS.filter((c) => !c.runnable);
+  if (notRun.length) {
+    out.push('## Not measured', '');
+    for (const c of notRun) out.push(`- **${c.label}** — ${c.reason}`);
+    out.push('');
+  }
+  const reasons = new Map();
+  for (const r of rows) if (r.invalid) { const k = String(r.error || 'invalid').split(':')[0]; reasons.set(k, (reasons.get(k) || 0) + 1); }
+  if (reasons.size) {
+    out.push('## Invalid runs (excluded from every rate)', '');
+    for (const [k, n] of reasons) out.push(`- ${k}: ${n}`);
+    out.push('');
+  }
+  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound). "invalid" = the run measured nothing about its channel (server never came up, a write did not land, a mid-task fact never fired or landed after the last action, or the bench itself failed); it is excluded from the rates, not counted as a fail. _(control)_ rows are solvable without any channel; _(calibration)_ rows check that delivery works, not which channel is better._');
+  return out.join('\n');
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const file = process.argv[2];
+  if (!file) { console.error('usage: report.mjs results.jsonl [--json]'); process.exit(2); }
+  const rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const cells = summarize(rows);
+  process.stdout.write(process.argv.includes('--json') ? `${JSON.stringify(cells, null, 2)}\n` : `${toMarkdown(cells, rows)}\n`);
+}
