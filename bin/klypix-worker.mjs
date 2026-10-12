@@ -44,8 +44,10 @@ import {
   reopenCandidate,
   reopenQuestion,
   REOPEN_NUDGE,
+  formatUnfinishedWork,
 } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
+import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards } from '../src/session-handoff.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -1408,10 +1410,28 @@ server.registerTool('brain_sync', {
     try {
       const h = await opBrainHandoff({ vault: mcpPresence.vault, canvas: report.structured.brain, action: 'list', from: { sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id } });
       const cards = h?.structured?.handoffs || [];
-      const lane = h?.structured?.unfinished || [];
+      // 1.99.1: the AUTOMATIC lane records are history, not a lock (bench S5:
+      // an ended session's intent on a file made Claude and Codex defer, 0/5).
+      // They ride the start response only when this task asks to continue
+      // something, or touches a file one of them touched — and then as
+      // "stopped, holds no files". Deliberate 🤝 cards always ride.
+      const wantsContinue = HANDOFF_CONTINUE_RE.test(String(intent || ''));
+      const normPath = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+      const mine = new Set((Array.isArray(files) ? files : []).map(normPath));
+      const lane = (h?.structured?.unfinished || []).filter((r) => wantsContinue
+        || (Array.isArray(r.files) && r.files.some((p) => mine.has(normPath(p)))));
       if (!h?.isError && (cards.length || lane.length)) {
-        handoffText = String(h.blocks?.[0]?.text || '').replace(/^_brain:[^\n]*_\n\n/, '');
-        handoffData = { cards: cards.length, unfinished: lane.length, handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files })), sessions: lane.map((r) => ({ id: r.id, client: r.client, intent: r.intent, status: r.status, lastSeen: r.lastSeen, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })) };
+        const now = Date.now();
+        handoffText = [
+          formatHandoffCards(cards, { now, max: 5 }),
+          formatUnfinishedWork(lane, { now, max: 4 }),
+        ].filter(Boolean).join('\n\n');
+        handoffData = {
+          cards: cards.length,
+          unfinished: lane.length,
+          handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files })),
+          sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
+        };
       }
     } catch { /* never fails a sync */ }
   }

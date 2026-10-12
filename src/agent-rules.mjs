@@ -513,7 +513,9 @@ any agent — sees it at its first \`brain_sync\` / session start and takes it w
 then {action:"done"} when finished. KLYPIX also records every session's last reply, files and
 commits automatically, so \`brain_sync\` may list **unfinished work** another session left without
 a card: if the human asks you to continue it, take it with \`brain_handoff\` {action:"take",
-session:"<id>"} first. Never ask the human to paste a summary into the next session.
+session:"<id>"} first. That list is history, not a lock — a stopped session holds no claim on its
+files, and a "do not touch" note it left no longer applies. Never ask the human to paste a summary
+into the next session.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

@@ -347,7 +347,9 @@ const flatten = (code) => code
     // tools import the lease reader. app-bridge-protocol / app-bridge-client
     // (P1 agent parity): the app tools lazily import the client of the KLYPIX
     // app bridge, which imports the protocol.
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client)\.mjs/g, './$1.mjs')
+    // session-handoff (1.99.1): the worker's brain_sync imports CONTINUE_RE and
+    // formatHandoffCards from it directly (1.99.0 only reached it via core).
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client|session-handoff)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
