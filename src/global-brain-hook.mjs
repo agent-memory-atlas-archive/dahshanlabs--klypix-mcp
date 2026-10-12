@@ -1467,6 +1467,10 @@ function releaseLeaseFooterLine(list, now) {
 // left off"). Read-only. Quoted text is another session's record, never the
 // human's instructions; markers in it were neutralized at store time.
 const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
+// 1.99.1 twin of agent-presence UNFINISHED_WINDOW_MS / hasWorkEvidence: only a
+// session that stopped in the last 24h AND left a 1.99+ work record is listed.
+const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
+const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId));
 const CONTINUE_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
 const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
 function unfinishedFooter(sid, { max = 4 } = {}) {
@@ -1485,18 +1489,19 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
                 const intentAt = Number(e.intentAt) || Number(e.firstSeen) || 0;
                 return { e, row, w, completed: Number(e.completedAt) > 0 && Number(e.completedAt) >= intentAt, done: Number(w.doneAt) > 0 && Number(w.doneAt) >= intentAt, quietMs: quiet(row) };
             })
-            .filter(r => !r.completed && !r.done && r.quietMs >= UNFINISHED_QUIET_MS)
+            .filter(r => !r.completed && !r.done && r.quietMs >= UNFINISHED_QUIET_MS
+                && hasWorkEvidence(r.w) && now - Number(r.e.lastSeen || 0) < UNFINISHED_WINDOW_MS)
             .sort((a, b) => Number(b.e.lastSeen) - Number(a.e.lastSeen));
         if (!recs.length) return '';
         const flat = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const lines = [`⏸️ Unfinished work left by other sessions on this project (${recs.length}, newest first) — each stopped before its task was done and nobody is working on it now:`];
+        const lines = [`⏸️ Work other sessions may have left unfinished (${recs.length}, stopped in the last 24h, newest first). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
         for (const { e, row, w } of recs.slice(0, max)) {
             const status = row ? (statusLabelOf(row, now) || 'live') : (e.endedAt ? 'closed' : `not seen for ${agoWord(now - e.lastSeen).replace(/ ago$/, '')}`);
-            const bits = [status, `last active ${agoWord(now - e.lastSeen)}`];
+            const bits = [row ? `stopped (${status})` : 'ended', `last active ${agoWord(now - e.lastSeen)}`];
             if (e.branch) bits.push(`branch ${e.branch}`);
             lines.push(`- ${clientWordOf(e.client)} ${e.id.slice(0, 8)} · “${flat(e.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
             if (Array.isArray(w.commits) && w.commits.length) lines.push(`  commits: ${w.commits.map(c => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
-            if (Array.isArray(e.files) && e.files.length) lines.push(`  files: ${e.files.slice(-8).join(', ')}`);
+            if (Array.isArray(e.files) && e.files.length) lines.push(`  files it touched (free — not reserved): ${e.files.slice(-8).join(', ')}`);
             if (w.lastWords) lines.push(`  its last words: “${flat(w.lastWords).slice(0, 420)}”`);
             if (w.handoffCardId) lines.push(`  🤝 it left a handoff card in the brain: ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`);
             if (w.takenBy) {
@@ -1506,7 +1511,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             if (!row && (e.client === 'claude-code' || e.client === 'codex') && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(e.id)) lines.push(`  its own transcript, should the human want it: ${e.client === 'codex' ? `codex resume ${e.id}` : `claude --resume ${e.id}`}`);
         }
         if (recs.length > max) lines.push(`- …and ${recs.length - max} more — brain_handoff {action:"list"} shows all.`);
-        lines.push('To continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when it is finished, brain_handoff {action:"done", session:"<its id>"}. If it is not what the human asked for, leave it.');
+        lines.push('If the human asks you to continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when finished, brain_handoff {action:"done", session:"<its id>"}. Otherwise ignore this list — it is history, not a lock.');
         return '\n\n' + lines.join('\n');
     } catch { return ''; }
 }

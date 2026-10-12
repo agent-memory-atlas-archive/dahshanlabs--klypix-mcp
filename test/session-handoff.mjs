@@ -94,7 +94,7 @@ try {
     ok(closed && !closed.live && closed.status === 'closed' && closed.resumeCommand === `claude --resume ${claude}` && closed.lastWords.includes('chooser dialog'), 'A9 a closed session keeps its work state and offers its resume command');
 
     const text = formatUnfinishedWork(list, { now: now + 91 * MIN });
-    ok(text.includes('⏸️ Unfinished work') && text.includes('Claude Code 0abcdef0') && text.includes('Drive web upload') && text.includes('its last words') && text.includes('abc1234 feat(drive)') && text.includes('brain_handoff {action:"take", session:"<its id>"}'), 'A10 formatUnfinishedWork prints who, what, last words, commits and how to take over');
+    ok(text.includes('⏸️ Work other sessions may have left unfinished') && text.includes('Claude Code 0abcdef0') && text.includes('Drive web upload') && text.includes('its last words') && text.includes('abc1234 feat(drive)') && text.includes('brain_handoff {action:"take", session:"<its id>"}'), 'A10 formatUnfinishedWork prints who, what, last words, commits and how to take over');
 
     // Take by prefix (another session) → listed as taken; done → gone.
     const took = stampSessionWork({ brainPath, home, now: now + 92 * MIN, sessionId: claude.slice(0, 10), patch: { takenBy: { id: codex, client: 'codex', at: now + 92 * MIN } } });
@@ -114,6 +114,21 @@ try {
     upsertSession({ brainPath, home, now: now + 100 * MIN, id: claude, client: 'claude-code', channel: 'mcp', event: 'McpTaskStart', logicalSessionId: claude, identitySource: 'claude-lifecycle', intent: 'new task after the handoff' });
     const revived = listUnfinishedWork({ brainPath, home, now: now + 120 * MIN }).find((r) => r.id === claude);
     ok(revived && revived.intent === 'new task after the handoff', 'A17 a new intent after done is unfinished again (the stamp belongs to the old intent)');
+
+    // ── 1.99.1: signal, not history ─────────────────────────────────────────
+    // A session with NO 1.99 work record (a legacy or hook-only chat whose last
+    // prompt was "i can close?") is never listed — the field case was 34 such rows.
+    const empty = 'empty-session-0000-1111';
+    upsertSession({ brainPath, home, now: now + 100 * MIN, id: empty, client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: empty, identitySource: 'claude-lifecycle', intent: 'i can close ?', files: ['src/x.ts'] });
+    ok(!listUnfinishedWork({ brainPath, home, now: now + 200 * MIN }).some((r) => r.id === empty), 'A18 a session with no work record (no reply tail, commits or card) is never listed');
+    ok(listUnfinishedWork({ brainPath, home, now: now + 200 * MIN, includeWorking: true }).some((r) => r.id === empty), 'A19 …but take/done by session id can still find it (includeWorking)');
+    // Older than 24h → history, not listed.
+    ok(!listUnfinishedWork({ brainPath, home, now: now + 100 * MIN + 25 * 60 * MIN }).some((r) => r.id === claude), 'A20 a session that stopped more than 24h ago is not listed');
+    // Text and JSON both say: not running, holds no files, a WIP note is stale.
+    const rec2 = listUnfinishedWork({ brainPath, home, now: now + 120 * MIN }).find((r) => r.id === claude);
+    ok(rec2 && rec2.working === false && rec2.holdsFiles === false && /holds no claim/.test(rec2.note) && /no longer applies/.test(rec2.note), 'A21 the JSON record says working:false, holdsFiles:false and that a do-not-touch note no longer applies');
+    const t2 = formatUnfinishedWork([rec2], { now: now + 120 * MIN });
+    ok(t2.includes('None of them is running: they hold NO claim on any file') && t2.includes('files it touched (free — not reserved)') && t2.includes('history, not a lock'), 'A22 the text says the files are free and the list is history, not a lock');
   }
 
   // ── B. The Claude hook twin: Stop records, SessionStart / prompt print ────
@@ -156,12 +171,12 @@ try {
     fs.writeFileSync(laneFile, JSON.stringify(lane));
     const other = 'f987c66b-1111-2222-3333-444444444444';
     const start = run([], { session_id: other, cwd: project });
-    ok(start.includes('⏸️ Unfinished work') && start.includes('Claude Code 7d3d8a6c') && start.includes('its last words: “The upload route is wired') && start.includes(`${sha} feat(drive): upload route`), 'B3 SessionStart of another session prints the unfinished work with last words and commits');
+    ok(start.includes('⏸️ Work other sessions may have left unfinished') && start.includes('Claude Code 7d3d8a6c') && start.includes('its last words: “The upload route is wired') && start.includes(`${sha} feat(drive): upload route`), 'B3 SessionStart of another session prints the unfinished work with last words and commits');
     ok(start.includes(`claude --resume ${sid}`) || start.includes('not seen for') || start.includes('idle'), 'B4 the entry carries a status word (and a resume command once it is no longer live)');
     const cont = run(['--prompt'], { session_id: other, prompt: 'continue what the other session was doing', cwd: project });
-    ok(cont.includes('⏸️ Unfinished work') && cont.includes('7d3d8a6c'), 'B5 a continue-shaped prompt prints the unfinished work again');
+    ok(cont.includes('⏸️ Work other sessions may have left unfinished') && cont.includes('7d3d8a6c'), 'B5 a continue-shaped prompt prints the unfinished work again');
     const plain = run(['--prompt'], { session_id: other, prompt: 'rename the README heading', cwd: project });
-    ok(!plain.includes('⏸️ Unfinished work') && !plain.includes('🤝 KLYPIX'), 'B6 an unrelated prompt prints neither the list nor the hint');
+    ok(!plain.includes('⏸️ Work other sessions may have left unfinished') && !plain.includes('🤝 KLYPIX'), 'B6 an unrelated prompt prints neither the list nor the hint');
     const limit = run(['--prompt'], { session_id: other, prompt: 'we are close to the usage limit, write a handoff', cwd: project });
     ok(limit.includes('🤝 KLYPIX') && limit.includes('brain_handoff'), 'B7 naming the limit / asking for a handoff prints the deliberate-handoff hint');
     ok(HANDOFF_ASK_RE.test('hand it off before we hit the limit') && HANDOFF_ASK_RE.test('we are near the context window') && !HANDOFF_ASK_RE.test('rename the README heading'), 'B8 the ask regex matches a handoff request and not an unrelated prompt');
@@ -265,6 +280,25 @@ try {
     ok(!nothing.content[0].text.includes('🤝 Handoff card'), 'D9 a checkpoint prints no handoff block');
     await b.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
     await b.close();
+
+    // 1.99.1 (bench S5): an automatic lane record is history, not a lock. It
+    // rides brain_sync start only for a continue-shaped intent or a file
+    // overlap, and then says the files are free — in text AND JSON.
+    const t0 = Date.now() - 30 * MIN;
+    const ended = 'ended-codex-session-0042';
+    upsertSession({ brainPath, home, now: t0, id: ended, client: 'codex', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: ended, identitySource: 'codex-lifecycle', intent: 'Rewrite lib/report.js', files: ['lib/report.js'], work: { lastWords: 'WIP, do not touch lib/report.js', lastWordsAt: t0 } });
+    const c = await connect('mcp-session-cccc-0003');
+    const unrelated = await c.callTool({ name: 'brain_sync', arguments: { project, intent: 'fix the README typo', files: ['README.md'], phase: 'start' } });
+    ok(!unrelated.content[0].text.includes('may have left unfinished') && !(unrelated.structuredContent?.handoffs?.sessions || []).length, 'D10 an unrelated task does not get the automatic list');
+    await c.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    const overlap = await c.callTool({ name: 'brain_sync', arguments: { project, intent: 'add a total row to the report', files: ['lib/report.js'], phase: 'start' } });
+    const ov = overlap.structuredContent?.handoffs?.sessions?.find((s) => s.id === ended);
+    ok(overlap.content[0].text.includes('hold NO claim on any file') && ov && ov.state === 'ended' && ov.working === false && ov.holdsFiles === false, 'D11 a task touching the same file sees it — as ended, holding no files, in text and JSON');
+    await c.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    const cont = await c.callTool({ name: 'brain_sync', arguments: { project, intent: 'continue what the codex session was doing', phase: 'start' } });
+    ok(cont.content[0].text.includes('Rewrite lib/report.js') && cont.content[0].text.includes('files it touched (free — not reserved)'), 'D12 a continue-shaped task sees it with its last words');
+    await c.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    await c.close();
   }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

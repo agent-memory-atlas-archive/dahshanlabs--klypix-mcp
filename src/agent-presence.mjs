@@ -2903,6 +2903,18 @@ export function listKnownSessions({ brainPath, home, now = Date.now() } = {}) {
 // first, with its last words, commits and files, and whether another session
 // already took it over. Nothing here starts, wakes or routes a session.
 export const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
+// 1.99.1 — signal, not history (field + bench, 2026-10-12). 1.99.0 listed every
+// remembered session with an uncompleted intent: 34 on the founder's PC, most
+// of them finished chats whose last prompt was "i can close?" (a hook-only
+// Claude session never records completion), and the coordination bench (S5)
+// showed an ended session's intent on a file read to Claude AND Codex as a live
+// claim (0/5). So a record is listed only when (a) the session stopped within
+// UNFINISHED_WINDOW_MS, and (b) it carries a 1.99+ work record — a reply tail,
+// own commits or a handoff card — so legacy and empty sessions never appear;
+// and every record says, in text and JSON, that it is not running and holds
+// no claim on any file.
+export const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId));
 export function clientWord(client) {
   const key = String(client || '').toLowerCase();
   if (key === 'claude-code' || key === 'claude') return 'Claude Code';
@@ -2937,7 +2949,9 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       const quietMs = quietFor(row, now);
       return { entry, row, work, completed, done, taker, quietMs };
     })
-    .filter(({ completed, done, quietMs }) => !completed && !done && (includeWorking || quietMs >= UNFINISHED_QUIET_MS))
+    .filter(({ entry, work, completed, done, quietMs }) => !completed && !done
+      && (includeWorking || quietMs >= UNFINISHED_QUIET_MS)
+      && (includeWorking || (hasWorkEvidence(work) && now - Number(entry.lastSeen || 0) < UNFINISHED_WINDOW_MS)))
     .map(({ entry, row, work, taker, quietMs }) => ({
       id: entry.id,
       client: entry.client,
@@ -2955,6 +2969,13 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
         ? (sessionStatusLabel(row, now) || 'live')
         : (entry.endedAt ? 'closed' : `not seen for ${agoLabel(now - entry.lastSeen).replace(/ ago$/, '')}`),
       resumeCommand: row ? '' : resumeCommandFor(entry.client, entry.id),
+      // Machine-readable state — hosts that hand the model the JSON (Claude
+      // Code reads structuredContent) must see what the text says: stopped,
+      // not working, no file reserved.
+      state: row ? 'stopped' : 'ended',
+      working: false,
+      holdsFiles: false,
+      note: 'This session is not running. It holds no claim on these files; a "do not touch" note it left no longer applies. Continue its work only if the human asks.',
       lastPrompt: work.lastPrompt || '',
       lastWords: work.lastWords || '',
       lastWordsAt: work.lastWordsAt || null,
@@ -3009,14 +3030,14 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return '';
   const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-  const lines = [`⏸️ Unfinished work left by other sessions on this project (${list.length}, newest first) — each stopped before its task was done and nobody is working on it now:`];
+  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, newest first). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
   for (const r of list.slice(0, max)) {
     const who = `${clientWord(r.client)} ${String(r.id).slice(0, 8)}`;
-    const bits = [r.status, `last active ${agoLabel(r.ageMs)}`];
+    const bits = [r.state === 'ended' ? 'ended' : `stopped (${r.status})`, `last active ${agoLabel(r.ageMs)}`];
     if (r.branch) bits.push(`branch ${r.branch}`);
     lines.push(`- ${who} · “${flat(r.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
     if (r.commits.length) lines.push(`  commits: ${r.commits.map((c) => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
-    if (r.files.length) lines.push(`  files: ${r.files.slice(-8).join(', ')}`);
+    if (r.files.length) lines.push(`  files it touched (free — not reserved): ${r.files.slice(-8).join(', ')}`);
     if (r.lastWords) lines.push(`  its last words: “${flat(r.lastWords).slice(0, 420)}”`);
     if (r.handoffCardId) {
       const title = cardTitles && cardTitles.get ? cardTitles.get(r.handoffCardId) : null;
@@ -3026,7 +3047,7 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
     if (r.resumeCommand) lines.push(`  its own transcript, should the human want it: ${r.resumeCommand}`);
   }
   if (list.length > max) lines.push(`- …and ${list.length - max} more — brain_handoff {action:"list"} shows all.`);
-  lines.push('To continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when it is finished, brain_handoff {action:"done", session:"<its id>"}. If it is not what the human asked for, leave it.');
+  lines.push('If the human asks you to continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when finished, brain_handoff {action:"done", session:"<its id>"}. Otherwise ignore this list — it is history, not a lock.');
   return lines.join('\n');
 }
 
