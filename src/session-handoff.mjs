@@ -314,8 +314,33 @@ const MANAGED_END_RE = /<!--\s*klypix-brain:end/i;
 
 const normFile = (p) => String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
 
-/** Lock-like lines that name at least one file, outside code fences and KLYPIX's own managed block. */
-export function findLockNotes(text, { source = 'AGENTS.md' } = {}) {
+// Does `line` name `file` as a path (not as part of a longer path or word)?
+const isPathChar = (c) => Boolean(c) && /[\w./@-]/.test(c);
+function lineNames(line, file) {
+  const hay = String(line).replace(/\\/g, '/').toLowerCase();
+  const needle = normFile(file);
+  if (!needle) return false;
+  for (let at = hay.indexOf(needle); at !== -1; at = hay.indexOf(needle, at + 1)) {
+    const before = hay[at - 1];
+    const after = hay[at + needle.length];
+    const beforeOk = !isPathChar(before) || (before === '/' && hay[at - 2] === '.' && !isPathChar(hay[at - 3]));
+    const afterOk = !isPathChar(after) || (after === '.' && !isPathChar(hay[at + needle.length + 1]));
+    if (beforeOk && afterOk) return true;
+  }
+  return false;
+}
+
+/**
+ * Lock-like lines that name at least one file, outside code fences and
+ * KLYPIX's own managed block. With `mentions` (files a session declared it is
+ * about to work on), ALSO every line that names one of them, whatever its
+ * wording (kind 'mention'): a keyword list cannot know every way a person
+ * writes "keep off this file" (held-out bench note, 2026-10-13: "Kenji's agent
+ * owns units/convert.js … route any fix through the callers"), so the agent
+ * judges the sentence and KLYPIX supplies the evidence.
+ */
+export function findLockNotes(text, { source = 'AGENTS.md', mentions = [] } = {}) {
+  const wanted = (Array.isArray(mentions) ? mentions : []).filter(Boolean);
   const out = [];
   let fenced = false;
   let managed = false;
@@ -324,21 +349,25 @@ export function findLockNotes(text, { source = 'AGENTS.md' } = {}) {
     if (/^```/.test(line)) { fenced = !fenced; return; }
     if (MANAGED_START_RE.test(line)) { managed = true; return; }
     if (MANAGED_END_RE.test(line)) { managed = false; return; }
-    if (fenced || managed || !line || !LOCK_WORDS_RE.test(line)) return;
-    const files = [...new Set([...line.matchAll(PATH_RE)].map((m) => m[1]).filter((p) => !/^https?:/i.test(p) && (p.includes('/') || /^[^.]{2,}\./.test(p))))];
-    if (files.length) out.push({ source, lineNo: i + 1, line: line.replace(/^[-*+]\s+/, '').slice(0, 300), files });
+    if (fenced || managed || !line) return;
+    const lock = LOCK_WORDS_RE.test(line);
+    const named = wanted.filter((f) => lineNames(line, f));
+    if (!lock && !named.length) return;
+    const pathsInLine = lock ? [...line.matchAll(PATH_RE)].map((m) => m[1]).filter((p) => !/^https?:/i.test(p) && (p.includes('/') || /^[^.]{2,}\./.test(p))) : [];
+    const files = [...new Set([...pathsInLine, ...named])];
+    if (files.length) out.push({ source, lineNo: i + 1, line: line.replace(/^[-*+]\s+/, '').slice(0, 300), files, kind: lock ? 'lock' : 'mention' });
   });
   return out;
 }
 
 /** Every lock note in the project's instruction files (deduplicated by line text). */
-export function readLockNotes(projectDir, { files = LOCK_NOTE_FILES } = {}) {
+export function readLockNotes(projectDir, { files = LOCK_NOTE_FILES, mentions = [] } = {}) {
   const seen = new Set();
   const out = [];
   for (const rel of files) {
     let text = '';
     try { text = fs.readFileSync(path.join(projectDir, rel), 'utf8'); } catch { continue; }
-    for (const found of findLockNotes(text, { source: rel })) {
+    for (const found of findLockNotes(text, { source: rel, mentions })) {
       // Only names that are files of this project ("Node.js" in prose is not):
       // present in the checkout, or known to git on any branch.
       const note = { ...found, files: found.files.filter((f) => fs.existsSync(path.join(projectDir, f)) || Boolean(gitOut(projectDir, ['log', '--all', '-n', '1', '--format=%h', '--', f]))) };
@@ -427,7 +456,7 @@ export function formatLockNotes(assessed, { max = 6 } = {}) {
   const where = (n) => `${n.source}:${n.lineNo}${n.alsoIn?.length ? ` (also ${n.alsoIn.join(', ')})` : ''}`;
   const lines = ['📌 Notes in this project\'s instruction files that tell agents to keep off a file — checked by KLYPIX against the work it can see on this machine (a note can outlive the work it protected):'];
   for (const n of list.slice(0, max)) {
-    lines.push(`- “${n.line}” (${where(n)})`);
+    lines.push(`- “${n.line}” (${where(n)})${n.kind === 'mention' ? ' — names a file you declared; if it asks agents to keep off that file:' : ''}`);
     for (const f of n.files) {
       if (f.verdict === 'in-use') {
         lines.push(`  → ${f.file}: IN USE — live session ${f.holders.map((h) => `${clientWord(h.client)} ${String(h.id).slice(0, 8)}${h.intent ? ` (“${h.intent}”)` : ''}`).join(', ')} holds it now. Respect the note; coordinate with brain_message.`);
@@ -439,7 +468,7 @@ export function formatLockNotes(assessed, { max = 6 } = {}) {
       } else if (f.verdict === 'no-work-found') {
         const s = f.stopped.find((r) => r.merged);
         const extra = s ? ` The session that worked on it (${clientWord(s.client)} ${String(s.id).slice(0, 8)}${s.intent ? `, “${s.intent}”` : ''}) stopped${s.stoppedAgoMs != null ? ` ${agoWord(s.stoppedAgoMs)}` : ''} and its commits are merged (${s.commits.map((c) => `${c.sha} ${c.subject}`).join('; ')}).` : '';
-        lines.push(`  → ${f.file}: NO WORK FOUND — no live session holds it, no branch has unmerged changes to it and it has no uncommitted changes here.${extra} The note looks stale: if your task needs ${f.file}, work on it, and tell the human the note looks stale so they can remove it. (KLYPIX cannot see work on another machine or uncommitted work; if the human says the note still holds, it holds.)`);
+        lines.push(`  → ${f.file}: NO WORK FOUND — no live session holds it, no branch has unmerged changes to it and it has no uncommitted changes here.${extra} If the note asks agents to keep off ${f.file}, it looks stale: if your task needs ${f.file}, work on it, and tell the human the note looks stale so they can remove it. (KLYPIX cannot see work on another machine or uncommitted work; if the human says the note still holds, it holds.)`);
       } else {
         lines.push(`  → ${f.file}: UNKNOWN — not a git repository, so KLYPIX cannot check. Ask the human whether the note still holds.`);
       }
@@ -452,7 +481,7 @@ export function formatLockNotes(assessed, { max = 6 } = {}) {
 /** Machine twin of formatLockNotes, for hosts that hand the model the JSON. */
 export function lockNotesData(assessed) {
   return (Array.isArray(assessed) ? assessed : []).map((n) => ({
-    source: n.source, lineNo: n.lineNo, line: n.line, alsoIn: n.alsoIn || [],
+    source: n.source, lineNo: n.lineNo, line: n.line, kind: n.kind || 'lock', alsoIn: n.alsoIn || [],
     files: n.files.map((f) => ({
       file: f.file, verdict: f.verdict,
       holds: f.verdict === 'in-use' || f.verdict === 'in-progress',

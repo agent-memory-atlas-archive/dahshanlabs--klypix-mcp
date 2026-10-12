@@ -94,6 +94,12 @@ try {
     const notes = readLockNotes(r.dir);
     ok(notes.length === 1 && notes[0].source === 'AGENTS.md' && notes[0].alsoIn.join() === 'CLAUDE.md', 'A14 the same line in two instruction files is one note, citing both');
     ok(notes[0].files.join() === 'lib/ledger.js', 'A15 a name that is not a file of the project ("Node.js" in prose) is dropped');
+    // Any wording: a line naming a DECLARED file is found as a mention.
+    const plain = "- Mira's agent has lib/invoice.js this week; send fixes through the callers.";
+    ok(findLockNotes(plain).length === 0, 'A16 without a declared file, an unkeyworded line is not a note');
+    const m = findLockNotes(plain, { mentions: ['lib/invoice.js'] });
+    ok(m.length === 1 && m[0].kind === 'mention' && m[0].files.join() === 'lib/invoice.js', 'A17 with the file declared, the same line is found as a mention, whatever its wording');
+    ok(findLockNotes('see lib/invoice.json and xlib/invoice.js', { mentions: ['lib/invoice.js'] }).length === 0 && findLockNotes('edit ./lib/invoice.js.', { mentions: ['lib/invoice.js'] }).length === 1, 'A18 a mention must name the path itself, not a longer path or name');
   }
 
   // ── B. Verdict ────────────────────────────────────────────────────────────
@@ -115,7 +121,7 @@ try {
     const a = assessLockNote(r.dir, note, { live: [], stopped: [priya([{ sha, subject: 'ledger: consolidate rounding helpers' }])] });
     ok(verdictOf(a) === 'no-work-found', 'B1 finished work on main, nobody live, no branch → NO WORK FOUND');
     const text = formatLockNotes([a]);
-    ok(text.includes('NO WORK FOUND') && text.includes('The note looks stale') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
+    ok(text.includes('NO WORK FOUND') && text.includes('it looks stale') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
     ok(/tell the human the note looks stale so they can remove it/.test(text) && !/delete (the|this) note/i.test(text), 'B3 the text says to tell the human — never to delete the note');
     ok(/cannot see work on another machine or uncommitted work/.test(text), 'B4 the text states what KLYPIX cannot see');
     const d = lockNotesData([a]);
@@ -180,6 +186,7 @@ try {
   {
     const r = base('surfaces');
     r.write('lib/ledger.js', 'export function roundCents(a) { return Math.floor(a * 100) / 100; }\n');
+    r.write('AGENTS.md', notesFile(NOTE + "\n- Mira's agent has lib/invoice.js this week; send fixes through the callers."));
     r.commit('ledger: consolidate rounding helpers');
     fs.writeFileSync(path.join(r.dir, 'brain.klypix'), await buildKlypixMap({ title: 'Lock-notes test brain', kind: 'brain', areas: [{ title: 'Billing', cards: [{ text: 'Billing: amounts are dollars with cents' }] }] }));
     const hookEnv = { ...process.env, HOME: home, USERPROFILE: home, CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KLYPIX_AUTO_UPDATE: '0' };
@@ -210,6 +217,10 @@ try {
       ok(cp.content[0].text.includes('📌 Notes in this project'), 'D4 a checkpoint that declares a file a note names carries it too');
       const other = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'Docs only', files: ['README.md'], phase: 'checkpoint' } });
       ok(!other.content[0].text.includes('📌'), 'D5 a checkpoint about other files does not');
+      const inv = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'Fix invoice totals', files: ['lib/invoice.js'], phase: 'checkpoint' } });
+      const invText = inv.content[0].text;
+      ok(invText.includes("Mira's agent has lib/invoice.js") && invText.includes('names a file you declared') && invText.includes('lib/invoice.js: NO WORK FOUND') && invText.includes('If the note asks agents to keep off lib/invoice.js, it looks stale'), 'D6 declaring a file shows every instruction line naming it, whatever its wording, with the evidence');
+      ok(inv.structuredContent?.lockNotes?.some((n) => n.kind === 'mention'), 'D7 structured: kind mention');
       await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, phase: 'complete' } });
     } finally {
       await client.close();

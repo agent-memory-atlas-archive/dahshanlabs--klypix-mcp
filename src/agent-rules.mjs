@@ -516,7 +516,7 @@ a card: if the human asks you to continue it, take it with \`brain_handoff\` {ac
 session:"<id>"} first. That list is history, not a lock — a stopped session holds no claim on its
 files. Never ask the human to paste a summary into the next session.
 
-**A "do not touch" / hands-off / WIP note about a file** (here, in AGENTS.md / CLAUDE.md or any
+**A note that asks agents to keep off a file**, whatever its wording (here, in AGENTS.md / CLAUDE.md or any
 notes file) can outlive the work it protected. Before you obey one, or before you edit the file
 anyway, call \`brain_sync\` with that file in \`files\`: KLYPIX checks the note against live sessions,
 unmerged branches and uncommitted changes and says whether it still holds. If it still holds,

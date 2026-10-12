@@ -1463,7 +1463,9 @@ server.registerTool('brain_sync', {
       const projectDir = path.dirname(report.structured.brain);
       const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
       const declared = new Set((Array.isArray(files) ? files : []).map(normPath));
-      const notes = readLockNotes(projectDir).filter((n) => phase === 'start' || n.files.some((f) => declared.has(normPath(f))));
+      // Keyword-matched notes on start; on any sync, every instruction line that
+      // names a declared file, whatever its wording (the agent judges it).
+      const notes = readLockNotes(projectDir, { mentions: [...declared] }).filter((n) => (phase === 'start' && n.kind === 'lock') || n.files.some((f) => declared.has(normPath(f))));
       if (notes.length) {
         const brainPath = report.structured.brain;
         const selfId = [extra?.klypixRequestIdentity?.sessionId, mcpPresence.id].filter(Boolean);
