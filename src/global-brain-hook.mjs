@@ -58,6 +58,17 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                  someone would ask it (a question word first, ? last);
 //                  retrieval enrichment only, never on the canvas.
 const MARKER = /🧠\s*BRAIN\s*(?:\[([^\]]+)\])?\s*([?!✓~+]?)\s*:\s*(.+)$/i;
+// The marker may also be written AFTER the colon ("🧠 BRAIN [Drive]: ! text");
+// that line used to become a plain decision carrying a literal "! ". Same rule
+// as liftLeadingMarker in klypix-format.mjs (kept local: the hook loads the
+// format module lazily).
+const LEADING_MARKER = /^([?!✓~+])\s+(?=\S)/u;
+function markerParts(m) {
+    const body = m[3].trim();
+    if (m[2]) return { type: m[2], body };
+    const lead = LEADING_MARKER.exec(body);
+    return lead ? { type: lead[1], body: body.slice(lead[0].length) } : { type: '', body };
+}
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
 // Numeric semver compare (major.minor.patch; pre-release tags ignored). <0 if
 // a<b, 0 equal, >0 if a>b. Shared by the version-currency footer below.
@@ -2664,8 +2675,7 @@ function liveMilestoneFromTranscript(tp) {
         for (const raw of text.split('\n')) {
             const line = raw.trim();
             const m = MARKER.exec(line); if (!m) continue;
-            const type = m[2] || '';
-            const body0 = m[3].trim(); if (!body0) continue;
+            const { type, body: body0 } = markerParts(m); if (!body0) continue;
             const isMilestone = type === '!' || type === '+' || /🏁|🛠/.test(line);
             if (!isMilestone) continue;
             if (/<(open question|one-line decision|decision|area|placeholder|open|milestone)[^>]*>/i.test(body0) || /`[^`]*🧠/.test(raw)) continue;  // example/doc guard
@@ -3676,9 +3686,10 @@ async function capture(lib) {
                 continue;
             }
             const m = MARKER.exec(trimmed); if (!m) continue;
-            const area = (m[1] || '').trim(), type = m[2] || '';
-            let body = m[3].trim(); if (!body) continue;
-            const markerBody = body;   // as written — what the published hooks cut and keyed
+            const area = (m[1] || '').trim();
+            const { type, body: liftedBody } = markerParts(m);
+            let body = liftedBody; if (!body) continue;
+            const markerBody = m[3].trim();   // as written — what the published hooks cut and keyed
             // Strip optional `closes:` / `ev:` / `verify:` / `q:` suffixes off the
             // body so they don't leak into the card text; they drive the
             // close-link, evidence, live-probe and enrichment below. Only a
@@ -3776,6 +3787,14 @@ async function capture(lib) {
             const additive = type !== '✓' && type !== '~';
             const key = sha((type + '|' + area + '|' + (additive ? bodyWithCloses : body)).toLowerCase());
             const legacyKey = beforeUpgrade && additive && closes ? sha((type + '|' + area + '|' + body).toLowerCase()) : null;
+            // A marker written after the colon was keyed by earlier hooks as a
+            // plain decision whose body kept the glyph ("|Drive|! text"); a
+            // line they already landed is seen, never captured a second time.
+            if (!m[2] && type) {
+                const pre = splitMarkerSuffixes(markerBody);
+                const preKey = sha(('|' + area + '|' + (pre.bodyWithCloses || pre.body || markerBody)).toLowerCase());
+                if (seen.has(preKey)) { hitKeys.add(preKey); seen.add(key); ledger.push({ action: 'skipped-seen', area, preview, olderHook: true }); continue; }
+            }
             let repairStub = '';
             if (additive) {
                 if (seen.has(key)) { hitKeys.add(key); legacyClaimed.add(key); ledger.push({ action: 'skipped-seen', area, preview }); continue; }
