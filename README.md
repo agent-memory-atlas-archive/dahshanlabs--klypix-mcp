@@ -1328,14 +1328,17 @@ independently validated.
 ## Uninstall
 
 ```bash
-npx klypix-mcp uninstall --check   # full inventory — writes nothing
-npx klypix-mcp uninstall           # asks, then removes the machine-global install
-npx klypix-mcp uninstall unlink    # run inside a project: removes the files `link` wrote there
+npx klypix-mcp uninstall --check          # preview machine-global removal — writes nothing
+npx klypix-mcp uninstall --yes            # remove the machine-global install
+npx klypix-mcp uninstall unlink --check   # preview this project's managed files
+npx klypix-mcp uninstall unlink --yes     # remove this project's managed files
 ```
 
 It strips only KLYPIX's own entries — every other hook and setting in
 `~/.claude/settings.json` stays — backs up each file it edits, and **never deletes a `.klypix`**.
-`--yes` skips the prompt for scripted removal.
+Removal requires `--yes`. Without it, the command prints the plan and changes nothing;
+there is no interactive confirmation prompt. Run the project-local form in each project you
+want to unlink. A preview exits non-zero while managed files remain.
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
 
