@@ -45,9 +45,10 @@ import {
   reopenQuestion,
   REOPEN_NUDGE,
   formatUnfinishedWork,
+  listUnfinishedWork,
 } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
-import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards } from '../src/session-handoff.mjs';
+import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards, readLockNotes, assessLockNote, formatLockNotes, lockNotesData } from '../src/session-handoff.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -1445,8 +1446,33 @@ server.registerTool('brain_sync', {
           cards: cards.length,
           unfinished: lane.length,
           handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files })),
-          sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
+          sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, lastPrompt: r.lastPrompt || null, lastWords: r.lastWords || null, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
         };
+      }
+    } catch { /* never fails a sync */ }
+  }
+  // ── Lock notes (1.102.0, bench S5/S5b): a "do not touch" / hands-off / WIP
+  // line in AGENTS.md / CLAUDE.md is checked against live sessions, unmerged
+  // branches and uncommitted changes, and the verdict rides start (and any
+  // sync that declares a file a note names). Never edits the note; never
+  // fails a sync.
+  let lockText = '';
+  let lockData = null;
+  if (report.structured?.brain && (phase === 'start' || (Array.isArray(files) && files.length))) {
+    try {
+      const projectDir = path.dirname(report.structured.brain);
+      const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const declared = new Set((Array.isArray(files) ? files : []).map(normPath));
+      const notes = readLockNotes(projectDir).filter((n) => phase === 'start' || n.files.some((f) => declared.has(normPath(f))));
+      if (notes.length) {
+        const brainPath = report.structured.brain;
+        const selfId = [extra?.klypixRequestIdentity?.sessionId, mcpPresence.id].filter(Boolean);
+        const live = listActiveSessions({ brainPath });
+        let stopped = [];
+        try { stopped = listUnfinishedWork({ brainPath, includeWorking: false }); } catch { /* lane unreadable: git still answers */ }
+        const assessed = notes.slice(0, 6).map((n) => assessLockNote(projectDir, n, { live, stopped, selfId }));
+        lockText = formatLockNotes(assessed);
+        lockData = lockNotesData(assessed);
       }
     } catch { /* never fails a sync */ }
   }
@@ -1471,6 +1497,7 @@ server.registerTool('brain_sync', {
     ...(registration ? { registration } : {}),
     ...(harness ? { harness } : {}),
     ...(handoffData ? { handoffs: handoffData } : {}),
+    ...(lockData ? { lockNotes: lockData } : {}),
   };
   const harnessText = harness?.failed
     ? `KLYPIX harness self-heal needs attention: ${harness.failed} project(s) remain partially aligned; brain_doctor has the exact files.`
@@ -1482,7 +1509,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
     ...(report.isError ? { isError: true } : {}),

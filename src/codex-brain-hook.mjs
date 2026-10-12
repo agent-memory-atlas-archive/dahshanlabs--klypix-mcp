@@ -381,6 +381,25 @@ function unfinishedWorkBlock(brainPath, sessionId) {
   }
 }
 
+// 📌 Lock notes (1.102.0): the same check brain_sync and the Claude hook run —
+// a "do not touch" / hands-off / WIP line in AGENTS.md checked against live
+// sessions, local branches and uncommitted changes. Dynamic import so a stale
+// deployment without it no-ops; never throws.
+async function lockNotesBlock(projectDir, brainPath, sessionId, sessions) {
+  try {
+    const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
+    if (typeof lib.readLockNotes !== 'function') return '';
+    const notes = lib.readLockNotes(projectDir);
+    if (!notes.length) return '';
+    let stopped = [];
+    try { stopped = listUnfinishedWork({ brainPath, selfId: sessionId }); } catch { /* git still answers */ }
+    const assessed = notes.slice(0, 6).map((n) => lib.assessLockNote(projectDir, n, { live: sessions || [], stopped, selfId: sessionId ? [sessionId] : [] }));
+    return lib.formatLockNotes(assessed);
+  } catch {
+    return '';
+  }
+}
+
 // Unfinished-work patch for one Codex lifecycle event (session handoff). A
 // human prompt records what was asked; a Stop records the reply tail only if
 // the host put it in the payload. Null when the event carries nothing.
@@ -529,8 +548,10 @@ async function main() {
         return typeof ghl.ensureGitCaptureHook === 'function' ? (ghl.ensureGitCaptureHook(projectDir).notice || '') : '';
       } catch { return ''; }
     })();
+    const lockNotes = await lockNotesBlock(projectDir, brainPath, sessionId, sessions);
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
+      lockNotes,
       // Class-C ship observation — the engine's, not a Claude-hook-local copy.
       // Codex-driven projects had NO out-of-session ship detection at all, which
       // is exactly where the incident class bites hardest (2026-07-29 review).

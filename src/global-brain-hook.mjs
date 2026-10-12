@@ -1495,7 +1495,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             .sort((a, b) => Number(b.e.lastSeen) - Number(a.e.lastSeen));
         if (!recs.length) return '';
         const flat = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const lines = [`⏸️ Work other sessions may have left unfinished (${recs.length}, stopped in the last 24h, newest first). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
+        const lines = [`⏸️ Work other sessions may have left unfinished (${recs.length}, stopped in the last 24h, newest first). None of them is running: they hold NO live claim on any file. A "do not touch" or WIP note one of them left may be stale, or may still protect work it left unmerged — KLYPIX checks such notes against live sessions and branches (📌 block); follow that check, not the note's age. Use this list only if the human asks you to continue their work:`];
         for (const { e, row, w } of recs.slice(0, max)) {
             const status = row ? (statusLabelOf(row, now) || 'live') : (e.endedAt ? 'closed' : `not seen for ${agoWord(now - e.lastSeen).replace(/ ago$/, '')}`);
             const bits = [row ? `stopped (${status})` : 'ended', `last active ${agoWord(now - e.lastSeen)}`];
@@ -1516,6 +1516,28 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
         return '\n\n' + lines.join('\n');
     } catch { return ''; }
 }
+// 📌 Lock notes (1.102.0, bench S5/S5b): a "do not touch" / hands-off / WIP
+// line in this project's AGENTS.md / CLAUDE.md, checked against the lane's
+// live sessions, local branches and uncommitted changes — at session start,
+// before the agent decides to obey or ignore it. Same code as brain_sync
+// (session-handoff.mjs). Never edits the note; '' on any failure.
+async function lockNotesFooter(sid) {
+    try {
+        const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
+        if (typeof lib.readLockNotes !== 'function') return '';
+        const notes = lib.readLockNotes(CWD);
+        if (!notes.length) return '';
+        let data = {};
+        try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* no lane yet: git still answers */ }
+        const now = Date.now();
+        const live = pruneSessions(Array.isArray(data.sessions) ? data.sessions : [], now);
+        const stopped = dirPrune(data.directory, now).map(e => ({ id: e.id, client: e.client, intent: e.intent, files: e.files, commits: e.work?.commits || [], lastSeen: e.lastSeen }));
+        const assessed = notes.slice(0, 6).map(n => lib.assessLockNote(CWD, n, { live, stopped, selfId: sid ? [sid] : [], now }));
+        const text = lib.formatLockNotes(assessed);
+        return text ? '\n\n' + text : '';
+    } catch { return ''; }
+}
+
 // The nudge a session gets when the human asks for a handoff or says the
 // limit is near: the deliberate layer (a 🤝 card in the brain) on top of the
 // automatic state above. One line; the tool's own description carries the rest.
@@ -6087,7 +6109,8 @@ async function read(lib) {
     // is unverified — the reorder only stops it depending on footer lengths).
     // The full brief keeps its order.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
+    const lockLine = await lockNotesFooter(input.session_id);
+    const out = ultra + messages + lockLine + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
         + unfinishedFooter(input.session_id)
