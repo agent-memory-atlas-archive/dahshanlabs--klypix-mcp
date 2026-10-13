@@ -40,9 +40,9 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildKlypixMap, addBrainConnections, parseKlypix, appendIntoContainers } from '../../src/klypix-format.mjs';
-import { laneFileFor, listActiveSessions, postPresenceMessage, upsertSession } from '../../src/agent-presence.mjs';
+import { laneFileFor, listActiveSessions, listUnfinishedWork, postPresenceMessage, stampSessionWork, upsertSession } from '../../src/agent-presence.mjs';
 import { linkProject } from '../../src/agent-rules.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -182,7 +182,7 @@ const klypix = {
   id: 'klypix',
   label: 'KLYPIX (MCP server + AGENTS.md rules, no hooks)',
   runnable: true,
-  async prepare({ repo, scenario, sessionIds, benchHome = null, klypixBin = null }) {
+  async prepare({ repo, scenario, agent = null, sessionIds, benchHome = null, klypixBin = null, plugin = true, pinSession = true }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
     // The lane, the project registry and every other KLYPIX file of this run
     // live under ONE home: the run's throwaway folder (live runs) or the
@@ -191,7 +191,10 @@ const klypix = {
     // and a live run never registers temp projects in the user's own KLYPIX.
     const home = benchHome || os.homedir();
     const facts = scenario.facts;
-    const written = facts.filter((f) => f.text != null);
+    // A fact KLYPIX carries WITHOUT anyone writing it (`klypixVia`: the
+    // automatic work record a stopped session's Stop hook leaves, or a live
+    // session's presence) is never a card: nobody wrote one.
+    const written = facts.filter((f) => f.text != null && !f.klypixVia);
     // A replaced DECISION is archived with a 'superseded by' edge. An absence
     // archives nothing: its stale line was a session's work in progress, which
     // in KLYPIX is presence (a lane row that expires), not a card.
@@ -226,7 +229,10 @@ const klypix = {
 
     const actor = scenario.actor || {};
     const actorRow = (now) => upsertSession({
-      brainPath, home, now, id: actor.id, logicalSessionId: actor.id, client: actor.client || 'claude-code',
+      brainPath, home, now, id: actor.id, logicalSessionId: actor.id,
+      // A scenario can make the other session the OTHER vendor's (S9: a
+      // cross-vendor handoff, which no native resume command can carry).
+      client: typeof actor.clientFor === 'function' ? actor.clientFor(agent) : (actor.client || 'claude-code'),
       branch: actor.branch || null, intent: actor.intent || '', files: actor.files || [],
     });
     const touchActor = () => actorRow(Date.now());
@@ -236,6 +242,14 @@ const klypix = {
     let liveActor = false;
     if (actor.files && actor.files.length && !actor.closed) { touchActor(); liveActor = true; }
     if (actor.closed && actor.endedAgoMs) actorRow(Date.now() - actor.endedAgoMs);
+    // What the other session's Stop hook records with no one asking — its last
+    // prompt, the tail of its last reply, its own commits — stamped at the
+    // moment it stopped, through the same lane API the hooks use.
+    if (typeof actor.work === 'function') {
+      const at = actor.closed && actor.endedAgoMs ? Date.now() - actor.endedAgoMs : Date.now();
+      const stamped = stampSessionWork({ brainPath, sessionId: actor.id, patch: actor.work(repo, at), home, now: at });
+      if (!stamped.ok) throw new Error(`could not stamp the other session's work record: ${stamped.reason}`);
+    }
 
     // Read back what the channel actually holds (a broken write must show up
     // as "not delivered", not be assumed delivered).
@@ -243,11 +257,17 @@ const klypix = {
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
     const cardTexts = struct.cards.map((c) => compactText(c.text));
     const actorOnLane = listActiveSessions({ brainPath, home }).some((s) => s.id === actor.id);
+    // Whether the product itself lists the stopped session as unfinished work
+    // (its own window and evidence rules decide, not the bench).
+    const listed = actor.id ? listUnfinishedWork({ brainPath, home }).find((u) => u.id === actor.id) || null : null;
+    const actorListed = !!listed;
     let actorWritten = true;
     if (actor.closed && actor.endedAgoMs) {
       try { actorWritten = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8')).sessions.some((s) => s.id === actor.id); } catch { actorWritten = false; }
     }
     for (const f of facts) {
+      if (f.klypixVia === 'work') { if (listed && listed.lastWords) delivered.add(f.id); continue; }
+      if (f.klypixVia === 'presence') { if (actorOnLane) delivered.add(f.id); continue; }
       if (f.text != null) { if (cardTexts.some((t) => t.includes(f.text.slice(0, 40)))) delivered.add(f.id); continue; }
       // An absence is delivered when the ended session's row was written and
       // the product's expiry hides it, and no card carries the stale words.
@@ -263,6 +283,7 @@ const klypix = {
     return {
       relays: 0,
       delivered: [...delivered],
+      actorListed,
       // Same name `klypix link` writes, so an agent that also reads the
       // project's config never ends up with a second (published) copy.
       mcpServers: {
@@ -270,8 +291,12 @@ const klypix = {
           command: process.execPath,
           args: [klypixBin || KLYPIX_BIN, '--vault', repo.dir],
           env: {
-            KLYPIX_PLUGIN: '1', KLYPIX_SESSION_ID: sessionIds.agent, KLYPIX_AUTO_UPDATE: '0',
+            ...(plugin ? { KLYPIX_PLUGIN: '1' } : {}), ...(pinSession ? { KLYPIX_SESSION_ID: sessionIds.agent } : {}), KLYPIX_AUTO_UPDATE: '0',
             HOME: home, USERPROFILE: home, KLYPIX_BRAIN_DIR: path.join(home, '.claude', 'project-brain'),
+            // The desktop app's bridge is looked up under this folder: inside the
+            // run's home, no run can reach the user's open canvases, and every
+            // run sees 'app not running' the same way.
+            KLYPIX_APP_BRIDGE_DIR: path.join(home, 'agent-bridge'),
           },
         },
       },
@@ -324,15 +349,175 @@ const klypix = {
   },
 };
 
+// ── KLYPIX as installed (Claude Code) ────────────────────────────────────────
+// What `npx klypix-mcp install` gives a Claude Code user: the server NOT in
+// plugin mode, the five hooks the installer wires (same events, matchers and
+// arguments — the self-test checks them against bin/klypix-install.mjs), and
+// search by meaning when a prepared copy of its runtime is supplied
+// (KLYPIX_BENCH_SEMANTIC_DIR, linked in, never the user's own folders). The
+// installer writes the hooks into the user's settings; the bench's Claude runs
+// read project settings only, so the same hooks go into the run repo's
+// .claude/settings.json, kept out of git like a user-scope file. Each hook runs
+// THIS checkout's src/global-brain-hook.mjs through a wrapper that pins HOME,
+// USERPROFILE and KLYPIX_BRAIN_DIR to the run's throwaway home, so no hook ever
+// touches the user's own KLYPIX.
+//
+// Codex is n/a: Codex reads hooks only from the user's own CODEX_HOME. Running
+// them would run the user's installed KLYPIX (a probe on 2026-10-12 showed
+// --dangerously-bypass-hook-trust does exactly that, and project-level
+// .codex/hooks.json is not read); a separate CODEX_HOME would need a copy of
+// the login, which a token refresh could invalidate.
+export const INSTALLED_CLAUDE_HOOKS = Object.freeze([
+  // [event, matcher, argument, timeout]
+  ['SessionStart', 'startup|resume|clear', '', null],
+  ['UserPromptSubmit', null, '--prompt', 10],
+  ['Stop', null, '--capture', null],
+  ['PostToolUse', 'Bash|PowerShell|Edit|Write', '--live', 10],
+  ['PreToolUse', 'Bash|PowerShell|Edit|Write', '--guard', 10],
+]);
+export function claudeHookSettings(command) {
+  const hooks = {};
+  for (const [event, matcher, arg, timeout] of INSTALLED_CLAUDE_HOOKS) {
+    hooks[event] = [{ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command: `${command}${arg ? ` ${arg}` : ''}`, ...(timeout ? { timeout } : {}) }] }];
+  }
+  return { hooks };
+}
+export const SEMANTIC_DIR_ENV = 'KLYPIX_BENCH_SEMANTIC_DIR';
+const SERVER_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version; } catch { return null; } })();
+/** The prepared search-by-meaning copy, or null — never the user's own KLYPIX folder. */
+export function semanticDirOrNull(env = process.env) {
+  const dir = env[SEMANTIC_DIR_ENV];
+  if (!dir || !fs.existsSync(path.join(dir, 'semantic', 'node_modules', '@huggingface', 'transformers')) || !fs.existsSync(path.join(dir, 'hf-cache'))) return null;
+  const real = (p) => { try { return fs.realpathSync(p).toLowerCase(); } catch { return path.resolve(p).toLowerCase(); } };
+  if (real(dir) === real(path.join(os.homedir(), '.claude', 'project-brain'))) throw new Error(`${SEMANTIC_DIR_ENV} points at the user's own KLYPIX folder; use a prepared copy`);
+  return dir;
+}
+/** File count and bytes under the prepared copy — compared before and after a live run. */
+export function semanticDirFingerprint(dir) {
+  let files = 0; let bytes = 0;
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else { files += 1; try { bytes += fs.statSync(p).size; } catch { /* */ } } } };
+  try { walk(dir); } catch { return null; }
+  return { files, bytes };
+}
+/** Load the embedder and the reranker from the prepared copy, as the server would. */
+export function semanticPreflight(dir) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-semcheck-'));
+  const brainDir = path.join(tmp, '.claude', 'project-brain');
+  fs.mkdirSync(brainDir, { recursive: true });
+  const links = ['semantic', 'hf-cache'].map((name) => { const l = path.join(brainDir, name); fs.symlinkSync(path.join(dir, name), l, 'junction'); return l; });
+  try {
+    const mod = pathToFileURL(path.join(ROOT, 'src', 'semantic-memory.mjs')).href;
+    const code = `const m = await import(${JSON.stringify(mod)}); const pipe = await m.getEmbedderForUse(() => {}, 120000); const v = pipe ? await m.embedTexts(pipe, ['hello']) : null; let rr = false; try { await m.withRerankerForUse(() => {}, 120000, async (r) => { rr = !!r; }); } catch { rr = false; } process.stdout.write(JSON.stringify({ embed: !!(v && v[0] && v[0].length), dims: v?.[0]?.length ?? 0, rerank: rr })); process.exit(0);`;
+    const env = { ...process.env, HOME: tmp, USERPROFILE: tmp, KLYPIX_BRAIN_DIR: brainDir };
+    delete env.KLYPIX_PLUGIN;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', env, timeout: 300_000 });
+    try { return JSON.parse(String(r.stdout).trim().split('\n').pop()); } catch { return { embed: false, rerank: false, error: String(r.stderr || '').slice(-400) }; }
+  } finally {
+    for (const l of links) removeLink(l);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
+  }
+}
+const HOOK_SRC = path.join(ROOT, 'src', 'global-brain-hook.mjs');
+const removeLink = (link) => { try { fs.rmdirSync(link); } catch { try { fs.unlinkSync(link); } catch { /* */ } } };
+const klypixInstalled = {
+  id: 'klypix-installed',
+  label: 'KLYPIX as installed (server + hooks + search by meaning; Claude Code)',
+  runnable: true,
+  notApplicableFor: (agent) => (agent?.id === 'codex'
+    ? "Codex reads hooks only from the user's own CODEX_HOME; running them would run the user's installed KLYPIX — not measured"
+    : null),
+  async prepare(ctx) {
+    // No KLYPIX_SESSION_ID: the installer's MCP entry sets none, so the hooks
+    // and the server join identities the way a real install does.
+    const base = await klypix.prepare({ ...ctx, plugin: false, pinSession: false });
+    const home = ctx.benchHome || os.homedir();
+    const brainDir = path.join(home, '.claude', 'project-brain');
+    fs.mkdirSync(brainDir, { recursive: true });
+    // The project harness a real install + link has BEFORE any task (the
+    // non-plugin server would otherwise write it mid-run, into the agent's git
+    // status). Configs that point at a published build stay out of git.
+    try {
+      const { reconcileRegisteredProjects } = await import('../../src/mcp-auto-update.mjs');
+      const { auditProject, compactAgentsBrief, linkProject: link } = await import('../../src/agent-rules.mjs');
+      const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_DIR: brainDir };
+      delete env.KLYPIX_PLUGIN;
+      await reconcileRegisteredProjects({ brainDir, version: SERVER_VERSION, brainPaths: [path.join(ctx.repo.dir, 'brain.klypix')], rules: { auditProject, compactAgentsBrief, linkProject: link }, env });
+    } catch { /* the server repeats this pass at its first sync */ }
+    fs.appendFileSync(path.join(ctx.repo.dir, '.git', 'info', 'exclude'), '\n.claude/\n.mcp.json\n.codex/\n');
+    ctx.repo.commitIfChanged('klypix: project harness');
+    // Each hook runs IN PROCESS (as an installed hook does) after pinning its
+    // home, and logs that it started and how it exited, so a run whose hooks
+    // never ran is caught (invalid), never counted as KLYPIX.
+    const wrapper = path.join(home, 'klypix-hook.mjs');
+    const health = path.join(home, 'klypix-hook-runs.jsonl');
+    fs.writeFileSync(wrapper, [
+      "import fs from 'node:fs';",
+      "import { pathToFileURL } from 'node:url';",
+      `process.env.HOME = ${JSON.stringify(home)};`,
+      `process.env.USERPROFILE = ${JSON.stringify(home)};`,
+      `process.env.KLYPIX_BRAIN_DIR = ${JSON.stringify(brainDir)};`,
+      "process.env.KLYPIX_AUTO_UPDATE = '0';",
+      'delete process.env.KLYPIX_PLUGIN;',
+      "const arg = process.argv[2] || 'session-start';",
+      `const log = (rec) => { try { fs.appendFileSync(${JSON.stringify(health)}, JSON.stringify({ at: Date.now(), arg, ...rec }) + '\\n'); } catch { /* best effort */ } };`,
+      "log({ phase: 'start' });",
+      "process.on('exit', (code) => log({ phase: 'exit', code }));",
+      `await import(pathToFileURL(${JSON.stringify(HOOK_SRC)}).href);`,
+      '',
+    ].join('\n'));
+    const fwd = (p) => p.replace(/\\/g, '/');
+    // The installer's exact form: a bare `node`, then the quoted script. On
+    // Windows Claude Code runs hook commands through PowerShell, where a
+    // command line that STARTS with a quoted path is a parse error (the
+    // round-3 smoke run: every hook failed that way, silently).
+    const command = `node "${fwd(wrapper)}"`;
+    const settingsFile = path.join(ctx.repo.dir, '.claude', 'settings.json');
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8')); } catch { /* none yet */ }
+    fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+    fs.writeFileSync(settingsFile, JSON.stringify({ ...settings, ...claudeHookSettings(command) }, null, 2));
+    // Search by meaning: a prepared copy linked in LAST, so a failure above
+    // never leaves a link behind. Never the user's own folders.
+    const links = [];
+    const shared = semanticDirOrNull();
+    try {
+      if (shared) {
+        for (const name of ['semantic', 'hf-cache']) {
+          const link = path.join(brainDir, name);
+          if (!fs.existsSync(link)) { fs.symlinkSync(path.join(shared, name), link, 'junction'); links.push(link); }
+        }
+      }
+    } catch (err) { for (const link of links) removeLink(link); throw err; }
+    const semantic = links.length === 2;
+    return {
+      ...base,
+      semantic,
+      hookSettings: settingsFile,
+      hookRuns() {
+        let lines = [];
+        try { lines = fs.readFileSync(health, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none */ }
+        const started = {}; const failed = {};
+        for (const r of lines) {
+          if (r.phase === 'start') started[r.arg] = (started[r.arg] || 0) + 1;
+          if (r.phase === 'exit' && r.code) failed[r.arg] = (failed[r.arg] || 0) + 1;
+        }
+        return { started, failed, sessionStart: started['session-start'] || 0 };
+      },
+      cleanup() { for (const link of links) removeLink(link); base.cleanup?.(); },
+    };
+  },
+  later: (args) => klypix.later(args),
+};
+
 // Planned conditions: listed with the reason they are not run yet, so a
 // report can never imply they were measured.
 const planned = [
-  { id: 'klypix-hooks', label: 'KLYPIX with Claude Code hooks', reason: 'needs project-scoped hook settings pointed at this checkout; the MCP server with the AGENTS.md rules block is measured instead (whether hooks change the result is not measured)' },
   { id: 'claude-messaging', label: 'Claude Code cross-session messaging', reason: 'needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design' },
   { id: 'agent-mail', label: 'MCP Agent Mail', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
   { id: 'concord', label: 'Concord MCP', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
   { id: 'openmemory', label: 'Memory tool (OpenMemory MCP)', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
 ].map((p) => ({ ...p, runnable: false }));
 
-export const CONDITIONS = [none, relay, agentsMdKept, agentsMdAppended, klypix, ...planned];
+export const CONDITIONS = [none, relay, agentsMdKept, agentsMdAppended, klypix, klypixInstalled, ...planned];
+export const isKlypixCondition = (c) => String(c?.id ?? c ?? '').startsWith('klypix');
 export const conditionById = (id) => CONDITIONS.find((c) => c.id === id) || null;

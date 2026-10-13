@@ -34,6 +34,22 @@ expiry (S5), arrival during the task (S6), and ranking inside a long history
 | S7 | **A decision buried in six months of notes** | The September retry rule was reversed late in September, in the log's own terse register, without naming the rule it replaces; two more weeks of notes followed, including an email sender that *does* retry. The file holds ~300 dated lines (2–3 per working day since April); the brain holds the same ~300 as cards, the reversal linked to what it replaced. At ~20 KB the whole log fits in both agents' prompts, so S7 compares **in-prompt text against a channel the agent has to query**, not a search against a search | Hidden test: a failed send is not retried and is dead-lettered once (the event itself or a record wrapping it; a rethrow is tolerated). **Stale** = the sender was called more than once on failure, counted by running it |
 | S8 | **A partner limit nothing in the repository shows** _(calibration)_ | The partner drops request ids over 24 characters, with a hyphen, or without the client prefix `p7` — learned from their support, in no file, and the visible tests pass. A kept notes file carries this as well as KLYPIX does: S8 checks that **delivery** works (no channel should fail, every delivering channel should pass), not which channel is better | Hidden test: ids are `p7` + up to 22 alphanumerics and unique. **Stale** = a 400 was retried (the sender called more than once), counted by running it |
 
+### Round 3 — when nobody writes a note
+
+Rounds 1–2 always had the other session write the right note. Real sessions
+usually write nothing. Round 3 holds the other session to that, and asks what
+KLYPIX carries **on its own**: a stopped session's work record (its Stop hook
+records its last prompt, its last reply and its commits) and a live session's
+presence. Each keeps a generous notes condition (the session *did* write the
+note) as the upper bar; no channel is the realistic "nobody wrote it down".
+
+| | Scenario | What the other session knows | Graded by |
+|---|---|---|---|
+| S9 | **Continue the work a stopped session left** | A session stopped halfway through cursor pagination at its usage limit and wrote no note. The page sizes (default 20, max 50) and the response shape it agreed with its human live only in its last prompt and reply. The agent is asked to "continue where it left off". KLYPIX holds no card: only the automatic work record | Hidden test: default page 20, never more than 50, cursors visit every user once and end. **Stale** = built pagination with other sizes, by running it |
+| S10 | **A live session that has written nothing** | Another session is rewriting `lib/tax.js` on its own branch right now and never wrote a note. KLYPIX shows its presence (intent, files, branch); a notes file shows it only if it was written down | Hidden test: the rate is 8% **and** the overlap is handled (no conflict with the live branch, or named to the human). **Stale** = a silent conflict |
+| S5b | **A "hands off" note whose work is finished** _(held out)_ | Held out from S5, the case klypix-mcp 1.100.0's fix was built from: a different file, section and register, a person's name instead of a session id, a session that stopped five hours ago and left a work record. The refactor the note protected is finished and on main | Hidden test calls `roundCents` directly, so only the root-cause fix passes. **Stale** as in S5 |
+| S5c | **The same note, still valid** _(harm check)_ | Byte-identical note; this time the refactor is half done on its own branch and the lock is real. KLYPIX now says a stopped session's "do not touch" note no longer applies — S5c measures whether that misleads | Hidden test on the invoice, **and** no conflict with the in-progress branch. **Stale** = edited the locked file into a conflict without saying so |
+
 The hidden tests are written into the repo only **after** the agent finishes,
 so the agent cannot read or game them. There is no LLM judge.
 
@@ -46,14 +62,24 @@ so the agent cannot read or game them. There is no LLM judge.
 | `agents-md-kept` | The other session edited `AGENTS.md` / `CLAUDE.md` tidily (the out-of-date line removed). |
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
 | `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, an ended session as an expired row. **KLYPIX never edits the notes file**: whatever it said before is still there, and KLYPIX's signal has to beat it. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. Those rules go into `AGENTS.md`, which Codex loads itself. `klypix link` writes no `CLAUDE.md` target, because Claude Code's rules channel is hooks, so **Claude Code sees the rules only if it opens `AGENTS.md`**; otherwise its only pointer is the server's own instructions. (Round 2: Claude consulted KLYPIX in exactly the 31 of 35 runs in which it opened `AGENTS.md`.) Plugin mode means keyword-only `brain_ask`. This is not the default install, and whether hooks change the result is not measured. |
+| `klypix-installed` | What `npx klypix-mcp install` gives a Claude Code user: the server **not** in plugin mode, the five hooks the installer wires (SessionStart, UserPromptSubmit `--prompt`, Stop `--capture`, PostToolUse `--live`, PreToolUse `--guard`; the self-test checks them against `bin/klypix-install.mjs`) and search by meaning when `KLYPIX_BENCH_SEMANTIC_DIR` points at a prepared copy of its runtime and model. The hooks go into the run repo's `.claude/settings.json` (kept out of git) and run this checkout's hook through a wrapper pinned to the run's throwaway home, so no hook touches the user's own KLYPIX. **n/a for Codex**: Codex reads hooks only from the user's own `CODEX_HOME` (project-level hooks are not read), so running them would run the user's installed KLYPIX — not measured. |
+
+From round 3, Codex gets the KLYPIX server's tools approved
+(`default_tools_approval_mode = "approve"` on that server only), as Claude's
+allow-list already did; in round 2 Codex's approval policy refused every KLYPIX
+tool but `brain_sync`. `--codex-effort` pins Codex's reasoning effort on every
+run and records it.
 
 The instructions-file conditions are deliberately generous: the other session
 always writes the facts, in the right file, committed. Real teams forget.
 
 **Not measured yet** (listed in every report, never simulated):
-KLYPIX with Claude Code hooks, Claude Code cross-session messaging, MCP Agent
-Mail, Concord, and memory tools such as OpenMemory. Each needs an adapter
-verified against a pinned version before any number is published.
+KLYPIX's hooks on **Codex** (they live only in the user's own `CODEX_HOME`),
+Claude Code cross-session messaging, Claude Code's and Codex's native session
+resume (S9 makes every handoff cross-vendor so no native resume applies), MCP
+Agent Mail, Concord, and memory tools such as OpenMemory. Each needs an adapter
+verified against a pinned version before any number is published. KLYPIX's
+hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
 
 ## Fairness rules
 
@@ -65,7 +91,8 @@ verified against a pinned version before any number is published.
   nothing else.
 - A channel's delivery is **read back**, not assumed.
 - Every number is printed with its `n` and a 95% Wilson interval. A difference
-  is called out only when the intervals do not overlap; anything else is a tie.
+  is called out only when the intervals do not overlap. Overlap means no clear
+  difference at this sample size; it does not establish equivalence.
 - A run that measured nothing about its channel is **invalid** — shown beside
   `n`, listed by reason, and left out of every rate: the condition's server
   never came up; a write did not land (read back short, at start or mid-task); a
@@ -90,6 +117,10 @@ verified against a pinned version before any number is published.
 
 ## Running it
 
+The [round-3 historical reconciliation](results/2026-10-13-round3-reconciliation.md)
+preserves the existing result rows, including failures, and explains why they
+are not an evaluation of the current build.
+
 ```bash
 # Free: scripted oracle, no model calls. Proves graders and delivery.
 node bench/coordination/run.mjs --dry-run
@@ -109,6 +140,25 @@ on disk for inspection. `--timeout` is per run, in seconds (default 600).
 `--klypix-bin` points the KLYPIX condition at another server build — for
 example a released tag's checkout — so two versions can be compared on the same
 scenarios; every KLYPIX row records the server's version and commit.
+
+`--shuffle <seed>` interleaves the runs reproducibly. To continue an interrupted
+run, repeat the **same command** with `--resume`. The output must match the
+recorded source fingerprints, server revision, CLI versions, requested models,
+effort, budget, timeout, scenario/condition selection, run count, semantic assets
+and shuffle seed. Changed configurations need a new output file. Pin explicit
+models: an unpinned provider default can change outside this harness.
+
+Resume uses the latest attempt for each run and preserves its original order.
+Only completed attempts are skipped. A partially written final JSON line is
+removed before appending; malformed interior lines fail visibly. An existing
+nonempty output cannot be appended to without `--resume`.
+
+Reports reject different experiment identities instead of silently pooling them.
+Historical files without that identity remain readable with a warning, but cannot
+be resumed. Combining several historical files requires `--legacy-merge` and a
+manual check that they continue the same experiment; this flag does not establish
+their provenance. A grader passing after an agent error is counted as an error,
+not a completed success.
 
 Live runs leave your own setup alone. The CLIs start directly, never through
 `cmd.exe`, and get the prompt on stdin. The agent's environment carries nothing
@@ -138,9 +188,28 @@ that its first `brain_sync` shows the agent what the other session knew.
 - **The mailbox is not measured.** KLYPIX's directed notes reach a session the
   sender already knew. Every agent here is a brand-new session, so a finding
   left by an ended session travels as a brain card.
-- **Claude Code without hooks.** The KLYPIX condition gives Claude Code only the
-  MCP server's instructions; Claude Code with KLYPIX's hooks is a planned,
-  separate condition.
+- **Two KLYPIX setups.** `klypix` is the MCP server alone (plugin mode); for
+  Claude Code the rules reach it only if it opens `AGENTS.md`. `klypix-installed`
+  (round 3, Claude Code only) is the installed product. Its known deviations from
+  a field install: Claude runs with `--no-session-persistence`, so the Stop hook
+  has no transcript (no capture-gap nudge, no work stamp for the agent itself) —
+  do not compare its turns or cost with field use; the hooks run through a
+  wrapper that pins the run's home; search by meaning comes from a prepared copy
+  that is checked before and after the run.
+- **Codex loads the user's global `AGENTS.md`.** `--ignore-user-config` skips
+  `config.toml` only. On a KLYPIX machine that file carries a KLYPIX rules block
+  (inert where there is no `brain.klypix`); every Codex row records its
+  fingerprint (`codexGlobalRules`). Rounds 1–2 ran the same way.
+- **Codex's reasoning effort is the model's own default** unless `--codex-effort`
+  pins it: the CLI sends none, and the API refuses an explicit `none` for
+  `gpt-6-astra`. Rounds 1–2 ran at that default (not "effort none").
+- **S10 and S2 are the shared-checkout case.** Both sessions work in one
+  checkout, so they share one brain and lane. Sessions in separate worktrees
+  have separate brains; that case is not measured.
+- **S9's plan lives where the scenario puts it.** In S9 the stopped session's
+  last reply is a mid-step line and the plan is in its last prompt; S9s is the
+  case where its last reply happened to summarise the plan. Real last replies
+  vary between the two.
 - **One machine.** KLYPIX's lane is machine-local; a teammate on another PC is
   out of scope here, as it is in the product.
 - **Small samples prove little.** Five runs that all pass give an interval of
