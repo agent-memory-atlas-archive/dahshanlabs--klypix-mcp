@@ -128,7 +128,7 @@ try {
     const rec2 = listUnfinishedWork({ brainPath, home, now: now + 120 * MIN }).find((r) => r.id === claude);
     ok(rec2 && rec2.working === false && rec2.holdsFiles === false && /holds no claim/.test(rec2.note) && /may be stale or may still protect unmerged work/.test(rec2.note) && !/no longer applies/.test(rec2.note), 'A21 the JSON record says working:false, holdsFiles:false, and that a do-not-touch note is checked, not assumed dead');
     const t2 = formatUnfinishedWork([rec2], { now: now + 120 * MIN });
-    ok(t2.includes('None of them is running: they hold NO live claim on any file') && t2.includes('KLYPIX checks such notes against live sessions and branches') && t2.includes('files it touched (free — not reserved)') && t2.includes('history, not a lock'), 'A22 the text says the files are free and the list is history, not a lock');
+    ok(t2.includes('None of them is running: they hold NO live claim on any file') && t2.includes('a question of evidence, not age') && t2.includes('files it touched (free — not reserved)') && t2.includes('history, not a lock'), 'A22 the text says the files are free and the list is history, not a lock');
   }
 
   // ── B. The Claude hook twin: Stop records, SessionStart / prompt print ────
