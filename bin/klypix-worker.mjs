@@ -48,7 +48,7 @@ import {
   listUnfinishedWork,
 } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
-import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards, readLockNotes, assessLockNote, formatLockNotes, lockNotesData } from '../src/session-handoff.mjs';
+import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards, readLockNotes, assessLockNote, formatLockNotes, lockNotesData, createLockNoteProbe } from '../src/session-handoff.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -1458,10 +1458,10 @@ server.registerTool('brain_sync', {
   // fails a sync.
   let lockText = '';
   let lockData = null;
-  if (report.structured?.brain && (phase === 'start' || (Array.isArray(files) && files.length))) {
+  if (include_context !== false && phase !== 'complete' && report.structured?.brain && (phase === 'start' || (Array.isArray(files) && files.length))) {
     try {
       const projectDir = path.dirname(report.structured.brain);
-      const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const normPath = (p) => { const value = String(p || '').replace(/\\/g, '/').replace(/^\.\//, ''); return process.platform === 'win32' ? value.toLowerCase() : value; };
       const declared = new Set((Array.isArray(files) ? files : []).map(normPath));
       // Keyword-matched notes on start; on any sync, every instruction line that
       // names a declared file, whatever its wording (the agent judges it).
@@ -1472,11 +1472,12 @@ server.registerTool('brain_sync', {
       // At start, lines naming a file a stopped session worked on ride too,
       // whatever their wording (bench S5d/S5f): the agent need not ask.
       const stoppedFiles = new Set(phase === 'start' ? stopped.flatMap((r) => (Array.isArray(r.files) ? r.files : []).map(normPath)) : []);
-      const notes = readLockNotes(projectDir, { mentions: [...new Set([...declared, ...stoppedFiles])].slice(0, 40) })
+      const probe = createLockNoteProbe(projectDir);
+      const notes = readLockNotes(projectDir, { probe, mentions: [...new Set([...declared, ...stoppedFiles])].slice(0, 40) })
         .filter((n) => (phase === 'start' && n.kind === 'lock') || n.files.some((f) => declared.has(normPath(f)) || stoppedFiles.has(normPath(f))));
       if (notes.length) {
         const live = listActiveSessions({ brainPath });
-        const assessed = notes.slice(0, 6).map((n) => assessLockNote(projectDir, n, { live, stopped, selfId }));
+        const assessed = notes.slice(0, 6).map((n) => assessLockNote(projectDir, n, { live, stopped, selfId, probe }));
         lockText = formatLockNotes(assessed);
         lockData = lockNotesData(assessed);
       }

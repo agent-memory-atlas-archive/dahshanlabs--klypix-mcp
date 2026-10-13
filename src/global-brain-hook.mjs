@@ -1495,7 +1495,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             .sort((a, b) => Number(b.e.lastSeen) - Number(a.e.lastSeen));
         if (!recs.length) return '';
         const flat = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const lines = [`⏸️ Work other sessions may have left unfinished (${recs.length}, stopped in the last 24h, newest first). None of them is running: they hold NO live claim on any file. Whether a note about one of their files still holds is a question of evidence, not age: KLYPIX checks every instruction-file line that names one of these files against live sessions, branches and uncommitted changes (📌, when there is such a line). Use this list only if the human asks you to continue their work:`];
+        const lines = [`⏸️ Work other sessions may have left unfinished (${recs.length}, stopped in the last 24h, newest first). None of them is running: they hold NO live claim on any file. Whether a note about one of their files still holds is a question of evidence, not age: KLYPIX surfaces matching lines from supported instruction files with bounded checks of local sessions, branches and worktrees (📌, when there is such a line). Use this list only if the human asks you to continue their work:`];
         for (const { e, row, w } of recs.slice(0, max)) {
             const status = row ? (statusLabelOf(row, now) || 'live') : (e.endedAt ? 'closed' : `not seen for ${agoWord(now - e.lastSeen).replace(/ ago$/, '')}`);
             const bits = [row ? `stopped (${status})` : 'ended', `last active ${agoWord(now - e.lastSeen)}`];
@@ -1536,9 +1536,10 @@ async function lockNotesFooter(sid) {
         // Lines naming a file a stopped session worked on ride too, whatever
         // their wording (bench S5d/S5f: the agent with hooks never asked).
         const mentions = [...new Set(stopped.flatMap(r => Array.isArray(r.files) ? r.files : []))].slice(0, 20);
-        const notes = lib.readLockNotes(CWD, { mentions });
+        const probe = lib.createLockNoteProbe(CWD);
+        const notes = lib.readLockNotes(CWD, { mentions, probe });
         if (!notes.length) return '';
-        const assessed = notes.slice(0, 6).map(n => lib.assessLockNote(CWD, n, { live, stopped, selfId: sid ? [sid] : [], now }));
+        const assessed = notes.slice(0, 6).map(n => lib.assessLockNote(CWD, n, { live, stopped, selfId: sid ? [sid] : [], now, probe }));
         const text = lib.formatLockNotes(assessed);
         return text ? '\n\n' + text : '';
     } catch { return ''; }

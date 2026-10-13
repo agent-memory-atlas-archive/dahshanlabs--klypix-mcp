@@ -393,9 +393,10 @@ async function lockNotesBlock(projectDir, brainPath, sessionId, sessions) {
     try { stopped = listUnfinishedWork({ brainPath, selfId: sessionId }); } catch { /* git still answers */ }
     // Lines naming a file a stopped session worked on ride too, whatever their wording.
     const mentions = [...new Set(stopped.flatMap((r) => (Array.isArray(r.files) ? r.files : [])))].slice(0, 20);
-    const notes = lib.readLockNotes(projectDir, { mentions });
+    const probe = lib.createLockNoteProbe(projectDir);
+    const notes = lib.readLockNotes(projectDir, { mentions, probe });
     if (!notes.length) return '';
-    const assessed = notes.slice(0, 6).map((n) => lib.assessLockNote(projectDir, n, { live: sessions || [], stopped, selfId: sessionId ? [sessionId] : [] }));
+    const assessed = notes.slice(0, 6).map((n) => lib.assessLockNote(projectDir, n, { live: sessions || [], stopped, selfId: sessionId ? [sessionId] : [], probe }));
     return lib.formatLockNotes(assessed);
   } catch {
     return '';

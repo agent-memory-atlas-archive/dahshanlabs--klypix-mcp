@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
-import { findLockNotes, readLockNotes, assessLockNote, formatLockNotes, lockNotesData } from '../src/session-handoff.mjs';
+import { findLockNotes, readLockNotes, assessLockNote, formatLockNotes, lockNotesData, createLockNoteProbe } from '../src/session-handoff.mjs';
 import { BRAIN_INSTRUCTIONS } from '../src/agent-rules.mjs';
 import { upsertSession, endSession } from '../src/agent-presence.mjs';
 import { KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
@@ -122,11 +122,11 @@ try {
     const a = assessLockNote(r.dir, note, { live: [], stopped: [priya([{ sha, subject: 'ledger: consolidate rounding helpers' }])] });
     ok(verdictOf(a) === 'no-work-found', 'B1 finished work on main, nobody live, no branch → NO WORK FOUND');
     const text = formatLockNotes([a]);
-    ok(text.includes('NO WORK FOUND') && text.includes('it looks stale') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
+    ok(text.includes('NO WORK FOUND') && text.includes('temporary coordination reservation may be stale') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
     ok(/tell the human the note looks stale so they can remove it/.test(text) && !/delete (the|this) note/i.test(text), 'B3 the text says to tell the human — never to delete the note');
-    ok(/cannot see work on another machine or uncommitted work/.test(text), 'B4 the text states what KLYPIX cannot see');
+    ok(/cannot see other machines/.test(text), 'B4 the text states what KLYPIX cannot see');
     const d = lockNotesData([a]);
-    ok(d[0].files[0].holds === false && d[0].files[0].verdict === 'no-work-found', 'B5 structured: holds:false');
+    ok(d[0].files[0].workFound === false && d[0].files[0].verdict === 'no-work-found', 'B5 structured: workFound:false');
 
     // A live session (not me) declares the file → IN USE; me declaring it → not.
     const live = [{ id: 'live-peer-0002', client: 'codex', intent: 'ledger audit', files: ['lib/ledger.js'] }, { id: 'me-0003', logicalSessionId: 'me-logical', client: 'claude-code', files: ['lib/ledger.js'] }];
@@ -149,12 +149,12 @@ try {
     const a = assessLockNote(r.dir, note, { live: [], stopped: [priya([{ sha, subject: 'wip: ledger rounding refactor (half done)' }])] });
     ok(verdictOf(a) === 'in-progress', 'B9 an unmerged branch with commits on the file → WORK IN PROGRESS');
     const text = formatLockNotes([a]);
-    ok(text.includes('WORK IN PROGRESS') && text.includes('branch a/ledger-refactor') && text.includes('The note still holds: do not edit lib/ledger.js'), 'B10 the text names the branch and says the note holds');
-    ok(lockNotesData([a])[0].files[0].holds === true, 'B11 structured: holds:true');
+    ok(text.includes('WORK IN PROGRESS') && text.includes('branch a/ledger-refactor') && text.includes('Preserve this work; coordinate or isolate your changes'), 'B10 the text names existing work without turning it into authority');
+    ok(lockNotesData([a])[0].files[0].workFound === true, 'B11 structured: workFound:true');
     // The branch deleted, but the stopped session's commit is not in HEAD → still in progress.
     r.git(['branch', '-q', '-D', 'a/ledger-refactor']);
     ok(verdictOf(assessLockNote(r.dir, note, { stopped: [priya([{ sha, subject: 'wip' }])] })) === 'in-progress', 'B12 a stopped session\'s unmerged commit (branch gone) → WORK IN PROGRESS');
-    ok(verdictOf(assessLockNote(r.dir, note, { stopped: [priya([{ sha: 'deadbee', subject: 'from another clone' }])] })) === 'in-progress', 'B13 an unknown sha (another clone, rebased away) is NOT merged — the conservative answer');
+    ok(verdictOf(assessLockNote(r.dir, note, { stopped: [priya([{ sha: 'deadbee', subject: 'from another clone' }])] })) === 'unknown', 'B13 an unknown sha (another clone, rebased away) is UNKNOWN');
   }
   {
     // A squash-merged branch still shows HEAD..branch commits, but its change is in HEAD.
@@ -175,8 +175,89 @@ try {
     fs.writeFileSync(path.join(dir, 'AGENTS.md'), notesFile(NOTE));
     const [note] = readLockNotes(dir);
     const a = assessLockNote(dir, note, {});
-    ok(verdictOf(a) === 'unknown' && formatLockNotes([a]).includes('Ask the human'), 'B15 not a git repo → UNKNOWN, ask the human (never "no work found")');
+    ok(verdictOf(a) === 'unknown' && formatLockNotes([a]).includes('evidence check is incomplete'), 'B15 not a git repo → UNKNOWN, ask the human (never "no work found")');
     ok(formatLockNotes([]) === '', 'B16 no notes → no block');
+  }
+
+  // ── Review regressions: authority and incomplete/local evidence ───────────
+  {
+    const r = base('authority');
+    const [note] = findLockNotes('Do not edit lib/ledger.js; it is generated and must only be changed through its generator.');
+    const a = assessLockNote(r.dir, note);
+    const text = formatLockNotes([a]);
+    ok(verdictOf(a) === 'no-work-found' && text.includes('not permission to override instructions') && text.includes('generated-file policies'), 'R1 a clean generated file never gets permission to bypass its rule');
+    ok(!text.includes('if your task needs lib/ledger.js, work on it') && lockNotesData([a])[0].files[0].canOverrideInstructions === false, 'R2 neither prose nor machine data grants an override');
+    ok(findLockNotes('Do not edit ../outside.js').length === 0, 'R3 notes cannot target paths outside the project');
+    ok(findLockNotes('~~~js\nDo not edit lib/ledger.js\n~~~').length === 0, 'R4 tilde code fences are not instructions');
+    ok(findLockNotes('Do not edit lib\\ledger.js')[0]?.files[0] === 'lib/ledger.js', 'R5 Windows file separators are recognised');
+    ok(findLockNotes('Do not edit `lib/my ledger.js`')[0]?.files.includes('lib/my ledger.js'), 'R5b quoted filenames may contain spaces');
+    r.write('lib/ledger[1].js', 'clean\n');
+    r.write('lib/ledger1.js', 'clean\n');
+    r.commit('literal pathspec fixture');
+    r.write('lib/ledger1.js', 'dirty unrelated file\n');
+    const exact = { source: 'AGENTS.md', lineNo: 1, line: 'keep off literal filename', files: ['lib/ledger[1].js'] };
+    ok(verdictOf(assessLockNote(r.dir, exact), 'lib/ledger[1].js') === 'no-work-found', 'R6 a literal filename is not expanded as a Git pathspec');
+  }
+  {
+    const r = base('sibling');
+    const peer = path.join(root, 'sibling checkout with spaces');
+    r.git(['worktree', 'add', '-q', '-b', 'peer', peer]);
+    fs.appendFileSync(path.join(peer, 'lib/ledger.js'), '// unfinished peer work\n');
+    const [note] = readLockNotes(r.dir);
+    const a = assessLockNote(r.dir, note);
+    ok(verdictOf(a) === 'in-progress' && a.files[0].dirtyWorktrees.includes(peer.replace(/\\/g, '/')), 'R7 uncommitted sibling-worktree edits are preserved');
+    // Detached commits also have no branch for for-each-ref to discover.
+    execFileSync('git', ['add', 'lib/ledger.js'], { cwd: peer, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-qm', 'detached work'], { cwd: peer, stdio: 'pipe' });
+    execFileSync('git', ['checkout', '--detach', '-q'], { cwd: peer, stdio: 'pipe' });
+    r.git(['branch', '-D', 'peer']);
+    ok(verdictOf(assessLockNote(r.dir, note)) === 'in-progress', 'R8 committed work on a detached sibling worktree is found');
+    r.git(['worktree', 'remove', peer]);
+  }
+  {
+    const r = base('incomplete');
+    r.git(['branch', 'old-feature']);
+    const [note] = readLockNotes(r.dir);
+    for (const options of [{ maxBranches: 1 }, { maxWorktrees: 0 }, { budgetMs: 0 }]) {
+      const probe = createLockNoteProbe(r.dir, options);
+      const a = assessLockNote(r.dir, note, { probe });
+      ok(verdictOf(a) === 'unknown' && a.files[0].incomplete.length > 0, `R9 bounded/incomplete search cannot claim absence: ${JSON.stringify(options)}`);
+    }
+    for (const fail of ['status', 'for-each-ref', 'worktree']) {
+      const probe = createLockNoteProbe(r.dir, { runGit: (cwd, args, timeout) => {
+        if (args[0] === fail) { const error = new Error('simulated timeout'); error.code = 'ETIMEDOUT'; throw error; }
+        return execFileSync('git', ['--literal-pathspecs', ...args], { cwd, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
+      } });
+      ok(verdictOf(assessLockNote(r.dir, note, { probe })) === 'unknown', `R10 failed Git ${fail} cannot become NO WORK FOUND`);
+    }
+    let calls = 0;
+    const probe = createLockNoteProbe(r.dir, { runGit: (cwd, args, timeout) => {
+      calls++;
+      return execFileSync('git', ['--literal-pathspecs', ...args], { cwd, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
+    } });
+    assessLockNote(r.dir, note, { probe });
+    const before = calls;
+    assessLockNote(r.dir, note, { probe });
+    ok(calls === before, 'R11 multiple notes reuse one bounded Git snapshot');
+  }
+  {
+    const r = base('failed-diff');
+    r.git(['checkout', '-qb', 'peer']);
+    r.write('lib/ledger.js', 'unfinished branch\n');
+    r.commit('peer work');
+    r.git(['checkout', '-q', 'main']);
+    const [note] = readLockNotes(r.dir);
+    for (const fail of ['log', 'diff']) {
+      const probe = createLockNoteProbe(r.dir, { runGit: (cwd, args, timeout) => {
+        if (args[0] === fail) throw new Error('simulated unavailable comparison');
+        return execFileSync('git', ['--literal-pathspecs', ...args], { cwd, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
+      } });
+      const a = assessLockNote(r.dir, note, { probe });
+      ok(verdictOf(a) === 'unknown' && lockNotesData([a])[0].files[0].workFound === null, `R12 failed Git ${fail} comparison remains unknown in text and JSON`);
+    }
+    r.write('lib/ledger.js', 'local unfinished edits\n');
+    const a = assessLockNote(r.dir, note, { probe: createLockNoteProbe(r.dir, { maxBranches: 1 }) });
+    ok(verdictOf(a) === 'in-progress', 'R13 positive dirty-work evidence survives an incomplete branch scan');
   }
 
   // ── C. The rule text ──────────────────────────────────────────────────────
@@ -220,8 +301,10 @@ try {
       ok(!other.content[0].text.includes('📌'), 'D5 a checkpoint about other files does not');
       const inv = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'Fix invoice totals', files: ['lib/invoice.js'], phase: 'checkpoint' } });
       const invText = inv.content[0].text;
-      ok(invText.includes("Mira's agent has lib/invoice.js") && invText.includes('names a file you declared') && invText.includes('lib/invoice.js: NO WORK FOUND') && invText.includes('If the note asks agents to keep off lib/invoice.js, it looks stale'), 'D6 declaring a file shows every instruction line naming it, whatever its wording, with the evidence');
+      ok(invText.includes("Mira's agent has lib/invoice.js") && invText.includes('names a file you declared') && invText.includes('lib/invoice.js: NO WORK FOUND') && invText.includes('A temporary coordination reservation may be stale'), 'D6 declaring a file shows every instruction line naming it, whatever its wording, with the evidence');
       ok(inv.structuredContent?.lockNotes?.some((n) => n.kind === 'mention'), 'D7 structured: kind mention');
+      const silent = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'No context requested', files: ['lib/ledger.js'], phase: 'checkpoint', include_context: false } });
+      ok(!silent.structuredContent?.lockNotes && !silent.content[0].text.includes('📌'), 'D7b include_context:false skips note checks');
       await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, phase: 'complete' } });
     } finally {
       await client.close();

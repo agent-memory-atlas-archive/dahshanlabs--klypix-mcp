@@ -3056,7 +3056,7 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return '';
   const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, ${ranked ? 'most relevant first' : 'newest first'}). None of them is running: they hold NO live claim on any file. Whether a note about one of their files still holds is a question of evidence, not age: KLYPIX checks every instruction-file line that names one of these files against live sessions, branches and uncommitted changes (📌, when there is such a line). Use this list only if the human asks you to continue their work:`];
+  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, ${ranked ? 'most relevant first' : 'newest first'}). None of them is running: they hold NO live claim on any file. Whether a note about one of their files still holds is a question of evidence, not age: KLYPIX surfaces matching lines from supported instruction files with bounded checks of local sessions, branches and worktrees (📌, when there is such a line). Use this list only if the human asks you to continue their work:`];
   for (const r of list.slice(0, max)) {
     const who = `${clientWord(r.client)} ${String(r.id).slice(0, 8)}`;
     const bits = [r.state === 'ended' ? 'ended' : `stopped (${r.status})`, `last active ${agoLabel(r.ageMs)}`];
