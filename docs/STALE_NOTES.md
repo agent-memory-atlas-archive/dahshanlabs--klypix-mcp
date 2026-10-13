@@ -38,6 +38,8 @@ Structured results use `workFound: true | false | null` and
   project-relative. Instruction sources resolving outside the project are skipped.
 - Evidence: observed local sessions, up to 30 local branches, up to 20 registered
   worktrees (including detached and dirty worktrees), and recorded commits.
+  Connected-but-idle sessions use the same activity window as the handoff list;
+  heartbeats do not renew a work claim, but their unfinished commits still count.
   Squash/cherry-picked work is recognised when this file matches the target.
   Subsequent changes can make that conservative comparison report work again.
 - Git reads share one cached 2.5-second budget per hook/sync; individual commands

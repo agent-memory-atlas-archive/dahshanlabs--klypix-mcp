@@ -259,6 +259,21 @@ try {
     const a = assessLockNote(r.dir, note, { probe: createLockNoteProbe(r.dir, { maxBranches: 1 }) });
     ok(verdictOf(a) === 'in-progress', 'R13 positive dirty-work evidence survives an incomplete branch scan');
   }
+  {
+    const r = base('idle-connection');
+    const [note] = readLockNotes(r.dir);
+    const now = Date.now();
+    const idle = { id: 'connected-but-idle', client: 'claude-code', files: ['lib/ledger.js'], hostStatus: 'busy', hostStatusAt: now - 3600_000, lastSeen: now };
+    ok(verdictOf(assessLockNote(r.dir, note, { live: [idle], now })) === 'no-work-found', 'R14 a fresh heartbeat does not make an hour-old busy stamp a live holder');
+    ok(verdictOf(assessLockNote(r.dir, note, { live: [{ ...idle, hostStatusAt: now }], now })) === 'in-use', 'R15 fresh host work still reports a live holder');
+    r.git(['checkout', '-qb', 'idle-work']);
+    r.write('lib/ledger.js', 'unfinished idle session work\n');
+    const sha = r.commit('unfinished work');
+    r.git(['checkout', '-q', 'main']);
+    r.git(['branch', '-D', 'idle-work']);
+    idle.work = { commits: [{ sha, subject: 'unfinished work' }] };
+    ok(verdictOf(assessLockNote(r.dir, note, { live: [idle], now })) === 'in-progress', 'R16 idle connection history still protects its unmerged commits');
+  }
 
   // ── C. The rule text ──────────────────────────────────────────────────────
   ok(!/no longer applies/.test(BRAIN_INSTRUCTIONS) && /Before you obey one, or before you edit the file\s+anyway, call `brain_sync` with that file in `files`/.test(BRAIN_INSTRUCTIONS) && /never delete the note yourself/.test(BRAIN_INSTRUCTIONS), 'C1 the rules carry the one-sentence check and never say a note "no longer applies"');

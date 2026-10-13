@@ -1530,7 +1530,7 @@ async function lockNotesFooter(sid) {
         const now = Date.now();
         const live = pruneSessions(Array.isArray(data.sessions) ? data.sessions : [], now);
         const me = String(sid || '').toLowerCase();
-        const liveIds = new Set(live.flatMap(s => [s.id, s.logicalSessionId].filter(Boolean).map(v => String(v).toLowerCase())));
+        const liveIds = new Set(live.filter(s => lib.sessionWorkIsRecent(s, now)).flatMap(s => [s.id, s.logicalSessionId].filter(Boolean).map(v => String(v).toLowerCase())));
         const stopped = dirPrune(data.directory, now).filter(e => !liveIds.has(String(e.id || '').toLowerCase()) && String(e.id || '').toLowerCase() !== me)
             .map(e => ({ id: e.id, client: e.client, intent: e.intent, files: e.files, commits: e.work?.commits || [], lastSeen: e.lastSeen }));
         // Lines naming a file a stopped session worked on ride too, whatever

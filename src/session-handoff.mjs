@@ -28,6 +28,8 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { HANDOFF_RE, handoffTitle, isOpenHandoffCard } from './klypix-format.mjs';
+import { sessionWorkIsRecent } from './agent-presence.mjs';
+export { sessionWorkIsRecent };
 
 export const HANDOFF_SCHEMA_VERSION = 1;
 export const HANDOFF_REASONS = Object.freeze({
@@ -500,12 +502,16 @@ export function assessLockNote(projectDir, note, { live = [], stopped = [], self
   // carry on the lane (canonical, logical, transport aliases) is excluded.
   const mine = new Set((Array.isArray(selfId) ? selfId : [selfId]).map((x) => String(x || '').toLowerCase()).filter(Boolean));
   const isMe = (s) => [s.id, s.logicalSessionId, ...(Array.isArray(s.aliases) ? s.aliases : [])].some((x) => x && mine.has(String(x).toLowerCase()));
+  const history = [...new Map([
+    ...live.filter(s => !sessionWorkIsRecent(s, now)).map(s => ({ ...s, commits: s.work?.commits || [] })),
+    ...stopped,
+  ].map(s => [s.id, s])).values()];
   const files = note.files.map((file) => {
     const f = normFile(file);
-    const holders = live.filter((s) => !isMe(s) && (s.files || []).some((x) => normFile(x) === f))
+    const holders = live.filter((s) => sessionWorkIsRecent(s, now) && !isMe(s) && (s.files || []).some((x) => normFile(x) === f))
       .map((s) => ({ id: s.id, client: s.client || null, intent: String(s.intent || '').slice(0, 120) }));
     const { branches, dirtyWorktrees } = probe.inspect(file);
-    const finished = stopped.filter((r) => !isMe(r) && (r.files || []).some((x) => normFile(x) === f))
+    const finished = history.filter((r) => !isMe(r) && (r.files || []).some((x) => normFile(x) === f))
       .map((r) => {
         const commits = Array.isArray(r.commits) ? r.commits : [];
         const outcomes = commits.slice(-20).map(c => probe.merged(c.sha, file));

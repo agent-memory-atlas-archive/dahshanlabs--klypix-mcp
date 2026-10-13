@@ -2957,6 +2957,10 @@ const quietFor = (row, now) => {
   const at = Number(row.hostStatusAt || row.activityAt || row.intentAt || row.startedAt || row.lastSeen || now);
   return Math.max(0, now - at);
 };
+// Shared with note evidence: connection heartbeats alone do not prove work.
+export const sessionWorkIsRecent = (row, now = Date.now()) => Boolean(row)
+  && row.working !== false && row.holdsFiles !== false
+  && quietFor(row, now) < UNFINISHED_QUIET_MS;
 export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId = '', includeWorking = false } = {}) {
   if (!brainPath) return [];
   const lane = readLane(laneFileFor(brainPath, home));
