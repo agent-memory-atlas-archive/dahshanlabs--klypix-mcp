@@ -1465,13 +1465,17 @@ server.registerTool('brain_sync', {
       const declared = new Set((Array.isArray(files) ? files : []).map(normPath));
       // Keyword-matched notes on start; on any sync, every instruction line that
       // names a declared file, whatever its wording (the agent judges it).
-      const notes = readLockNotes(projectDir, { mentions: [...declared] }).filter((n) => (phase === 'start' && n.kind === 'lock') || n.files.some((f) => declared.has(normPath(f))));
+      const brainPath = report.structured.brain;
+      const selfId = [extra?.klypixRequestIdentity?.sessionId, mcpPresence.id].filter(Boolean);
+      let stopped = [];
+      try { stopped = listUnfinishedWork({ brainPath, selfId: selfId[0] || '', includeWorking: false }); } catch { /* lane unreadable: git still answers */ }
+      // At start, lines naming a file a stopped session worked on ride too,
+      // whatever their wording (bench S5d/S5f): the agent need not ask.
+      const stoppedFiles = new Set(phase === 'start' ? stopped.flatMap((r) => (Array.isArray(r.files) ? r.files : []).map(normPath)) : []);
+      const notes = readLockNotes(projectDir, { mentions: [...new Set([...declared, ...stoppedFiles])].slice(0, 40) })
+        .filter((n) => (phase === 'start' && n.kind === 'lock') || n.files.some((f) => declared.has(normPath(f)) || stoppedFiles.has(normPath(f))));
       if (notes.length) {
-        const brainPath = report.structured.brain;
-        const selfId = [extra?.klypixRequestIdentity?.sessionId, mcpPresence.id].filter(Boolean);
         const live = listActiveSessions({ brainPath });
-        let stopped = [];
-        try { stopped = listUnfinishedWork({ brainPath, includeWorking: false }); } catch { /* lane unreadable: git still answers */ }
         const assessed = notes.slice(0, 6).map((n) => assessLockNote(projectDir, n, { live, stopped, selfId }));
         lockText = formatLockNotes(assessed);
         lockData = lockNotesData(assessed);

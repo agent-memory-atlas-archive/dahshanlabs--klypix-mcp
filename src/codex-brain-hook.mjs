@@ -389,10 +389,12 @@ async function lockNotesBlock(projectDir, brainPath, sessionId, sessions) {
   try {
     const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
     if (typeof lib.readLockNotes !== 'function') return '';
-    const notes = lib.readLockNotes(projectDir);
-    if (!notes.length) return '';
     let stopped = [];
     try { stopped = listUnfinishedWork({ brainPath, selfId: sessionId }); } catch { /* git still answers */ }
+    // Lines naming a file a stopped session worked on ride too, whatever their wording.
+    const mentions = [...new Set(stopped.flatMap((r) => (Array.isArray(r.files) ? r.files : [])))].slice(0, 20);
+    const notes = lib.readLockNotes(projectDir, { mentions });
+    if (!notes.length) return '';
     const assessed = notes.slice(0, 6).map((n) => lib.assessLockNote(projectDir, n, { live: sessions || [], stopped, selfId: sessionId ? [sessionId] : [] }));
     return lib.formatLockNotes(assessed);
   } catch {

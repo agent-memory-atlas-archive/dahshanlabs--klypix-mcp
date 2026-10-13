@@ -32,6 +32,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { buildKlypixMap } from '../src/klypix-format.mjs';
 import { findLockNotes, readLockNotes, assessLockNote, formatLockNotes, lockNotesData } from '../src/session-handoff.mjs';
 import { BRAIN_INSTRUCTIONS } from '../src/agent-rules.mjs';
+import { upsertSession, endSession } from '../src/agent-presence.mjs';
 import { KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -225,6 +226,17 @@ try {
     } finally {
       await client.close();
     }
+    // A stopped session that worked on lib/invoice.js: the unkeyworded line
+    // naming that file rides session start with no declaration (bench S5d/S5f:
+    // with hooks installed, Claude never called brain_sync with the file).
+    const brainPath = path.join(r.dir, 'brain.klypix');
+    const t0 = Date.now() - 3 * 3600_000;
+    upsertSession({ brainPath, home, now: t0, id: 'mira-session-0005', client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: 'mira-session-0005', identitySource: 'claude-lifecycle', intent: 'Rework invoice totals', files: ['lib/invoice.js'], work: { lastWords: 'Committed the invoice changes.', lastWordsAt: t0 } });
+    endSession({ brainPath, home, now: t0 + 1000, id: 'mira-session-0005' });
+    const start2 = execFileSync(process.execPath, [HOOK], { cwd: r.dir, env: hookEnv, encoding: 'utf8', input: JSON.stringify({ session_id: 'lock-hook-0006', cwd: r.dir }), stdio: ['pipe', 'pipe', 'pipe'] });
+    ok(start2.includes("Mira's agent has lib/invoice.js") && start2.includes('lib/invoice.js: NO WORK FOUND') && start2.includes('a stopped session worked on'), 'D8 Claude SessionStart shows a line naming a file a stopped session worked on, whatever its wording, with the evidence');
+    const cx2 = JSON.parse(execFileSync(process.execPath, [codexHook], { cwd: r.dir, env: { ...workerEnv, HOME: home, USERPROFILE: home }, encoding: 'utf8', input: JSON.stringify({ cwd: r.dir, session_id: 'lock-codex-0007', hook_event_name: 'SessionStart' }) }) || '{}');
+    ok((cx2.hookSpecificOutput?.additionalContext || cx2.systemMessage || '').includes("Mira's agent has lib/invoice.js"), 'D9 the Codex SessionStart hook does too');
   }
   console.log(`\nlock-notes: ${checks} checks passed`);
 } finally {

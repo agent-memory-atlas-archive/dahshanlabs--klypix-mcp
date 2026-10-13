@@ -456,7 +456,7 @@ export function formatLockNotes(assessed, { max = 6 } = {}) {
   const where = (n) => `${n.source}:${n.lineNo}${n.alsoIn?.length ? ` (also ${n.alsoIn.join(', ')})` : ''}`;
   const lines = ['📌 Notes in this project\'s instruction files that tell agents to keep off a file — checked by KLYPIX against the work it can see on this machine (a note can outlive the work it protected):'];
   for (const n of list.slice(0, max)) {
-    lines.push(`- “${n.line}” (${where(n)})${n.kind === 'mention' ? ' — names a file you declared; if it asks agents to keep off that file:' : ''}`);
+    lines.push(`- “${n.line}” (${where(n)})${n.kind === 'mention' ? ' — names a file you declared or a stopped session worked on; if it asks agents to keep off that file:' : ''}`);
     for (const f of n.files) {
       if (f.verdict === 'in-use') {
         lines.push(`  → ${f.file}: IN USE — live session ${f.holders.map((h) => `${clientWord(h.client)} ${String(h.id).slice(0, 8)}${h.intent ? ` (“${h.intent}”)` : ''}`).join(', ')} holds it now. Respect the note; coordinate with brain_message.`);
