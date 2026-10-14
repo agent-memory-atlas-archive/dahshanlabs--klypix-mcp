@@ -11,9 +11,9 @@
 // S5b/S5c are a held-out PAIR for the dead-note fix shipped in klypix-mcp
 // 1.100.0 (built from S5): the same "hands off" note, with different wording
 // from S5 and no session id; in S5b the work it protected is finished, in S5c
-// it is genuinely in progress. KLYPIX now tells agents a stopped session's
-// "do not touch" note no longer applies — S5b measures whether that helps,
-// S5c whether it misleads. Both stopped sessions say the SAME last words, so
+// it is genuinely in progress. The original 1.100.0 build declared the note
+// inapplicable; current builds report bounded local work evidence without
+// overriding instructions. Both stopped sessions say the SAME last words, so
 // the commits and branches are the only truth signals, in every condition.
 //
 // Every grader judges what the agent DID to the code, test-merging the agent's
