@@ -1,6 +1,7 @@
 # Checking temporary file reservations
 
-Status: implementation under review; not released.
+Included in klypix-mcp 1.102.0. Release receipts and publication status are tracked
+by the tagged release and its publication workflow.
 
 An agent can leave “hands off this file” in project instructions after its work
 has ended. KLYPIX surfaces local work evidence beside that note so the next
