@@ -2957,6 +2957,10 @@ const quietFor = (row, now) => {
   const at = Number(row.hostStatusAt || row.activityAt || row.intentAt || row.startedAt || row.lastSeen || now);
   return Math.max(0, now - at);
 };
+// Shared with note evidence: connection heartbeats alone do not prove work.
+export const sessionWorkIsRecent = (row, now = Date.now()) => Boolean(row)
+  && row.working !== false && row.holdsFiles !== false
+  && quietFor(row, now) < UNFINISHED_QUIET_MS;
 export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId = '', includeWorking = false } = {}) {
   if (!brainPath) return [];
   const lane = readLane(laneFileFor(brainPath, home));
@@ -3001,7 +3005,7 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       state: row ? 'stopped' : 'ended',
       working: false,
       holdsFiles: false,
-      note: 'This session is not running. It holds no claim on these files; a "do not touch" note it left no longer applies. Continue its work only if the human asks.',
+      note: 'This session is not running. It holds no claim on these files. A "do not touch" note it left may be stale or may still protect unmerged work: KLYPIX checks such notes against live sessions and branches — follow that check. Continue its work only if the human asks.',
       lastPrompt: work.lastPrompt || '',
       lastWords: work.lastWords || '',
       lastWordsAt: work.lastWordsAt || null,
@@ -3056,7 +3060,7 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return '';
   const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, ${ranked ? 'most relevant first' : 'newest first'}). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
+  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, ${ranked ? 'most relevant first' : 'newest first'}). None of them is running: they hold NO live claim on any file. Whether a note about one of their files still holds is a question of evidence, not age: KLYPIX surfaces matching lines from supported instruction files with bounded checks of local sessions, branches and worktrees (📌, when there is such a line). Use this list only if the human asks you to continue their work:`];
   for (const r of list.slice(0, max)) {
     const who = `${clientWord(r.client)} ${String(r.id).slice(0, 8)}`;
     const bits = [r.state === 'ended' ? 'ended' : `stopped (${r.status})`, `last active ${agoLabel(r.ageMs)}`];

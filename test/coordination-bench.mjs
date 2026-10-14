@@ -188,13 +188,17 @@ for (const s of SCENARIOS) {
     const [check, what] = expectations[s.id];
     ok(!isError && check(sc, text), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
     if (s.id === 's5b-dead-note-held-out' || s.id === 's5c-valid-note-held-out') {
-      // Declaring the locked file surfaces the stopped session — as ENDED and
-      // holding no file, in both scenarios (the product cannot tell a finished
-      // refactor from a paused one; the bench measures what that does).
+      // The session is ended in both cases; local Git evidence distinguishes
+      // merged work from the still-unmerged refactor. Neither grants authority
+      // to override a standing instruction.
       const withFile = await syncAs(server, repo, null, s.task, 'start', ['lib/ledger.js']);
       const row = (withFile.sc.handoffs?.sessions || []).find((r) => r.id === 'actor-s5x-ledger');
-      ok(!withFile.isError && row?.state === 'ended' && row?.holdsFiles === false && /no longer applies/.test(withFile.text),
-        `B3 ${s.id}: declaring lib/ledger.js lists the stopped session as ended, holding no file, its "do not touch" note "no longer applies"`);
+      const evidence = (withFile.sc.lockNotes || []).flatMap((n) => n.files || []).filter((f) => f.file === 'lib/ledger.js');
+      const expectedVerdict = s.id === 's5b-dead-note-held-out' ? 'no-work-found' : 'in-progress';
+      ok(!withFile.isError && row?.state === 'ended' && row?.holdsFiles === false
+        && evidence.length > 0 && evidence.every((f) => f.verdict === expectedVerdict && f.canOverrideInstructions === false)
+        && !/no longer applies/.test(withFile.text),
+        `B3 ${s.id}: the ended session holds no file; local work evidence is ${expectedVerdict} and does not override instructions`);
       ok((repo.read('AGENTS.md') || '').includes('Hands off lib/ledger.js'), `B3 ${s.id}: KLYPIX leaves the note in the notes file`);
     }
     if (s.id === 's10-live-peer-wrote-nothing') {
