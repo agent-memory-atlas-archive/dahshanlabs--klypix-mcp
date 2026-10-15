@@ -1105,6 +1105,7 @@ function workNorm(raw) {
         }).filter(Boolean).slice(0, 4);
         if (checkouts.length) out.checkouts = checkouts;
     }
+    if (raw.handoffAuto === true) out.handoffAuto = true;           // 1.103.0 twin: the card was drafted by KLYPIX
     return Object.keys(out).length ? out : null;
 }
 const workMerge = (prev, patch) => {
@@ -1551,7 +1552,9 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             if (Array.isArray(e.files) && e.files.length) lines.push(`  files it touched (free — not reserved): ${e.files.slice(-8).join(', ')}`);
             lines.push(...checkoutLinesOf(w, e.cwd));
             if (w.lastWords) lines.push(`  its last words: “${flat(w.lastWords).slice(0, 420)}”`);
-            if (w.handoffCardId) lines.push(`  🤝 it left a handoff card in the brain: ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`);
+            if (w.handoffCardId) lines.push(w.handoffAuto
+                ? `  🤝 KLYPIX drafted a handoff card from this record (the session wrote none): ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`
+                : `  🤝 it left a handoff card in the brain: ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`);
             if (w.takenBy) {
                 const t = liveRow(w.takenBy.id);
                 lines.push(`  taken over by ${clientWordOf(w.takenBy.client)} ${String(w.takenBy.id).slice(0, 8)} ${w.takenBy.at ? agoWord(now - w.takenBy.at) : ''} (${t ? (statusLabelOf(t, now) || 'live') : 'not running'}) — coordinate with brain_message before duplicating it`);

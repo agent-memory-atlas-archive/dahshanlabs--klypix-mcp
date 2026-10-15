@@ -578,6 +578,9 @@ export function normalizeWork(raw) {
     const checkouts = raw.checkouts.map(normalizeCheckout).filter(Boolean).slice(0, WORK_CHECKOUTS_MAX);
     if (checkouts.length) out.checkouts = checkouts;
   }
+  // 1.103.0: the card at handoffCardId was DRAFTED BY KLYPIX from this record
+  // (the session never wrote one) — every renderer says so.
+  if (raw.handoffAuto === true) out.handoffAuto = true;
   return Object.keys(out).length ? out : null;
 }
 export function mergeWork(previous, patch) {
@@ -3089,6 +3092,7 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       workdirs: Array.isArray(work.workdirs) ? work.workdirs : [],
       checkouts: Array.isArray(work.checkouts) ? work.checkouts : [],
       handoffCardId: work.handoffCardId || null,
+      handoffAuto: work.handoffAuto === true,
       takenBy: work.takenBy
         ? { ...work.takenBy, live: Boolean(taker), status: taker ? (sessionStatusLabel(taker, now) || 'live') : 'not running' }
         : null,
@@ -3150,7 +3154,9 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
     if (r.lastWords) lines.push(`  its last words: “${flat(r.lastWords).slice(0, 420)}”`);
     if (r.handoffCardId) {
       const title = cardTitles && cardTitles.get ? cardTitles.get(r.handoffCardId) : null;
-      lines.push(`  🤝 it left a handoff card in the brain: ${r.handoffCardId}${title ? ` — “${flat(title).slice(0, 100)}”` : ''} (brain_handoff {action:"list"} prints it in full)`);
+      lines.push(r.handoffAuto
+        ? `  🤝 KLYPIX drafted a handoff card from this record (the session wrote none): ${r.handoffCardId}${title ? ` — “${flat(title).slice(0, 100)}”` : ''} (brain_handoff {action:"list"} prints it in full)`
+        : `  🤝 it left a handoff card in the brain: ${r.handoffCardId}${title ? ` — “${flat(title).slice(0, 100)}”` : ''} (brain_handoff {action:"list"} prints it in full)`);
     }
     if (r.takenBy) lines.push(`  taken over by ${clientWord(r.takenBy.client)} ${String(r.takenBy.id).slice(0, 8)} ${r.takenBy.at ? agoLabel(now - r.takenBy.at) : ''} (${r.takenBy.status}) — coordinate with brain_message before duplicating it`);
     if (r.resumeCommand) lines.push(`  its own transcript, should the human want it: ${r.resumeCommand}`);

@@ -702,6 +702,18 @@ until a session takes it (`{action:"take", id}`) and finishes it (`{action:"done
 archives it). A later handoff can name the earlier one it `continues`. The per-prompt hook nudges
 the agent to write one when the person says *handoff* or names the limit.
 
+**Drafted by KLYPIX — when the session never got to write one.** A usage limit, a crash or a
+closed window leaves no time for `brain_handoff`. Since 1.103.0 the brain writes the card itself:
+at the next `brain_sync` start or `brain_handoff list` of *any* session, a record that qualifies —
+the session is closed or quiet for 30 minutes, left real work (its own commits, or touched files
+and a reply tail), has no card and no taker, and its task was a human's, not an app's — becomes a
+🤝 HANDOFF card on that session's behalf, reason *interrupted*. The card says `Drafted: by KLYPIX`
+on its own line, lists only what git proved under *Done*, tells the reader to confirm the state
+with `git status` before touching anything, and carries the session's last words verbatim. The
+record and every list say the session wrote none. If the session resumes and completes its task,
+the drafted card is archived at the next pass. Three drafts per pass at most; a draft can never
+fail the sync that triggered it.
+
 Durable decisions still go in the brain as cards — a handoff is the one card about *work in
 flight*, and it closes when the work lands.
 
@@ -1017,7 +1029,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
-| `brain_handoff` | The session handoff. `write` puts a 🤝 card in the brain — task, done, next in order, files, verify — when a session stops before the work is done; the next session of any agent sees it at its first `brain_sync` and `take`s it, then marks it `done`. `list` also shows the **unfinished work** KLYPIX recorded automatically for every session (its last reply, files, own commits, and since 1.103.0 the directories it worked in with the uncommitted state of each checkout, so a fix left in a side checkout is named, not searched for), which can be taken over by session id |
+| `brain_handoff` | The session handoff. `write` puts a 🤝 card in the brain — task, done, next in order, files, verify — when a session stops before the work is done; the next session of any agent sees it at its first `brain_sync` and `take`s it, then marks it `done`. `list` also shows the **unfinished work** KLYPIX recorded automatically for every session (its last reply, files, own commits, and since 1.103.0 the directories it worked in with the uncommitted state of each checkout, so a fix left in a side checkout is named, not searched for), which can be taken over by session id. Since 1.103.0 a session that stopped without writing a card (a usage limit, a crash) gets one **drafted by KLYPIX** from that record at the next `brain_sync` start or `list` — marked `Drafted:`, reason *interrupted*, archived if the session later completes its task |
 | `brain_reopen` | Reopen a closed Claude Code or Codex session so a note waiting for it gets there now — only after the person answers *Reopen* in an in-chat prompt or KLYPIX's own dialog; opens a new, visible terminal in that session's folder with the host's resume command |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |

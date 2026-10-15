@@ -46,7 +46,7 @@ import {
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
-import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord } from './session-handoff.mjs';
+import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
@@ -2192,7 +2192,11 @@ const handoffStatusOf = (file) => {
   };
 };
 
-export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, continues, continuedBy, ...fields }) {
+// `auto` (internal, never a tool argument — the MCP schema strips unknown keys):
+// the card is drafted by KLYPIX from a dead session's record on that session's
+// behalf (`from` = the dead session); `auto.by` is the session whose sync
+// noticed it. `autoDraft` (list): run the draft/reconcile pass first.
+export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, continues, continuedBy, auto = null, autoDraft = true, ...fields }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -2203,15 +2207,30 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
   const reply = (textOut, extra = {}, isError = false) => ({ blocks: [text(textOut)], structured: { schemaVersion: 1, action, brain: file, ...extra }, ...(isError ? { isError: true } : {}) });
 
   if (action === 'list') {
+    const now = Date.now();
+    // 1.103.0: a session that died without a card gets one drafted from its
+    // record FIRST, so this very list — and the brain_sync start that calls
+    // it — shows the card; a drafted card whose session has since completed
+    // is archived. Both are courtesies: neither can fail the list.
+    let drafted = [];
+    let closed = [];
+    if (autoDraft) { try { drafted = await autoDraftHandoffs({ vault, canvas: file, from: me, now }); } catch { drafted = []; } }
     let struct = null;
     try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`brain_handoff list failed: ${e.message}`); }
-    const now = Date.now();
+    if (autoDraft) {
+      try {
+        closed = await reconcileAutoHandoffs({ vault, canvas: file, struct, now });
+        if (closed.length) ({ struct } = await parseKlypix(fs.readFileSync(file)));
+      } catch { closed = []; }
+    }
     const cards = listOpenHandoffCards(struct, { now });
     const lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId });
     const titles = new Map(cards.map((h) => [h.id, h.title]));
     const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8 }), formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
+    if (drafted.length) blocks.unshift(`🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}” (${handoffClientWord(d.client)} ${String(d.session).slice(0, 8)})`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.`);
+    if (closed.length) blocks.push(`✓ KLYPIX archived ${closed.length} drafted handoff card${closed.length > 1 ? 's' : ''} whose session resumed and completed its task: ${closed.map((c) => c.id).join(', ')}.`);
     const out = blocks.length ? blocks.join('\n\n') : 'No handoff card is open in this brain and no other session left unfinished work on this project (sessions quiet for 10 minutes or closed, intent never completed, last 14 days).';
-    return reply(brainStamp(file, struct, t.how) + out, { handoffs: cards, unfinished: lane });
+    return reply(brainStamp(file, struct, t.how) + out, { handoffs: cards, unfinished: lane, autoDrafted: drafted, autoClosed: closed });
   }
 
   if (action === 'write') {
@@ -2221,7 +2240,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     const at = Date.now();
     const repo = gitHeadInfo(projectDir);
     const resume = resumeCommandFor(me.client, me.sessionId);
-    const body = renderHandoffCard(value, { from: me, at, repo, resume });
+    const body = renderHandoffCard(value, { from: me, at, repo, resume, auto });
     const evidence = value.files.map((ref) => ({ kind: 'file', ref }));
     // A handoff that CONTINUES an earlier one closes it FIRST: an open ❓ with
     // a near-identical title would otherwise be the capture engine's merge
@@ -2252,13 +2271,14 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
           .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         if (!mine.length) return;
         cardId = mine[0].id;
-        const res = await rewriteCardById(buf, cardId, (j) => { j.handoff = handoffMachineField(value, { from: me, at, repo, continues }); }, { now: at });
+        const res = await rewriteCardById(buf, cardId, (j) => { j.handoff = handoffMachineField(value, { from: me, at, repo, continues, auto, resume }); }, { now: at });
         if (res.changed) await atomicWrite(file, res.buffer);
       }, { brain: true });
     } catch { /* the card landed; only the machine twin is missing — prose still parses */ }
-    // The lane: this session's automatic record now points at its card.
+    // The lane: this session's automatic record now points at its card (for a
+    // drafted card, the DEAD session's record — `me` is that session).
     let laneStamp = null;
-    if (me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId } }); } catch { laneStamp = null; } }
+    if (me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId, ...(auto ? { handoffAuto: true } : {}) } }); } catch { laneStamp = null; } }
     // Name the successor on the closed card (archived above), so its history
     // says where the work went.
     if (continues && cardId && !continuedNote.includes('NOT closed')) {
@@ -2350,4 +2370,62 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     }, { brain: true });
   }
   return err(`brain_handoff: unknown action "${action}" — use write, take, done or list.`);
+}
+
+// ── Auto-drafted handoff (1.103.0): the brain writes the card itself ─────────
+// Field case 2026-10-15: Codex hit its usage limit mid-task and wrote no card;
+// its automatic record (files, own commits, last words) survived, and a human
+// had to ask another agent to turn that into a handoff by hand. This is that
+// step, done by KLYPIX: every brain_sync start / brain_handoff list turns a
+// qualifying record (session-handoff.mjs autoHandoffCandidates — closed or
+// quiet 30 min, real work, no card, no taker) into a 🤝 card written on the
+// dead session's behalf and marked "Drafted: by KLYPIX". Bounded (max per
+// pass), lane-read first (a parse only when something must be written), and
+// never a failure of the caller. Returns the drafted cards.
+const AUTO_HANDOFF_MAX_PER_PASS = 3;
+const AUTO_FROM = Object.freeze({ sessionId: 'auto', client: 'klypix' });
+export async function autoDraftHandoffs({ vault, canvas, from = {}, now = Date.now(), max = AUTO_HANDOFF_MAX_PER_PASS } = {}) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous || !t.file) return [];
+  const file = t.file;
+  const me = { sessionId: String(from.sessionId || '').slice(0, 160), client: String(from.client || 'unknown').slice(0, 40) };
+  let lane = [];
+  try { lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId }); } catch { return []; }
+  const drafted = [];
+  for (const rec of autoHandoffCandidates(lane).slice(0, max)) {
+    try {
+      const draft = draftHandoffFromWork(rec, { projectDir: path.dirname(file) });
+      const r = await opBrainHandoff({ vault, canvas: file, action: 'write', from: { sessionId: rec.id, client: rec.client }, via: 'klypix-auto', auto: { by: me, at: now }, ...draft });
+      if (!r.isError && r.structured?.id) drafted.push({ id: r.structured.id, session: rec.id, client: rec.client, title: draft.title });
+    } catch { /* a draft is a courtesy; the record still lists as unfinished work */ }
+  }
+  return drafted;
+}
+// A drafted card whose session has since COMPLETED its task (brain_sync
+// complete, or its work marked done by session id) is archived, so a session
+// that merely paused never leaves a stale card behind. Returns what closed.
+export async function reconcileAutoHandoffs({ vault, canvas, struct, now = Date.now() } = {}) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous || !t.file) return [];
+  const file = t.file;
+  const open = listOpenHandoffCards(struct, { now }).filter((h) => h.auto && h.from.sessionId);
+  if (!open.length) return [];
+  let known = [];
+  try { known = listKnownSessions({ brainPath: file, now }); } catch { return []; }
+  const closed = [];
+  for (const h of open) {
+    const key = String(h.from.sessionId).toLowerCase();
+    const entry = known.find((e) => String(e.id).toLowerCase() === key);
+    if (!entry) continue;
+    const draftedAt = Number(h.at) || 0;
+    const intentAt = Number(entry.intentAt) || 0;
+    const completed = (Number(entry.completedAt) > 0 && Number(entry.completedAt) >= intentAt && Number(entry.completedAt) >= draftedAt)
+      || (Number(entry.work?.doneAt) > 0 && Number(entry.work.doneAt) >= draftedAt);
+    if (!completed) continue;
+    try {
+      const r = await opBrainHandoff({ vault, canvas: file, action: 'done', id: h.id, from: AUTO_FROM, via: 'klypix-auto', summary: `${handoffClientWord(entry.client)} ${String(entry.id).slice(0, 8)} resumed and completed its task, so KLYPIX archived the card it had drafted` });
+      if (!r.isError) closed.push({ id: h.id, session: entry.id });
+    } catch { /* best-effort */ }
+  }
+  return closed;
 }

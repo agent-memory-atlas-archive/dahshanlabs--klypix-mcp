@@ -33,7 +33,7 @@ import {
 } from '../src/agent-presence.mjs';
 import {
   normalizeHandoffInput, renderHandoffCard, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, HANDOFF_ASK_RE, CONTINUE_RE,
-  workdirsFromCommand, workdirsFromToolInput, workdirsFromCommands, snapshotCheckouts,
+  workdirsFromCommand, workdirsFromToolInput, workdirsFromCommands, snapshotCheckouts, autoHandoffCandidates, draftHandoffFromWork, AUTO_HANDOFF_QUIET_MS,
 } from '../src/session-handoff.mjs';
 import { opBrainHandoff, opBrainNote } from '../src/klypix-core.mjs';
 
@@ -243,6 +243,87 @@ try {
     renderHandoffCard; opBrainNote; // referenced for completeness
   }
 
+  // ── F. Auto-drafted handoff (1.103.0): the brain writes the card itself ──
+  // Field case 2026-10-15: Codex hit its usage limit mid-task and never wrote
+  // a card; a human had to ask another agent to turn the automatic record into
+  // one. Now the next session's list / brain_sync start does that, marked.
+  {
+    // F1–F2: a path chunked by the ~37-column card wrap is rebuilt, never split
+    // into two "files" (the card KLYPIX wrote by hand that day listed
+    // "…/lib/managed-" and "run-worker.ts" as two files no agent could open).
+    const wrappedText = [
+      'Handoff: ❓ 🤝 HANDOFF — Stop recovery',
+      'From: Codex 01a13570 · 2026-10-15 20:04 UTC · reason: usage limit',
+      'Task: fix it.',
+      'Next:',
+      '1. read the diff',
+      'Files: artifacts/api-server/src/lib/managed-',
+      'run-worker.ts,',
+      'artifacts/agentforge/src/lib/run-stat',
+      'us.ts',
+      'Verify: git -C C:/w/facts status --porcelain',
+      '#handoff',
+    ].join('\n');
+    const p1 = parseHandoffCard({ id: 'txt_wrap', text: wrappedText, area: 'Handoff' });
+    ok(p1.files.length === 2 && p1.files[0] === 'artifacts/api-server/src/lib/managed-run-worker.ts' && p1.files[1] === 'artifacts/agentforge/src/lib/run-status.ts', `F1 a wrapped Files line is rebuilt into whole paths (${p1.files.join(' | ')})`);
+    const p2 = parseHandoffCard({ id: 'txt_ev', text: wrappedText, area: 'Handoff', evidence: [{ kind: 'file', ref: 'artifacts/api-server/src/lib/managed-run-worker.ts' }, { kind: 'file', ref: 'artifacts/agentforge/src/lib/run-status.ts' }, { kind: 'url', ref: 'https://x' }] });
+    ok(p2.files.length === 2 && p2.files.includes('artifacts/agentforge/src/lib/run-status.ts'), 'F2 the card\'s file evidence anchors (never wrapped) are the files when present');
+    // F3: the gate — strict on purpose.
+    const base = { intent: 'Fix the managed-run Stop recovery', files: ['a.ts'], lastWords: 'Edge cases folded in.', commits: [], handoffCardId: null, takenBy: null, state: 'stopped', quietMs: 12 * MIN };
+    const cands = autoHandoffCandidates([
+      { ...base, id: 'app', intent: 'This is an app-generated request for a suggested next user message.', quietMs: 90 * MIN },
+      { ...base, id: 'lunch' },
+      { ...base, id: 'quiet', quietMs: AUTO_HANDOFF_QUIET_MS },
+      { ...base, id: 'ended', state: 'ended', quietMs: null, files: [], lastWords: '', commits: [{ sha: 'abc1234', subject: 'fix: x' }] },
+      { ...base, id: 'bare', state: 'ended', lastWords: '', commits: [] },
+      { ...base, id: 'carded', quietMs: 90 * MIN, handoffCardId: 'txt_x' },
+      { ...base, id: 'taken', quietMs: 90 * MIN, takenBy: { id: 't' } },
+    ]).map((r) => r.id);
+    ok(cands.join(',') === 'quiet,ended', `F3 only a closed session with commits, or one quiet ≥30 min with files and a reply tail, qualifies — never an app turn, a lunch break, a bare record, a carded or a taken one (${cands.join(',')})`);
+    // F4: the draft is honest by construction.
+    const d = draftHandoffFromWork({ id: 'x', client: 'codex', intent: 'Fix the managed-run Stop recovery', cwd: 'C:/w/facts', files: ['artifacts/api-server/src/lib/managed-run-worker.ts'], lastPrompt: 'resume unfinished work', lastWords: 'Both edge cases are folded in. Next: run the suites.', commits: [{ sha: '7fcf976', subject: 'test: supply optional receipt' }] });
+    ok(d.reason === 'interrupted' && d.title === 'Fix the managed-run Stop recovery' && d.done[0] === 'committed 7fcf976 test: supply optional receipt' && d.next.length === 2 && /in C:\/w\/facts: git status, then git diff on the files below \(its own commits are under Done\)/.test(d.next[0]) && /^git -C "C:\/w\/facts" status --porcelain -- artifacts\/api-server/.test(d.verify) && d.lastWords.startsWith('Both edge cases') && d.task.includes('resume unfinished work'), 'F4 draftHandoffFromWork: reason interrupted, Done = its commits only, Next = confirm with git first, verify on its files, last words verbatim');
+    // F5: end to end, in process — a Codex session that stopped 35 minutes ago
+    // with real work and no card; another session's list drafts the card.
+    const realLane = () => JSON.parse(fs.readFileSync(laneFileFor(brainPath), 'utf8'));
+    const realEntry = (id) => (realLane().directory || []).find((e) => e.id === id);
+    fs.rmSync(laneFileFor(brainPath), { force: true });
+    const dead = 'codex-dead-session-0099';
+    const t0 = Date.now() - 35 * MIN;
+    upsertSession({ brainPath, now: t0, id: dead, client: 'codex', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: dead, identitySource: 'codex-lifecycle', intent: 'Fix the managed-run Stop recovery', files: ['artifacts/api-server/src/lib/managed-run-worker.ts', 'artifacts/agentforge/src/lib/run-status.ts'], cwd: project, work: { lastPrompt: 'resume unfinished work', lastWords: 'Both edge cases are folded into the fix and the tests. Next: run the managed-run suites.', lastWordsAt: t0, commits: [{ sha: '7fcf976', subject: 'test: supply optional receipt to image route fixtures' }] } });
+    const noticer = { sessionId: 'claude-noticer-0100', client: 'claude-code' };
+    const l1 = await opBrainHandoff({ vault: project, action: 'list', from: noticer, via: 'claude-code' });
+    const drafted = l1.structured?.autoDrafted || [];
+    ok(!l1.isError && drafted.length === 1 && drafted[0].session === dead && /^txt_/.test(drafted[0].id) && l1.blocks[0].text.includes('KLYPIX drafted 1 handoff card just now'), `F5 another session's list drafts a card for the dead session and says so (${drafted[0]?.id})`);
+    const autoId = drafted[0].id;
+    let { struct: s5 } = await parseKlypix(fs.readFileSync(brainPath));
+    const autoCard = s5.cards.find((c) => c.id === autoId);
+    const h5 = parseHandoffCard(autoCard);
+    const unwrapped = String(autoCard?.text || '').replace(/\s+/g, ' ');
+    ok(autoCard && isOpenHandoffCard(autoCard) && / Drafted: by KLYPIX from the session's own record/.test(unwrapped) && /reason: interrupted — stopped without a handoff Drafted:/.test(unwrapped) && h5.auto === true && h5.reason === 'interrupted' && h5.from.sessionId === dead && h5.from.client === 'Codex' && autoCard.handoff?.auto?.by?.sessionId === noticer.sessionId, 'F6 the card is an open 🤝 on the dead session\'s behalf: Drafted: line, reason interrupted, machine twin names who noticed');
+    ok(h5.files.length === 2 && h5.files.includes('artifacts/agentforge/src/lib/run-status.ts') && h5.done[0].includes('7fcf976') && h5.lastWords.startsWith('Both edge cases') && h5.lastWords.includes('Next∶ run the managed-run suites') && h5.next.length === 2 && /git/.test(h5.next[0]) && h5.resume === `codex resume ${dead}`, 'F7 it carries the files, the commit, the last words verbatim, a confirm-with-git first step and the resume command');
+    ok(realEntry(dead)?.work?.handoffCardId === autoId && realEntry(dead).work.handoffAuto === true, 'F8 the dead session\'s lane record points at the drafted card and is marked auto');
+    const u8 = listUnfinishedWork({ brainPath, selfId: noticer.sessionId }).find((r) => r.id === dead);
+    ok(u8 && u8.handoffAuto === true && formatUnfinishedWork([u8], { cardTitles: new Map([[autoId, h5.title]]) }).includes('KLYPIX drafted a handoff card from this record (the session wrote none)'), 'F9 the unfinished-work list says KLYPIX drafted it, not that the session left it');
+    ok(formatHandoffCards([h5]).includes('drafted by KLYPIX from the record of Codex codex-de') && formatHandoffCards([h5]).includes('verify its state with git first') && formatHandoffCards([h5]).includes('its last words: “Both edge cases'), 'F10 the handoff block says it was drafted, tells the reader to verify, and quotes the last words');
+    const l2 = await opBrainHandoff({ vault: project, action: 'list', from: noticer, via: 'claude-code' });
+    ok((l2.structured?.autoDrafted || []).length === 0 && l2.structured.handoffs.filter((h) => h.id === autoId).length === 1, 'F11 a second list drafts nothing again — one card per dead session');
+    // F12: a DELIBERATE handoff on the same task from another session keeps
+    // its own card — the drafted one must not swallow it (merge-on-capture).
+    const w12 = await opBrainHandoff({ vault: project, action: 'write', from: { sessionId: 'claude-finisher-0101', client: 'claude-code' }, via: 'claude-code', title: 'Fix the managed-run Stop recovery', task: 'Finish and ship the Stop recovery fix.', next: ['run the suites', 'open the PR'], files: ['artifacts/api-server/src/lib/managed-run-worker.ts'], reason: 'usage_limit' });
+    ({ struct: s5 } = await parseKlypix(fs.readFileSync(brainPath)));
+    ok(!w12.isError && w12.structured.id && w12.structured.id !== autoId && listOpenHandoffCards(s5).filter((h) => [autoId, w12.structured.id].includes(h.id)).length === 2 && !parseHandoffCard(s5.cards.find((c) => c.id === w12.structured.id)).auto, 'F12 a deliberate handoff with the same title lands as its OWN card beside the drafted one');
+    // F13: the dead session comes back and completes its task → the drafted
+    // card is archived at the next pass; the deliberate one stays open.
+    upsertSession({ brainPath, now: Date.now(), id: dead, client: 'codex', channel: 'mcp', event: 'McpTaskComplete', logicalSessionId: dead, identitySource: 'codex-lifecycle', intent: '' });
+    const l3 = await opBrainHandoff({ vault: project, action: 'list', from: noticer, via: 'claude-code' });
+    ({ struct: s5 } = await parseKlypix(fs.readFileSync(brainPath)));
+    const closedCard = s5.cards.find((c) => c.id === autoId);
+    ok((l3.structured?.autoClosed || []).some((c) => c.id === autoId) && l3.blocks[0].text.includes('archived 1 drafted handoff card') && closedCard && /^archive$/i.test(closedCard.area || '') && closedCard.handoff.state === 'done' && /resumed and completed its task/.test(closedCard.handoff.done.summary) && listOpenHandoffCards(s5).some((h) => h.id === w12.structured.id), 'F13 when the session completes its task, KLYPIX archives the card it drafted — the deliberate card stays');
+    await opBrainHandoff({ vault: project, action: 'done', id: w12.structured.id, from: { sessionId: 'claude-finisher-0101', client: 'claude-code' }, summary: 'shipped' });
+    fs.rmSync(laneFileFor(brainPath), { force: true });
+  }
+
   // ── D. Over MCP stdio: registered, and brain_sync start carries it ────────
   {
     // The worker must not adopt THIS test's real host session through an
@@ -302,6 +383,26 @@ try {
     ok(cont.content[0].text.includes('Rewrite lib/report.js') && cont.content[0].text.includes('files it touched (free — not reserved)'), 'D12 a continue-shaped task sees it with its last words');
     await c.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
     await c.close();
+
+    // D13–D15 (1.103.0): over stdio, a brain_sync start drafts the card for a
+    // session that died with real work, announces it, flags it in the JSON —
+    // and the session's NEXT tool is not rejected (the draft replaced the
+    // brain file; the binding is refreshed, as after any managed write).
+    const deadMcp = 'codex-dead-mcp-session-0077';
+    const tDead = Date.now() - 40 * MIN;
+    upsertSession({ brainPath, home, now: tDead, id: deadMcp, client: 'codex', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: deadMcp, identitySource: 'codex-lifecycle', intent: 'Port the billing export to the new API', files: ['src/billing/port.ts'], work: { lastWords: 'Port compiles; the integration test is still red.', lastWordsAt: tDead, commits: [{ sha: '9e8d7c6', subject: 'feat(billing): port export' }] } });
+    const dd = await connect('claude-after-dead-0078');
+    const ds = await dd.callTool({ name: 'brain_sync', arguments: { project, intent: 'continue what codex left on the billing export', phase: 'start' } });
+    const dsText = ds.content[0].text;
+    const dsDrafted = ds.structuredContent?.handoffs?.autoDrafted || [];
+    ok(!ds.isError && dsDrafted.length === 1 && dsDrafted[0].session === deadMcp && dsText.includes('KLYPIX drafted 1 handoff card just now') && dsText.includes('Port the billing export to the new API') && dsText.includes('verify its state with git first'), 'D13 a brain_sync start drafts the dead Codex session\'s card and announces it as drafted');
+    ok(ds.structuredContent.handoffs.handoffs.some((h) => h.id === dsDrafted[0].id && h.auto === true && h.reason === 'interrupted'), 'D14 structured.handoffs flags the drafted card (auto:true, reason interrupted)');
+    const after = await dd.callTool({ name: 'brain_handoff', arguments: { project, action: 'list' } });
+    ok(!after.isError && after.structuredContent?.status !== 'project-changed' && after.content[0].text.includes(dsDrafted[0].id), 'D15 the next tool call still works — the drafted write did not break the project binding');
+    ok(entryOf(deadMcp)?.work?.handoffCardId === dsDrafted[0].id && entryOf(deadMcp).work.handoffAuto === true, 'D16 the worker\'s lane record for the dead session points at the drafted card, marked auto');
+    await dd.callTool({ name: 'brain_handoff', arguments: { project, action: 'done', id: dsDrafted[0].id, summary: 'ported' } });
+    await dd.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    await dd.close();
 
     // ── E. Universal (1.99.1): not only Claude Code ─────────────────────────
     // E1–E4: an MCP-only host (Cursor, Gemini CLI, VS Code — no hooks at all)

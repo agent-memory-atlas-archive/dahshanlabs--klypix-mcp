@@ -1409,7 +1409,13 @@ server.registerTool('brain_sync', {
   let handoffData = null;
   if (phase === 'start' && include_context !== false && report.structured?.brain) {
     try {
-      const h = await opBrainHandoff({ vault: mcpPresence.vault, canvas: report.structured.brain, action: 'list', from: { sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id } });
+      const h = await opBrainHandoff({ vault: mcpPresence.vault, canvas: report.structured.brain, action: 'list', from: { sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id, client: extra?.klypixRequestIdentity?.clientInfo?.client || extra?.klypixClientName || 'unknown' } });
+      // 1.103.0: the list may have WRITTEN the brain (a card drafted for a dead
+      // session, or a drafted card archived) — an atomic replace that changes
+      // the brain inode captured at sync. Refresh the binding from the
+      // unchanged canonical root, as the tool wrapper does after any managed
+      // write, or the session's very next tool is rejected as project-changed.
+      if ((h?.structured?.autoDrafted || []).length || (h?.structured?.autoClosed || []).length) mcpPresence.refreshCurrentProjectBinding();
       const cards = h?.structured?.handoffs || [];
       // 1.99.1: the AUTOMATIC lane records are history, not a lock (bench S5:
       // an ended session's intent on a file made Claude and Codex defer, 0/5).
@@ -1438,14 +1444,19 @@ server.registerTool('brain_sync', {
         .map(({ r }) => r);
       if (!h?.isError && (cards.length || lane.length)) {
         const now = Date.now();
+        const drafted = Array.isArray(h?.structured?.autoDrafted) ? h.structured.autoDrafted : [];
         handoffText = [
+          // 1.103.0: a card KLYPIX drafted in THIS pass from a dead session's
+          // record is announced as such — a lead to verify, not the session's words.
+          drafted.length ? `🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}”`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.` : '',
           formatHandoffCards(cards, { now, max: 5 }),
           formatUnfinishedWork(lane, { now, max: 4, ranked: wantsContinue && words.size > 0 }),
         ].filter(Boolean).join('\n\n');
         handoffData = {
           cards: cards.length,
           unfinished: lane.length,
-          handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files })),
+          handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files, auto: c.auto === true })),
+          ...(Array.isArray(h?.structured?.autoDrafted) && h.structured.autoDrafted.length ? { autoDrafted: h.structured.autoDrafted } : {}),
           sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, lastPrompt: r.lastPrompt || null, lastWords: r.lastWords || null, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
         };
       }
