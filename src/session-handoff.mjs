@@ -584,7 +584,12 @@ const DIR_TOKEN = String.raw`((?:[A-Za-z]:[\\/]|/(?!/))[^\s"'` + '`' + String.ra
 const CD_RE = new RegExp(String.raw`(?:^|[;&|(]\s*|\n\s*|&&\s*)(?:cd|pushd|chdir|Set-Location|sl)\s+(?:/d\s+|-LiteralPath\s+|-Path\s+)?["']?` + DIR_TOKEN, 'gim');
 const GIT_C_RE = new RegExp(String.raw`\bgit\s+(?:--literal-pathspecs\s+|--no-pager\s+)*-C\s+["']?` + DIR_TOKEN, 'gi');
 const WORKDIR_KEY_RE = /["']?(?:workdir|working_directory|cwd)["']?\s*[:=]\s*["']((?:[A-Za-z]:[\\/]|\/(?!\/))[^"'\n]+)["']/gi;
-const dirKeyOf = (d) => path.resolve(String(d)).replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+// Both path styles on every OS: a Windows transcript parsed on Linux (CI, a
+// shared lane) must still see `C:/w/facts` as absolute. path.isAbsolute alone
+// says no there, and path.resolve would glue cwd in front of it.
+const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
+const isAbsoluteDir = (d) => WIN_ABS_RE.test(d) || path.isAbsolute(d);
+const dirKeyOf = (d) => (WIN_ABS_RE.test(String(d)) ? String(d) : path.resolve(String(d))).replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
 const cleanDir = (d) => String(d || '').trim().replace(/[\\/]+$/, '').replace(/["']+$/, '');
 /** The absolute directories one shell command moved into (cd / git -C / a workdir key). Pure. */
 export function workdirsFromCommand(command) {
@@ -596,7 +601,7 @@ export function workdirsFromCommand(command) {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {
       const dir = cleanDir(m[1]);
-      if (!dir || !path.isAbsolute(dir) || dir.length > 400) continue;
+      if (!dir || !isAbsoluteDir(dir) || dir.length > 400) continue;
       const key = dirKeyOf(dir);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -611,7 +616,7 @@ export function workdirsFromToolInput(toolInput) {
   const out = [];
   for (const key of ['workdir', 'cwd', 'working_directory', 'workingDirectory']) {
     const v = ti[key];
-    if (typeof v === 'string' && path.isAbsolute(cleanDir(v))) out.push(cleanDir(v));
+    if (typeof v === 'string' && isAbsoluteDir(cleanDir(v))) out.push(cleanDir(v));
   }
   // An argv array (`["bash","-lc","cd /x && …"]`) is joined with newlines so
   // the script argument starts a line of its own and a leading `cd` is seen.
@@ -669,7 +674,7 @@ export function snapshotCheckouts({ dirs, projectDir, sessionFiles = [], runGit 
   for (const raw of Array.isArray(dirs) ? dirs : []) {
     if (out.length >= maxDirs || Date.now() >= deadline) break;
     const dir = cleanDir(raw);
-    if (!dir || !path.isAbsolute(dir)) continue;
+    if (!dir || !isAbsoluteDir(dir)) continue;
     const dirKey = dirKeyOf(dir);
     if (seenDirs.has(dirKey)) continue;
     seenDirs.add(dirKey);
