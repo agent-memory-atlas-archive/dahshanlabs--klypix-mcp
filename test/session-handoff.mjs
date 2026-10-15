@@ -29,9 +29,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildKlypixMap, parseKlypix, structToUltraBrief, structToBrief, isOpenHandoffCard, handoffTitle, rewriteCardById } from '../src/klypix-format.mjs';
 import {
-  formatUnfinishedWork, laneFileFor, listUnfinishedWork, normalizeWork, mergeWork, stampSessionWork, upsertSession, endSession, UNFINISHED_QUIET_MS,
+  formatUnfinishedWork, formatCheckoutLines, hasWorkEvidence, laneFileFor, listUnfinishedWork, normalizeWork, mergeWork, stampSessionWork, upsertSession, endSession, UNFINISHED_QUIET_MS,
 } from '../src/agent-presence.mjs';
-import { normalizeHandoffInput, renderHandoffCard, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, HANDOFF_ASK_RE, CONTINUE_RE } from '../src/session-handoff.mjs';
+import {
+  normalizeHandoffInput, renderHandoffCard, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, HANDOFF_ASK_RE, CONTINUE_RE,
+  workdirsFromCommand, workdirsFromToolInput, workdirsFromCommands, snapshotCheckouts,
+} from '../src/session-handoff.mjs';
 import { opBrainHandoff, opBrainNote } from '../src/klypix-core.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -354,6 +357,135 @@ try {
     ok(pickText.includes('1a2b3c4 feat(invoice): pdf layout') && pickText.includes('Layout is committed') && firstRecord.startsWith('- Codex codex-th') && pickText.includes('most relevant first'), `E8 asked to continue "what codex was doing on the invoice", a Claude session gets the Codex work FIRST — commits, last words (first: ${firstRecord.slice(0, 60)})`);
     await cl.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
     await cl.close();
+  }
+
+  // ── F. Where it worked (1.103.0): workdirs + checkouts ───────────────────
+  // Field case 2026-10-15: Codex hit its usage limit with a fix UNCOMMITTED on a
+  // branch in a side checkout (C:\w\facts) that `git worktree list` in the
+  // project does not show. Last words, files and commits were all recorded —
+  // and the next session still searched for an hour. The record now names the
+  // checkout, its branch and its uncommitted paths.
+  {
+    const dirKey = (d) => path.resolve(String(d)).replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+    const sameDir = (a, b) => dirKey(a) === dirKey(b);
+    // F1–F3: the pure parsers.
+    const parsed = workdirsFromCommand('cd C:/w/facts && git status; git -C E:/other/repo log -1; text(await tools.exec_command({cmd:"pnpm test","workdir":"C:/w/facts"})); pushd /srv/app\nSet-Location -LiteralPath D:\\x\\y\\');
+    ok(parsed.length === 4 && parsed[0] === 'C:/w/facts' && parsed.includes('/srv/app') && parsed.includes('D:\\x\\y') && parsed.includes('E:/other/repo'), `F1 workdirsFromCommand finds cd / pushd / Set-Location / git -C / a workdir key, once each (${parsed.join(' | ')})`);
+    ok(workdirsFromCommand('ls -la && npm test').length === 0 && workdirsFromCommand('cd src && ls').length === 0, 'F2 a command with no absolute directory, or a relative cd, yields nothing');
+    const fromTool = workdirsFromToolInput({ command: ['bash', '-lc', 'cd /x/y && ls'], workdir: 'C:\\w\\facts\\' });
+    ok(fromTool[0] === 'C:\\w\\facts' && fromTool[1] === '/x/y', 'F3 workdirsFromToolInput takes the explicit workdir first, then the command text');
+    const many = workdirsFromCommands(['cd /a', 'cd /b', 'cd /c', 'cd /a', 'cd /d', 'cd /e', 'cd /gone'], { isDirectory: (d) => d !== '/gone' });
+    ok(many.join(',') === '/b,/c,/a,/d,/e'.split(',').slice(-4).join(',') && !many.includes('/gone'), `F4 workdirsFromCommands keeps the 4 newest existing directories, re-use moves to the tail (${many.join(',')})`);
+
+    // F5–F8: a real snapshot — the project checkout reports only this session's
+    // files; a side checkout reports its whole status; a non-git dir is skipped.
+    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const mkRepo = (name, files) => {
+      const dir = path.join(root, name);
+      fs.mkdirSync(dir, { recursive: true });
+      git(dir, ['init', '-q']);
+      git(dir, ['config', 'user.email', 'test@example.com']);
+      git(dir, ['config', 'user.name', 'Test']);
+      git(dir, ['config', 'commit.gpgsign', 'false']);
+      for (const [f, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, f), body);
+      git(dir, ['add', '-A']);
+      git(dir, ['commit', '-q', '-m', 'init']);
+      return dir;
+    };
+    const projF = mkRepo('projF', { 'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c' });
+    const side = mkRepo('side', { 'f1.txt': 'one', 'f2.txt': 'two' });
+    git(side, ['checkout', '-q', '-b', 'codex/managed-stop-recovery']);
+    fs.writeFileSync(path.join(projF, 'a.txt'), 'a-edited');          // touched by this session
+    fs.writeFileSync(path.join(projF, 'b.txt'), 'b-edited-by-a-peer'); // NOT this session's
+    fs.writeFileSync(path.join(side, 'f1.txt'), 'changed');
+    fs.writeFileSync(path.join(side, 'f2.txt'), 'changed');
+    fs.writeFileSync(path.join(side, 'new.txt'), 'new');
+    fs.mkdirSync(path.join(root, 'plain'), { recursive: true });
+    const snap = snapshotCheckouts({ dirs: [projF, side, path.join(side, '.'), path.join(root, 'plain'), path.join(root, 'missing')], projectDir: projF, sessionFiles: ['a.txt'] });
+    const shared = snap.find((c) => c.shared);
+    const sideEntry = snap.find((c) => !c.shared);
+    ok(snap.length === 2 && shared && sameDir(shared.dir, projF) && shared.changed === 1 && shared.paths.join() === 'a.txt', `F5 the project checkout reports only the files this session touched (${JSON.stringify(shared?.paths)})`);
+    ok(sideEntry && sameDir(sideEntry.dir, side) && sideEntry.branch === 'codex/managed-stop-recovery' && /^[0-9a-f]{12}$/.test(sideEntry.head) && sideEntry.changed === 3 && sideEntry.paths.includes('new.txt') && sideEntry.paths.includes('f1.txt') && !sideEntry.statusUnknown, `F6 a separate checkout reports branch, head and its whole uncommitted status (${sideEntry?.changed} changed)`);
+    ok(snapshotCheckouts({ dirs: [projF], projectDir: projF, sessionFiles: ['c.txt'] }).length === 0, 'F7 a project checkout with none of this session\'s files dirty is not reported (a shared dirty tree is not its work)');
+    const slow = snapshotCheckouts({ dirs: [side], projectDir: projF, runGit: (cwd, argv, ms) => { if (argv[0] === 'status') throw new Error('timeout'); return execFileSync('git', ['--literal-pathspecs', ...argv], { cwd, encoding: 'utf8', timeout: ms, stdio: ['ignore', 'pipe', 'ignore'] }); } });
+    ok(slow.length === 1 && slow[0].statusUnknown === true && slow[0].changed === 0 && formatCheckoutLines({ checkouts: slow }).join('\n').includes('git status unavailable'), 'F8 a git status that does not answer leaves statusUnknown, never a false "clean"');
+
+    // F9–F11: the record — caps, merge, evidence, text.
+    const big = normalizeWork({ workdirs: ['/1', '/2', '/3', '/4', '/5', '/6'], checkouts: [{ dir: 'C:/w/facts', branch: 'x', head: '186b6c0b1234', changed: 20, paths: Array.from({ length: 20 }, (_v, i) => `p${i}.ts`), shared: false }, { dir: '' }, 'junk', ...Array.from({ length: 5 }, (_v, i) => ({ dir: `/c${i}` }))] });
+    ok(big.workdirs.join(',') === '/3,/4,/5,/6' && big.checkouts.length === 4 && big.checkouts[0].paths.length === 12 && big.checkouts[0].changed === 20 && big.checkouts[0].head === '186b6c0b1234', 'F9 normalizeWork caps workdirs at 4 (newest), checkouts at 4, paths at 12 while keeping the true changed count, and drops junk');
+    const merged = mergeWork({ workdirs: ['/a'], lastWords: 'x' }, { addWorkdirs: ['/b', '/a'] });
+    ok(merged.workdirs.join(',') === '/b,/a' && merged.lastWords === 'x' && !('addWorkdirs' in merged), 'F10 addWorkdirs appends and de-duplicates (re-use moves to the tail)');
+    ok(hasWorkEvidence({ checkouts: [{ dir: '/x', changed: 2, paths: ['a'] }] }) && !hasWorkEvidence({ checkouts: [{ dir: '/x', changed: 0, paths: [] }] }), 'F11 uncommitted changes in a checkout are work evidence; a clean one alone is not');
+    const facts = { dir: 'C:/w/facts', branch: 'codex/managed-stop-recovery', head: '186b6c0b4d3e', changed: 11, paths: ['artifacts/api-server/src/lib/managed-run-worker.ts', 'artifacts/api-server/src/routes/runs.ts'], shared: false, at: Date.now() };
+    const linesF = formatCheckoutLines({ checkouts: [facts, { dir: 'E:/ANTIGRAVITY/AgentLit', changed: 1, paths: ['README.md'], shared: true }], workdirs: ['C:/w/facts', 'D:/elsewhere', 'E:/ANTIGRAVITY/AgentLit'] }, { cwd: 'E:/ANTIGRAVITY/AgentLit' });
+    ok(linesF[0].includes('worked in a separate checkout: C:/w/facts (branch codex/managed-stop-recovery @ 186b6c0b4d3e; 11 uncommitted: artifacts/api-server/src/lib/managed-run-worker.ts, artifacts/api-server/src/routes/runs.ts …and 9 more)') && linesF[0].includes('git worktree list may not show it'), `F12 a separate checkout is named in full with branch, head and its uncommitted paths (${linesF[0].slice(0, 80)}…)`);
+    ok(linesF[1] === '  uncommitted in the project checkout (files this session touched): README.md' && linesF[2] === '  also ran commands in: D:/elsewhere', 'F13 the project checkout line names only this session\'s files; a non-git workdir is listed too, cwd is not repeated');
+
+    // F14: a session that recorded ONLY uncommitted work (cut off before any
+    // reply tail) is listed, and the list names the checkout.
+    const now = 2_400_000_000_000;
+    const cut = '01a13570-659e-7331-b5d2-1fbf41caaffe';
+    upsertSession({ brainPath, home, now, id: cut, client: 'codex', channel: 'mcp', event: 'McpTaskStart', logicalSessionId: cut, identitySource: 'codex-lifecycle', intent: 'fix managed-run Stop recovery', cwd: 'E:/ANTIGRAVITY/AgentLit' });
+    upsertSession({ brainPath, home, now: now + MIN, id: cut, client: 'codex', channel: 'lifecycle', event: 'Stop', logicalSessionId: cut, identitySource: 'codex-lifecycle', hostStatus: 'idle', work: { workdirs: ['C:/w/facts'], checkouts: [facts] } });
+    const cutRec = listUnfinishedWork({ brainPath, home, now: now + 30 * MIN }).find((r) => r.id === cut);
+    ok(cutRec && cutRec.checkouts.length === 1 && cutRec.checkouts[0].dir === 'C:/w/facts' && cutRec.workdirs.join() === 'C:/w/facts', 'F14 a session whose only evidence is uncommitted work in a side checkout is listed, with the checkout in its JSON record');
+    const cutText = formatUnfinishedWork([cutRec], { now: now + 30 * MIN });
+    ok(cutText.includes('worked in a separate checkout: C:/w/facts (branch codex/managed-stop-recovery') && cutText.indexOf('worked in a separate checkout') < cutText.indexOf('If the human asks'), 'F15 the unfinished-work block prints where it worked');
+    // In-process, the core op resolves the lane under os.homedir(): point it at
+    // the test home for this one call (the stdio worker gets HOME via env).
+    const savedHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    let tk2;
+    try { tk2 = await opBrainHandoff({ vault: project, action: 'take', session: cut.slice(0, 8), from: { sessionId: 'taker-0001', client: 'claude-code' }, via: 'claude-code' }); }
+    finally { for (const [k, v] of Object.entries(savedHome)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+    ok(!tk2.isError && tk2.blocks[0].text.includes('Where it worked: worked in a separate checkout: C:/w/facts') && tk2.structured.record.checkouts[0].changed === 11, `F16 taking the work over names the checkout in the reply and the record (${tk2.isError ? tk2.blocks[0].text.slice(0, 120) : 'ok'})`);
+
+    // F17–F18: the Claude hook twin records it at Stop and prints it at SessionStart.
+    const hookEnv = { ...process.env, HOME: home, USERPROFILE: home, CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KLYPIX_AUTO_UPDATE: '0' };
+    delete hookEnv.KLYPIX_SESSION_ID;
+    const sidF = 'c0ffee00-aaaa-bbbb-cccc-000000000001';
+    const transcriptF = path.join(root, 'transcript-f.jsonl');
+    const tsF = new Date().toISOString();
+    const J = (l) => JSON.stringify(l) + '\n';
+    fs.writeFileSync(transcriptF, J({ type: 'user', timestamp: tsF, message: { role: 'user', content: 'fix the stop recovery in the side checkout' } }));
+    const runF = (args, input) => execFileSync(process.execPath, [HOOK, ...args], { cwd: project, env: hookEnv, encoding: 'utf8', input: JSON.stringify(input), stdio: ['pipe', 'pipe', 'pipe'] });
+    runF(['--prompt'], { session_id: sidF, prompt: 'fix the stop recovery in the side checkout', transcript_path: transcriptF, cwd: project });
+    fs.writeFileSync(path.join(project, 'a.txt'), 'edited by the cut-off session');
+    fs.appendFileSync(transcriptF, [
+      { type: 'assistant', timestamp: tsF, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'f1', name: 'Bash', input: { command: `cd ${side} && git status --short` } }] } },
+      { type: 'user', timestamp: tsF, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f1', content: ' M f1.txt' }] } },
+      { type: 'assistant', timestamp: tsF, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'f2', name: 'Edit', input: { file_path: path.join(project, 'a.txt'), old_string: 'x', new_string: 'y' } }] } },
+      { type: 'user', timestamp: tsF, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'f2', content: 'ok' }] } },
+      { type: 'assistant', timestamp: tsF, message: { role: 'assistant', content: [{ type: 'text', text: 'Both edge cases are in the fix now; closing the gap before release.' }] } },
+    ].map(J).join(''));
+    runF(['--capture'], { session_id: sidF, transcript_path: transcriptF, cwd: project });
+    const eF = entryOf(sidF);
+    const eSide = (eF?.work?.checkouts || []).find((c) => !c.shared);
+    const eShared = (eF?.work?.checkouts || []).find((c) => c.shared);
+    ok(eF?.work?.workdirs?.some((d) => sameDir(d, side)) && eSide && sameDir(eSide.dir, side) && eSide.branch === 'codex/managed-stop-recovery' && eSide.changed === 3, `F17 the Claude Stop hook records the side checkout its Bash moved into, with branch and uncommitted count (${eSide?.changed})`);
+    ok(eShared && eShared.paths.join() === 'a.txt', 'F18 …and, for the shared project checkout, only the file this session edited');
+    {
+      const lf = laneFileFor(brainPath, home);
+      const lane = JSON.parse(fs.readFileSync(lf, 'utf8'));
+      for (const row of lane.sessions) if (row.id === sidF) { row.hostStatusAt -= 60 * MIN; row.lastSeen -= 60 * MIN; }
+      for (const row of lane.directory) if (row.id === sidF) row.lastSeen -= 60 * MIN;
+      fs.writeFileSync(lf, JSON.stringify(lane));
+    }
+    const startF = runF([], { session_id: 'c0ffee00-aaaa-bbbb-cccc-000000000002', cwd: project });
+    ok(startF.includes('worked in a separate checkout:') && startF.toLowerCase().includes(dirKey(side).split('/').pop()) && startF.includes('uncommitted in the project checkout (files this session touched): a.txt'), 'F19 SessionStart of the next Claude session prints where the cut-off session worked (hook twin)');
+
+    // F20: the Codex hook records a tool call's workdir and snapshots it at Stop.
+    const codexHook = path.join(__dirname, '..', 'src', 'codex-brain-hook.mjs');
+    const workerEnvF = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE|CODEX|KLYPIX)/.test(k)));
+    const runCodexF = (input) => execFileSync(process.execPath, [codexHook], { cwd: project, env: { ...workerEnvF, HOME: home, USERPROFILE: home }, encoding: 'utf8', input: JSON.stringify({ cwd: project, ...input }) });
+    const cxF = 'codex-thread-side-checkout-0009';
+    runCodexF({ session_id: cxF, hook_event_name: 'SessionStart' });
+    runCodexF({ session_id: cxF, hook_event_name: 'UserPromptSubmit', prompt: 'finish the stop recovery fix' });
+    runCodexF({ session_id: cxF, hook_event_name: 'PostToolUse', tool_name: 'shell', tool_input: { command: ['pwsh', '-c', 'pnpm test'], workdir: side }, tool_response: { output: 'ok', exit_code: 0 } });
+    ok(entryOf(cxF)?.work?.workdirs?.some((d) => sameDir(d, side)), 'F20 the Codex hook records the workdir of a tool call');
+    runCodexF({ session_id: cxF, hook_event_name: 'Stop', last_assistant_message: 'Review found one more case; closing it before release.' });
+    const cxSide = (entryOf(cxF)?.work?.checkouts || []).find((c) => !c.shared);
+    ok(cxSide && sameDir(cxSide.dir, side) && cxSide.changed === 3 && cxSide.branch === 'codex/managed-stop-recovery', `F21 at Stop the Codex hook snapshots that checkout: branch and uncommitted count (${cxSide?.changed})`);
   }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

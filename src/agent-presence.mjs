@@ -512,6 +512,37 @@ const endedMatches = (row, id) => {
 // without `work` is byte-stable through a touch that changes nothing.
 export const WORK_LAST_WORDS_MAX = 700;
 export const WORK_COMMITS_MAX = 6;
+// Where the session actually worked (1.103.0, field case 2026-10-15): the
+// directories its shell commands moved into (`workdirs`) and a bounded `git
+// status` of each checkout at Stop (`checkouts`). Codex had left a fix
+// UNCOMMITTED on a branch in a side checkout (C:\w\facts) that `git worktree
+// list` in the project does not show; its last words, files and commits were
+// all recorded and still nobody could find the work.
+export const WORK_WORKDIRS_MAX = 4;
+export const WORK_CHECKOUTS_MAX = 4;
+export const WORK_CHECKOUT_PATHS_MAX = 12;
+// Newest last; a directory used again moves to the tail (LRU, like observedFiles).
+const normalizeDirList = (raw, max) => {
+  const cleaned = (Array.isArray(raw) ? raw : []).map((d) => String(d || '').trim().replace(/[\\/]+$/, '').slice(0, 400)).filter(Boolean);
+  const out = [];
+  const seen = new Set();
+  for (const d of cleaned.reverse()) { if (seen.has(d)) continue; seen.add(d); out.unshift(d); }
+  return out.slice(-max);
+};
+export function normalizeCheckout(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const dir = String(raw.dir || '').trim().replace(/[\\/]+$/, '').slice(0, 400);
+  if (!dir) return null;
+  const paths = [...new Set((Array.isArray(raw.paths) ? raw.paths : []).map((p) => String(p || '').trim().slice(0, 200)).filter(Boolean))].slice(0, WORK_CHECKOUT_PATHS_MAX);
+  const changed = Math.max(Number.isFinite(Number(raw.changed)) ? Math.round(Number(raw.changed)) : 0, paths.length);
+  const head = String(raw.head || '').trim().slice(0, 12);
+  const branch = String(raw.branch || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const at = Number.isFinite(Number(raw.at)) && Number(raw.at) > 0 ? Number(raw.at) : null;
+  return {
+    dir, branch: branch || null, head: /^[0-9a-f]{4,12}$/i.test(head) ? head : null, changed, paths,
+    shared: Boolean(raw.shared), ...(raw.statusUnknown ? { statusUnknown: true } : {}), ...(at ? { at } : {}),
+  };
+}
 export function normalizeWork(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const out = {};
@@ -539,6 +570,14 @@ export function normalizeWork(raw) {
   // hooks or not — stamps when it was declared, so a Cursor / Gemini / VS Code
   // session that stopped mid-task is still found by the next session.
   if (ms(raw.declaredAt)) out.declaredAt = ms(raw.declaredAt);
+  // 1.103.0: where it worked — directories beyond cwd, and each checkout's
+  // uncommitted state at the last Stop (replaced whole on every Stop).
+  const workdirs = normalizeDirList(raw.workdirs, WORK_WORKDIRS_MAX);
+  if (workdirs.length) out.workdirs = workdirs;
+  if (Array.isArray(raw.checkouts)) {
+    const checkouts = raw.checkouts.map(normalizeCheckout).filter(Boolean).slice(0, WORK_CHECKOUTS_MAX);
+    if (checkouts.length) out.checkouts = checkouts;
+  }
   return Object.keys(out).length ? out : null;
 }
 export function mergeWork(previous, patch) {
@@ -546,6 +585,12 @@ export function mergeWork(previous, patch) {
   if (patch === null) return null;
   const prev = normalizeWork(previous) || {};
   const next = patch && typeof patch === 'object' ? { ...patch } : {};
+  // `addWorkdirs` APPENDS (one tool call at a time on Codex; a transcript walk
+  // on Claude), newest last, de-duplicated, capped like `workdirs`.
+  if (Array.isArray(next.addWorkdirs)) {
+    next.workdirs = normalizeDirList([...(prev.workdirs || []), ...next.addWorkdirs], WORK_WORKDIRS_MAX);
+    delete next.addWorkdirs;
+  }
   // `addCommits` APPENDS (Codex records one commit per tool result; the
   // Claude Stop hook replaces the full list with `commits`), newest last,
   // de-duplicated by sha, capped like `commits`.
@@ -2940,7 +2985,37 @@ export const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Evidence of real work, from ANY host: a reply tail (Claude and Codex Stop
 // hooks), own commits (Claude transcript, Codex tool results), a handoff card
 // (brain_handoff), or a task declared through brain_sync (every MCP host).
-export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId || work.declaredAt));
+// 1.103.0: uncommitted changes in a checkout it worked in are evidence too — a
+// session cut off before its first reply tail still left work on disk.
+export const hasUncommittedWork = (work) => Boolean(work && Array.isArray(work.checkouts) && work.checkouts.some((c) => c && Number(c.changed) > 0));
+export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId || work.declaredAt || hasUncommittedWork(work)));
+// The "where it worked" lines of one record — shared by formatUnfinishedWork,
+// the brain_handoff take reply and (as a twin) the Claude hook's footer. A
+// separate checkout is named in full with its branch, head and uncommitted
+// paths: the next session must not have to search for it. The project
+// checkout is shared by every session, so only the files THIS session touched
+// are reported there.
+export function formatCheckoutLines(work, { cwd = null } = {}) {
+  const lines = [];
+  const checkouts = Array.isArray(work?.checkouts) ? work.checkouts : [];
+  const named = new Set();
+  for (const c of checkouts) {
+    if (!c || !c.dir) continue;
+    named.add(String(c.dir).replace(/\\/g, '/').toLowerCase());
+    const more = Number(c.changed) > c.paths.length ? ` …and ${Number(c.changed) - c.paths.length} more` : '';
+    if (c.shared) {
+      if (Number(c.changed) > 0) lines.push(`  uncommitted in the project checkout (files this session touched): ${c.paths.join(', ')}${more}`);
+      continue;
+    }
+    const where = [c.branch ? `branch ${c.branch}` : 'detached HEAD', ...(c.head ? [`@ ${c.head}`] : [])].join(' ');
+    const state = c.statusUnknown ? 'git status unavailable' : (Number(c.changed) > 0 ? `${c.changed} uncommitted: ${c.paths.join(', ')}${more}` : 'clean');
+    lines.push(`  worked in a separate checkout: ${c.dir} (${where}; ${state}) — not the project folder; git worktree list may not show it`);
+  }
+  const extra = (Array.isArray(work?.workdirs) ? work.workdirs : [])
+    .filter((d) => !named.has(String(d).replace(/\\/g, '/').toLowerCase()) && (!cwd || String(d).replace(/\\/g, '/').toLowerCase() !== String(cwd).replace(/\\/g, '/').toLowerCase()));
+  if (extra.length) lines.push(`  also ran commands in: ${extra.join(', ')}`);
+  return lines;
+}
 export function clientWord(client) {
   const key = String(client || '').toLowerCase();
   if (key === 'claude-code' || key === 'claude') return 'Claude Code';
@@ -3010,6 +3085,9 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       lastWords: work.lastWords || '',
       lastWordsAt: work.lastWordsAt || null,
       commits: Array.isArray(work.commits) ? work.commits : [],
+      // 1.103.0: where it worked — so a fix left in a side checkout is found.
+      workdirs: Array.isArray(work.workdirs) ? work.workdirs : [],
+      checkouts: Array.isArray(work.checkouts) ? work.checkouts : [],
       handoffCardId: work.handoffCardId || null,
       takenBy: work.takenBy
         ? { ...work.takenBy, live: Boolean(taker), status: taker ? (sessionStatusLabel(taker, now) || 'live') : 'not running' }
@@ -3068,6 +3146,7 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
     lines.push(`- ${who} · “${flat(r.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
     if (r.commits.length) lines.push(`  commits: ${r.commits.map((c) => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
     if (r.files.length) lines.push(`  files it touched (free — not reserved): ${r.files.slice(-8).join(', ')}`);
+    lines.push(...formatCheckoutLines(r, { cwd: r.cwd }));
     if (r.lastWords) lines.push(`  its last words: “${flat(r.lastWords).slice(0, 420)}”`);
     if (r.handoffCardId) {
       const title = cardTitles && cardTitles.get ? cardTitles.get(r.handoffCardId) : null;

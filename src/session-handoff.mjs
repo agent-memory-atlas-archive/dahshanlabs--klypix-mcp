@@ -571,3 +571,128 @@ export function lockNotesData(assessed) {
     })),
   }));
 }
+
+// ── Where a session actually worked (1.103.0) ───────────────────────────────
+// Field case, 2026-10-15: Codex hit its usage limit mid-fix. The automatic
+// record had its last words, files and commits — and the fix sat UNCOMMITTED
+// on a branch in a side checkout (C:\w\facts) that `git worktree list` in the
+// project does not show. The next session searched for an hour. So the Stop
+// hooks also record the directories a session ran commands in (cd, pushd,
+// Set-Location, git -C, a tool's workdir) and a bounded `git status` of each
+// checkout. Pure apart from git: fixed arguments, short timeouts, injectable.
+const DIR_TOKEN = String.raw`((?:[A-Za-z]:[\\/]|/(?!/))[^\s"'` + '`' + String.raw`;|&<>)]+)`;
+const CD_RE = new RegExp(String.raw`(?:^|[;&|(]\s*|\n\s*|&&\s*)(?:cd|pushd|chdir|Set-Location|sl)\s+(?:/d\s+|-LiteralPath\s+|-Path\s+)?["']?` + DIR_TOKEN, 'gim');
+const GIT_C_RE = new RegExp(String.raw`\bgit\s+(?:--literal-pathspecs\s+|--no-pager\s+)*-C\s+["']?` + DIR_TOKEN, 'gi');
+const WORKDIR_KEY_RE = /["']?(?:workdir|working_directory|cwd)["']?\s*[:=]\s*["']((?:[A-Za-z]:[\\/]|\/(?!\/))[^"'\n]+)["']/gi;
+const dirKeyOf = (d) => path.resolve(String(d)).replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+const cleanDir = (d) => String(d || '').trim().replace(/[\\/]+$/, '').replace(/["']+$/, '');
+/** The absolute directories one shell command moved into (cd / git -C / a workdir key). Pure. */
+export function workdirsFromCommand(command) {
+  const text = String(command || '');
+  if (!text || !/[A-Za-z]:[\\/]|\//.test(text)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const re of [CD_RE, GIT_C_RE, WORKDIR_KEY_RE]) {
+    re.lastIndex = 0;
+    for (const m of text.matchAll(re)) {
+      const dir = cleanDir(m[1]);
+      if (!dir || !path.isAbsolute(dir) || dir.length > 400) continue;
+      const key = dirKeyOf(dir);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(dir);
+    }
+  }
+  return out;
+}
+/** The directories a tool call ran in: an explicit workdir/cwd key, then the command text. Pure. */
+export function workdirsFromToolInput(toolInput) {
+  const ti = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  const out = [];
+  for (const key of ['workdir', 'cwd', 'working_directory', 'workingDirectory']) {
+    const v = ti[key];
+    if (typeof v === 'string' && path.isAbsolute(cleanDir(v))) out.push(cleanDir(v));
+  }
+  // An argv array (`["bash","-lc","cd /x && …"]`) is joined with newlines so
+  // the script argument starts a line of its own and a leading `cd` is seen.
+  const cmd = typeof ti === 'string' ? ti : (Array.isArray(ti.command) ? ti.command.map((v) => (typeof v === 'string' ? v : '')).join('\n') : [ti.command, ti.cmd].filter((v) => typeof v === 'string').join('\n'));
+  out.push(...workdirsFromCommand(cmd));
+  const seen = new Set();
+  return out.filter((d) => { const k = dirKeyOf(d); if (seen.has(k)) return false; seen.add(k); return true; });
+}
+/** Existing directories from many commands, newest last, capped. */
+export function workdirsFromCommands(commands, { max = 4, isDirectory = defaultIsDirectory } = {}) {
+  const found = new Map();
+  for (const cmd of Array.isArray(commands) ? commands : []) {
+    for (const dir of workdirsFromCommand(typeof cmd === 'string' ? cmd : cmd?.cmd)) {
+      const key = dirKeyOf(dir);
+      found.delete(key);
+      found.set(key, dir);
+    }
+  }
+  const out = [];
+  for (const dir of [...found.values()].reverse()) {
+    if (out.length >= max) break;
+    if (isDirectory(dir)) out.unshift(dir);
+  }
+  return out;
+}
+function defaultIsDirectory(dir) { try { return fs.statSync(dir).isDirectory(); } catch { return false; } }
+function defaultRunGit(cwd, argv, ms) {
+  return execFileSync('git', ['--literal-pathspecs', ...argv], {
+    cwd, encoding: 'utf8', timeout: ms, maxBuffer: 2 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+  });
+}
+/**
+ * One bounded snapshot of every checkout a session worked in: branch, head and
+ * uncommitted paths. `dirs` is cwd first, then the recorded workdirs. The
+ * checkout that IS the project (shared by every session) reports only the
+ * paths in `sessionFiles` (project-relative) — a shared dirty tree is not this
+ * session's work; a separate checkout (a worktree, a side clone) reports its
+ * whole status, capped. Never throws; a git that does not answer in time
+ * leaves `statusUnknown` rather than a false "clean".
+ */
+export function snapshotCheckouts({ dirs, projectDir, sessionFiles = [], runGit = defaultRunGit, isDirectory = defaultIsDirectory, maxDirs = 4, maxPaths = 12, budgetMs = 3000, now = Date.now() } = {}) {
+  const deadline = Date.now() + budgetMs;
+  const query = (cwd, argv, ms) => {
+    const left = deadline - Date.now();
+    if (left <= 0) return null;
+    try { return String(runGit(cwd, argv, Math.min(ms, left))); } catch { return null; }
+  };
+  const projectKey = projectDir ? dirKeyOf(projectDir) : '';
+  const session = new Set((Array.isArray(sessionFiles) ? sessionFiles : []).map((f) => String(f || '').replace(/\\/g, '/').replace(/^\.\//, '')).filter(Boolean));
+  const seenDirs = new Set();
+  const seenTops = new Set();
+  const out = [];
+  for (const raw of Array.isArray(dirs) ? dirs : []) {
+    if (out.length >= maxDirs || Date.now() >= deadline) break;
+    const dir = cleanDir(raw);
+    if (!dir || !path.isAbsolute(dir)) continue;
+    const dirKey = dirKeyOf(dir);
+    if (seenDirs.has(dirKey)) continue;
+    seenDirs.add(dirKey);
+    if (!isDirectory(dir)) continue;
+    const top = (query(dir, ['rev-parse', '--show-toplevel'], 700) || '').trim();
+    if (!top) continue;
+    const topKey = dirKeyOf(top);
+    if (seenTops.has(topKey)) continue;
+    seenTops.add(topKey);
+    const branchRaw = (query(top, ['rev-parse', '--abbrev-ref', 'HEAD'], 700) || '').trim();
+    const head = (query(top, ['rev-parse', '--short=12', 'HEAD'], 700) || '').trim() || null;
+    const status = query(top, ['status', '--porcelain', '--untracked-files=normal'], 1500);
+    const shared = topKey === projectKey;
+    let paths = status === null ? [] : status.split('\n').map((line) => line.replace(/\r$/, '')).filter((line) => line.length > 3)
+      .map((line) => { const p = line.slice(3); const arrow = p.indexOf(' -> '); return (arrow >= 0 ? p.slice(arrow + 4) : p).replace(/^"|"$/g, '').replace(/\\/g, '/'); })
+      .filter(Boolean);
+    if (shared) paths = paths.filter((p) => session.has(p) || [...session].some((f) => p.endsWith('/') && f.startsWith(p)));
+    const changed = paths.length;
+    if (shared && changed === 0) continue;
+    out.push({
+      dir: top, branch: branchRaw && branchRaw !== 'HEAD' ? branchRaw : null, head: head && /^[0-9a-f]{4,12}$/i.test(head) ? head : null,
+      changed, paths: paths.slice(0, maxPaths), shared, ...(status === null ? { statusUnknown: true } : {}), at: now,
+    });
+  }
+  return out;
+}

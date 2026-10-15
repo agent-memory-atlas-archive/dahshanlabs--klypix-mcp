@@ -495,6 +495,20 @@ async function main() {
     ? touchedFiles(input, projectDir)
     : undefined;
   const files = humanTurn ? [] : undefined;
+  const workPatch = codexWorkPatch({ event, humanTurn, prompt, input }) || {};
+  // Where it works (1.103.0): the directory a tool call ran in (Codex's exec
+  // carries `workdir`; a command may `cd` or `git -C` elsewhere). Dynamic +
+  // guarded so a stale bundle without the helper still records the rest.
+  let whereLib = null;
+  if (event === 'PostToolUse' || event === 'Stop') {
+    try { whereLib = await import(new URL('./session-handoff.mjs', import.meta.url).href); } catch { whereLib = null; }
+  }
+  if (event === 'PostToolUse' && typeof whereLib?.workdirsFromToolInput === 'function') {
+    try {
+      const dirs = whereLib.workdirsFromToolInput(toolInput(input));
+      if (dirs.length) workPatch.addWorkdirs = dirs;
+    } catch { /* best-effort */ }
+  }
   const sessions = upsertSession({
     brainPath,
     id: sessionId,
@@ -517,8 +531,29 @@ async function main() {
     // human prompt on a human turn, and at Stop the reply tail WHEN the host
     // hands it over (Codex's Stop payload may carry `last_assistant_message`;
     // this adapter never reads Codex's transcript). Absent = keep the known.
-    ...(codexWorkPatch({ event, humanTurn, prompt, input }) ? { work: codexWorkPatch({ event, humanTurn, prompt, input }) } : {}),
+    ...(Object.keys(workPatch).length ? { work: workPatch } : {}),
   });
+  // At Stop, a bounded git status of every checkout this session worked in
+  // (cwd first, then the workdirs its tool calls recorded) — the fix left
+  // uncommitted in a side checkout is what the 2026-10-15 field case lost.
+  // A second touch, so it sees the workdirs the first one merged.
+  if (event === 'Stop' && typeof whereLib?.snapshotCheckouts === 'function') {
+    try {
+      const me = sessions.find((session) => session.id === sessionId);
+      const checkouts = whereLib.snapshotCheckouts({
+        dirs: [cwd, ...(Array.isArray(me?.work?.workdirs) ? me.work.workdirs : [])],
+        projectDir,
+        sessionFiles: [...new Set([...(me?.files || []), ...(me?.observedFiles || [])])],
+      });
+      if (checkouts.length) {
+        upsertSession({
+          brainPath, id: sessionId, client: 'codex', event, channel: 'lifecycle', cwd,
+          ...(HOST_PID.pid ? { hostPid: HOST_PID.pid, hostPidSource: HOST_PID.source } : {}),
+          logicalSessionId: sessionId, identitySource: 'codex-lifecycle', work: { checkouts },
+        });
+      }
+    } catch { /* best-effort */ }
+  }
 
   const ignored = event === 'PostToolUse' ? ownBrainMessageText(input) : [];
   // Stop can show a UI warning but cannot add model context. Never advance a
