@@ -26,6 +26,7 @@
 //             not) so a dry run proves each grader separates them.
 import { runNodeTests, mergeConflictFiles, runNodeProbe } from './lib/repo.mjs';
 import { ROUND3 } from './scenarios-round3.mjs';
+import { RECHECK } from './scenarios-recheck.mjs';
 
 // Claude Code reads CLAUDE.md natively, Codex and most other hosts AGENTS.md.
 // Every scenario writes both, identically, so no agent starts with less.
@@ -744,5 +745,5 @@ const s8 = {
   },
 };
 
-export const SCENARIOS = [s1, s2, s3, s4, s5, s6, s7, s8, ...ROUND3];
+export const SCENARIOS = [s1, s2, s3, s4, s5, s6, s7, s8, ...ROUND3, ...RECHECK];
 export const scenarioById = (id) => SCENARIOS.find((s) => s.id === id || s.id.startsWith(`${id}-`) || s.id.split('-')[0] === id) || null;
