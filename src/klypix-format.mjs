@@ -2920,7 +2920,7 @@ export const isOpenHandoffCard = (c) => isHandoffCard(c) && isUnresolvedOpenCard
 // The capture engine hard-wraps a card at ~36 columns, so the title may span
 // several lines: take line 1 and every following line up to the first section
 // keyword (From:/Task:/…) or tag line.
-const HANDOFF_SECTION_LINE_RE = /^(?:From|Task|Done|Next|Files|Verify|Open|Taken|Finished|Continued by|Resume the session)\b[^\n]*:/u;
+const HANDOFF_SECTION_LINE_RE = /^(?:From|Drafted|Task|Done|Next|Files|Verify|Last words|Open|Taken|Finished|Continued by|Resume)\b[^\n]*:/u;
 export function handoffHeadLines(text) {
     const lines = String(text ?? '').replace(/\r/g, '').split('\n');
     const head = [lines[0] || ''];
@@ -7308,14 +7308,21 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // wording + createdAt) instead of stacking a twin the close-pass would
         // later miss. (Supersede deliberately skips ? cards, so without this
         // twins could never merge at capture at all.)
+        // A 🤝 HANDOFF card is one SESSION's record of its work in flight, never
+        // a rephrasing of another's: two sessions handing off the same task are
+        // two cards (`continues` links them). So a handoff neither merges into
+        // an existing ❓ nor serves as the merge target of one — 1.103.0 field
+        // case: the card KLYPIX drafted from a dead session's record (title =
+        // its intent) swallowed the next session's deliberate handoff on the
+        // same task, and that write came back without an id.
         let merging = null;
         for (let i = cards.length - 1; i >= 0; i--) try {
             const card = merging = cards[i];
-            if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
+            if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text) || HANDOFF_RE.test(String(card.text).split('\n', 1)[0])) continue;
             const nTok = tokenSet(card.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (!/❓/.test(c.text)) continue;
+                if (!/❓/.test(c.text) || HANDOFF_RE.test(String(c.text).split('\n', 1)[0])) continue;
                 const s = overlapScore(nTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
