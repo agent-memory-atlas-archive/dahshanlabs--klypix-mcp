@@ -45,7 +45,7 @@ import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
-import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, resumeCommandFor } from './agent-presence.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
 import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
@@ -2294,7 +2294,8 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       }
       const rec = listUnfinishedWork({ brainPath: file, now, includeWorking: true }).find((x) => x.id === r.id) || null;
       if (action === 'take') {
-        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
+        const where = rec ? formatCheckoutLines(rec, { cwd: rec.cwd }).map((l) => l.trim()).join('\n') : '';
+        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${where ? `\nWhere it worked: ${where}` : ''}${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
       }
       return reply(`✓ Marked done: the work ${String(r.id).slice(0, 8)} left no longer shows as unfinished.${extraNote ? ` Note kept: ${extraNote}` : ''}`, { session: r.id });
     }

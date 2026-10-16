@@ -1087,9 +1087,35 @@ function workNorm(raw) {
     if (raw.takenBy && typeof raw.takenBy === 'object' && raw.takenBy.id) out.takenBy = { id: str(raw.takenBy.id, 160), client: str(raw.takenBy.client, 40) || 'unknown', at: ms(raw.takenBy.at) };
     if (ms(raw.doneAt)) { out.doneAt = ms(raw.doneAt); if (raw.doneBy) out.doneBy = str(raw.doneBy, 160); }
     if (ms(raw.declaredAt)) out.declaredAt = ms(raw.declaredAt);   // 1.99.1 twin: a brain_sync-declared task (any MCP host)
+    // 1.103.0 twin: where it worked — workdirs beyond cwd, and each checkout's
+    // uncommitted state at the last Stop (normalizeCheckout in agent-presence).
+    const dirs = []; const seenDirs = new Set();   // newest last; re-use moves to the tail (twin of normalizeDirList)
+    for (const d of (Array.isArray(raw.workdirs) ? raw.workdirs : []).map(d => String(d || '').trim().replace(/[\\/]+$/, '').slice(0, 400)).filter(Boolean).reverse()) { if (seenDirs.has(d)) continue; seenDirs.add(d); dirs.unshift(d); }
+    if (dirs.length) out.workdirs = dirs.slice(-4);
+    if (Array.isArray(raw.checkouts)) {
+        const checkouts = raw.checkouts.map(c => {
+            if (!c || typeof c !== 'object') return null;
+            const dir = String(c.dir || '').trim().replace(/[\\/]+$/, '').slice(0, 400);
+            if (!dir) return null;
+            const paths = [...new Set((Array.isArray(c.paths) ? c.paths : []).map(p => String(p || '').trim().slice(0, 200)).filter(Boolean))].slice(0, 12);
+            const head = String(c.head || '').trim().slice(0, 12);
+            const branch = str(c.branch, 120);
+            const at = ms(c.at);
+            return { dir, branch: branch || null, head: /^[0-9a-f]{4,12}$/i.test(head) ? head : null, changed: Math.max(Number.isFinite(Number(c.changed)) ? Math.round(Number(c.changed)) : 0, paths.length), paths, shared: Boolean(c.shared), ...(c.statusUnknown ? { statusUnknown: true } : {}), ...(at ? { at } : {}) };
+        }).filter(Boolean).slice(0, 4);
+        if (checkouts.length) out.checkouts = checkouts;
+    }
     return Object.keys(out).length ? out : null;
 }
-const workMerge = (prev, patch) => (patch === undefined ? workNorm(prev) : patch === null ? null : workNorm({ ...(workNorm(prev) || {}), ...(patch && typeof patch === 'object' ? patch : {}) }));
+const workMerge = (prev, patch) => {
+    if (patch === undefined) return workNorm(prev);
+    if (patch === null) return null;
+    const p = workNorm(prev) || {};
+    const next = patch && typeof patch === 'object' ? { ...patch } : {};
+    // addWorkdirs APPENDS (twin of agent-presence mergeWork), newest last, capped 4.
+    if (Array.isArray(next.addWorkdirs)) { next.workdirs = [...(p.workdirs || []), ...next.addWorkdirs]; delete next.addWorkdirs; }
+    return workNorm({ ...p, ...next });
+};
 function dirPrune(rows, now) {
     return (Array.isArray(rows) ? rows : [])
         .filter(row => row && dirKey(row.id) && now - Number(row.lastSeen || 0) < DIR_FRESH_MS)
@@ -1471,8 +1497,28 @@ const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
 // 1.99.1 twin of agent-presence UNFINISHED_WINDOW_MS / hasWorkEvidence: only a
 // session that stopped in the last 24h AND left a 1.99+ work record is listed.
 const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
-const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId || w.declaredAt));
-const CONTINUE_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
+const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId || w.declaredAt
+    || (Array.isArray(w.checkouts) && w.checkouts.some(c => c && Number(c.changed) > 0))));   // 1.103.0 twin: uncommitted work on disk counts
+// 1.103.0 twin of agent-presence formatCheckoutLines: the "where it worked"
+// lines — a separate checkout named in full so nobody searches for it.
+function checkoutLinesOf(w, cwd) {
+    const lines = [];
+    const named = new Set();
+    const low = (d) => String(d || '').replace(/\\/g, '/').toLowerCase();
+    for (const c of Array.isArray(w?.checkouts) ? w.checkouts : []) {
+        if (!c || !c.dir) continue;
+        named.add(low(c.dir));
+        const more = Number(c.changed) > c.paths.length ? ` …and ${Number(c.changed) - c.paths.length} more` : '';
+        if (c.shared) { if (Number(c.changed) > 0) lines.push(`  uncommitted in the project checkout (files this session touched): ${c.paths.join(', ')}${more}`); continue; }
+        const where = [c.branch ? `branch ${c.branch}` : 'detached HEAD', ...(c.head ? [`@ ${c.head}`] : [])].join(' ');
+        const state = c.statusUnknown ? 'git status unavailable' : (Number(c.changed) > 0 ? `${c.changed} uncommitted: ${c.paths.join(', ')}${more}` : 'clean');
+        lines.push(`  worked in a separate checkout: ${c.dir} (${where}; ${state}) — not the project folder; git worktree list may not show it`);
+    }
+    const extra = (Array.isArray(w?.workdirs) ? w.workdirs : []).filter(d => !named.has(low(d)) && (!cwd || low(d) !== low(cwd)));
+    if (extra.length) lines.push(`  also ran commands in: ${extra.join(', ')}`);
+    return lines;
+}
+const CONTINUE_RE =/\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
 const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
 function unfinishedFooter(sid, { max = 4 } = {}) {
     try {
@@ -1503,6 +1549,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             lines.push(`- ${clientWordOf(e.client)} ${e.id.slice(0, 8)} · “${flat(e.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
             if (Array.isArray(w.commits) && w.commits.length) lines.push(`  commits: ${w.commits.map(c => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
             if (Array.isArray(e.files) && e.files.length) lines.push(`  files it touched (free — not reserved): ${e.files.slice(-8).join(', ')}`);
+            lines.push(...checkoutLinesOf(w, e.cwd));
             if (w.lastWords) lines.push(`  its last words: “${flat(w.lastWords).slice(0, 420)}”`);
             if (w.handoffCardId) lines.push(`  🤝 it left a handoff card in the brain: ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`);
             if (w.takenBy) {
@@ -4082,6 +4129,24 @@ async function capture(lib) {
                 .filter(Boolean);
             if (commits.length) workPatch.commits = commits;
         }
+        // Where it actually worked (1.103.0): the directories its shell commands
+        // moved into (cd / pushd / git -C / a workdir key) and a bounded git
+        // status of each checkout — a fix left uncommitted in a side checkout is
+        // FOUND by the next session, not searched for. The project checkout is
+        // shared by many sessions, so only the files THIS session touched count
+        // there. Dynamic + guarded: a stale bundle without the helper keeps the
+        // record's other fields.
+        try {
+            const whereLib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
+            if (typeof whereLib.snapshotCheckouts === 'function' && typeof whereLib.workdirsFromCommands === 'function') {
+                const prevDirs = Array.isArray(scopeRow.work?.workdirs) ? scopeRow.work.workdirs : [];
+                const seenDirs = whereLib.workdirsFromCommands(shellCmds.slice(-80).map(c => c.cmd));
+                if (seenDirs.length) workPatch.addWorkdirs = seenDirs;
+                const sessionFiles = [...new Set([...laneFiles, ...(Array.isArray(scopeRow.files) ? scopeRow.files : []), ...(Array.isArray(scopeRow.observedFiles) ? scopeRow.observedFiles : [])])];
+                const checkouts = whereLib.snapshotCheckouts({ dirs: [CWD, ...prevDirs, ...seenDirs], projectDir: CWD, sessionFiles });
+                if (checkouts.length) workPatch.checkouts = checkouts;
+            }
+        } catch { /* best-effort: the record keeps its other fields */ }
         touchSession(input.session_id, {
             branch: gitBranch(), hostStatus: 'idle',
             ...(laneFiles.length ? { addFiles: laneFiles } : {}),

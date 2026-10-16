@@ -510,10 +510,11 @@ is near, the day ends, you are blocked, you are switching tool) Call \`brain_han
 {action:"write"} with the task, what is done, what is NEXT in order, the files and how to verify.
 It is a 🤝 card in this brain the human can see and correct, and the next session on this project —
 any agent — sees it at its first \`brain_sync\` / session start and takes it with {action:"take"},
-then {action:"done"} when finished. KLYPIX also records every session's last reply, files and
-commits automatically, so \`brain_sync\` may list **unfinished work** another session left without
-a card: if the human asks you to continue it, take it with \`brain_handoff\` {action:"take",
-session:"<id>"} first. That list is history, not a lock — a stopped session holds no claim on its
+then {action:"done"} when finished. KLYPIX also records every session's last reply, files,
+commits and the checkouts it worked in (with their uncommitted files) automatically, so
+\`brain_sync\` may list **unfinished work** another session left without a card: if the human asks
+you to continue it, take it with \`brain_handoff\` {action:"take", session:"<id>"} first, and look
+first in the checkout the record names — it may be a side folder, not the project. That list is history, not a lock — a stopped session holds no claim on its
 files. Never ask the human to paste a summary into the next session.
 
 **A note that asks agents to keep off a file**, whatever its wording (here, in AGENTS.md / CLAUDE.md or any
