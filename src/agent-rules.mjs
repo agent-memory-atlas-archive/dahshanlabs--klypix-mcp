@@ -520,10 +520,11 @@ files. Never ask the human to paste a summary into the next session.
 **A note that asks agents to keep off a file**, whatever its wording (here, in AGENTS.md / CLAUDE.md or any
 notes file) can outlive the work it protected. Before you obey one, or before you edit the file
 anyway, call \`brain_sync\` with that file in \`files\`: KLYPIX checks the note against live sessions,
-unmerged local branches and registered worktrees. The result is evidence, not permission:
-standing rules, generated-file policies and explicit human restrictions still apply. An incomplete
-check says UNKNOWN. Only an expired temporary reservation may be stale; if your task authorizes
-editing, continue and tell the human so they can remove the note — never delete the note yourself.
+unmerged local branches and registered worktrees. Decide which kind of note it is: a temporary
+reservation for someone's in-flight change ends when that work ends; a permanent rule (generated
+file, policy, legal or human restriction) always holds, whatever the evidence says. If a temporary
+reservation's work has ended and your task needs the file, change it there and tell the human so
+they can remove the note — never delete the note yourself. An incomplete check says UNKNOWN.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

@@ -136,6 +136,34 @@ const expectations = {
     'no live row and no card say anyone is on lib/ledger.js (the note lives only in the file)'],
   's5c-valid-note-held-out': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5x-ledger'),
     'no live row claims lib/ledger.js — the lock is held by a person, through the note'],
+  // Held-out pairs, the same kinds as s5b / s5c. s5d/s5e are read from their
+  // scenario objects at run time (their note is not read by this file's author).
+  ...Object.fromEntries(['s5d-dead-note-heldout2', 's5e-valid-note-heldout2'].map((id) => {
+    const s = SCENARIOS.find((x) => x.id === id);
+    const actorId = s?.actor?.id;
+    const words = (s?.facts || []).find((f) => f.staleLine)?.staleLine?.replace(/^- /, '').slice(0, 40) || null;
+    return [id, s?.truthInNotes
+      ? [(sc) => !(sc.peers || []).some((p) => p.id === actorId), 'no live row claims the protected file — the lock is held by a person, through the note']
+      : [(sc) => !(sc.peers || []).some((p) => p.id === actorId) && !(words && hitsText(sc).includes(words)),
+        'no live row and no card say anyone is on the protected file (the note lives only in the file)']];
+  })),
+  's5f-dead-note-heldout3': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5fg-slug') && !/Mateo|slug helpers/i.test(hitsText(sc)),
+    'no live row and no card say anyone is on lib/slug.js (the note lives only in the file)'],
+  's5g-valid-note-heldout3': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5fg-slug'),
+    'no live row claims lib/slug.js — the lock is held by a person, through the note'],
+  's5h-dead-note-heldout4': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5hi-backoff') && !/Tomasz|jitter/i.test(hitsText(sc)),
+    'no live row and no card say anyone is on lib/backoff.js (the note lives only in the file)'],
+  's5i-valid-note-heldout4': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5hi-backoff'),
+    'no live row claims lib/backoff.js — the lock is held by a person, through the note'],
+  // Re-check scenarios (scenarios-recheck.mjs, written blind): s5j as s5b, the other three as s5c.
+  's5j-dead-note-recheck': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5jk-duration') && !/keep out of lib\/duration|Ines is partway/i.test(hitsText(sc)),
+    'no live row and no card say anyone is on lib/duration.js (the note lives only in the file)'],
+  's5k-valid-note-recheck': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5jk-duration'),
+    'no live row claims lib/duration.js — the reservation is held by a person, through the note'],
+  's5l-generated-file-rule': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5l-mime'),
+    'no live row claims lib/mime-types.generated.js — the standing rule lives in the notes'],
+  's5m-human-restriction': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5m-sms'),
+    'no live row claims copy/sms-terms.js — the restriction is a person\'s, through the note'],
   's9-continue-stopped-session': [(sc, text) => (sc.handoffs?.sessions || []).some((r) => r.id === 'actor-s9-pagination' && r.state === 'ended' && r.holdsFiles === false)
     && /Now wiring them into listUsers/.test(text) && !/default limit 20/.test(text),
     'a continue-shaped task lists the stopped session; its last words are a mid-step line, and the plan (in its last prompt) is not shown'],
