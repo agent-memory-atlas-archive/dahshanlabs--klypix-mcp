@@ -122,7 +122,7 @@ try {
     const a = assessLockNote(r.dir, note, { live: [], stopped: [priya([{ sha, subject: 'ledger: consolidate rounding helpers' }])] });
     ok(verdictOf(a) === 'no-work-found', 'B1 finished work on main, nobody live, no branch → NO WORK FOUND');
     const text = formatLockNotes([a]);
-    ok(text.includes('NO WORK FOUND') && text.includes('temporary coordination reservation may be stale') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
+    ok(text.includes('NO WORK FOUND') && text.includes('If this note is a temporary reservation, the work it held has ended') && text.includes(`${sha} ledger: consolidate rounding helpers`) && text.includes('commits are merged'), 'B2 the text cites the stopped session and its merged commit');
     ok(/tell the human the note looks stale so they can remove it/.test(text) && !/delete (the|this) note/i.test(text), 'B3 the text says to tell the human — never to delete the note');
     ok(/cannot see other machines/.test(text), 'B4 the text states what KLYPIX cannot see');
     const d = lockNotesData([a]);
@@ -185,7 +185,7 @@ try {
     const [note] = findLockNotes('Do not edit lib/ledger.js; it is generated and must only be changed through its generator.');
     const a = assessLockNote(r.dir, note);
     const text = formatLockNotes([a]);
-    ok(verdictOf(a) === 'no-work-found' && text.includes('not permission to override instructions') && text.includes('generated-file policies'), 'R1 a clean generated file never gets permission to bypass its rule');
+    ok(verdictOf(a) === 'no-work-found' && text.includes('A PERMANENT rule') && text.includes('a generated-file policy') && text.includes('follow it whatever the evidence says'), 'R1 a clean generated file never gets permission to bypass its rule');
     ok(!text.includes('if your task needs lib/ledger.js, work on it') && lockNotesData([a])[0].files[0].canOverrideInstructions === false, 'R2 neither prose nor machine data grants an override');
     ok(findLockNotes('Do not edit ../outside.js').length === 0, 'R3 notes cannot target paths outside the project');
     ok(findLockNotes('~~~js\nDo not edit lib/ledger.js\n~~~').length === 0, 'R4 tilde code fences are not instructions');
@@ -316,7 +316,7 @@ try {
       ok(!other.content[0].text.includes('📌'), 'D5 a checkpoint about other files does not');
       const inv = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'Fix invoice totals', files: ['lib/invoice.js'], phase: 'checkpoint' } });
       const invText = inv.content[0].text;
-      ok(invText.includes("Mira's agent has lib/invoice.js") && invText.includes('names a file you declared') && invText.includes('lib/invoice.js: NO WORK FOUND') && invText.includes('A temporary coordination reservation may be stale'), 'D6 declaring a file shows every instruction line naming it, whatever its wording, with the evidence');
+      ok(invText.includes("Mira's agent has lib/invoice.js") && invText.includes('names a file you declared') && invText.includes('lib/invoice.js: NO WORK FOUND') && invText.includes('If this note is a temporary reservation, the work it held has ended'), 'D6 declaring a file shows every instruction line naming it, whatever its wording, with the evidence');
       ok(inv.structuredContent?.lockNotes?.some((n) => n.kind === 'mention'), 'D7 structured: kind mention');
       const silent = await client.callTool({ name: 'brain_sync', arguments: { project: r.dir, intent: 'No context requested', files: ['lib/ledger.js'], phase: 'checkpoint', include_context: false } });
       ok(!silent.structuredContent?.lockNotes && !silent.content[0].text.includes('📌'), 'D7b include_context:false skips note checks');

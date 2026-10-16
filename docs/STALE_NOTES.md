@@ -1,12 +1,14 @@
 # Checking temporary file reservations
 
-Included in klypix-mcp 1.102.0. Release receipts and publication status are tracked
-by the tagged release and its publication workflow.
+Introduced in klypix-mcp 1.102.0; the note-kind guidance described below was added
+after 1.102.0. Release receipts and publication status are tracked by the tagged
+release and its publication workflow.
 
 An agent can leave “hands off this file” in project instructions after its work
 has ended. KLYPIX surfaces local work evidence beside that note so the next
 session can distinguish a temporary reservation from ongoing work. It does not
-decide whether a human instruction remains binding.
+decide whether a human instruction remains binding; it asks the agent to decide
+which kind of note it faces.
 
 ## Evidence and authority
 
@@ -14,14 +16,22 @@ decide whether a human instruction remains binding.
 |---|---|
 | IN USE | Another observed session lists this exact file. Coordinate before overlapping edits. |
 | WORK IN PROGRESS | A local branch, registered worktree, or recorded stopped-session commit has relevant work. Preserve it; coordinate or isolate changes. |
-| NO WORK FOUND | The completed local check found no such work. A temporary reservation may be stale. |
+| NO WORK FOUND | The completed local check found no such work. If the note is a temporary reservation for someone’s in-flight change, that work has ended: the agent may make the change in the file and must tell the human. A permanent rule still applies. |
 | UNKNOWN | A Git probe failed, a revision is unavailable, or a search/time limit was reached. Do not infer staleness. |
 
-These results are evidence, not permission. A generated-file policy, security
-rule, permanent restriction or explicit human instruction still applies even
-when the worktree is clean. For a user-authorized task and an expired temporary
-reservation, the agent can continue and report the stale note. The checker
-never edits or deletes the note. It does not lock files.
+These results are evidence, not permission to break a rule. The agent first
+decides which kind of note it faces:
+
+- A **temporary reservation** holds a file for someone’s in-flight change (it
+  names a person, a session, a branch, or a change “until it lands”). It ends
+  when that work ends.
+- A **permanent rule** — a generated-file policy, a security or legal
+  restriction, a standing project rule, or a human instruction with no end —
+  always applies, even when the worktree is clean.
+
+For an expired temporary reservation, the agent makes the change where it
+belongs (not a workaround elsewhere) and reports the stale note to the human.
+The checker never edits or deletes the note. It does not lock files.
 
 Structured results use `workFound: true | false | null` and
 `canOverrideInstructions: false`; unknown is not represented as a negative result.
@@ -66,6 +76,30 @@ with and without KLYPIX on small synthetic scenarios, not competing products.
 Several scenarios informed implementation changes; only the final scenario pair
 was unseen by the final inherited build. MCP-only Claude was less reliable than
 hook delivery. One installed run still obeyed a dead note despite the evidence.
+
+### Live evaluation of the note-kind guidance (2026-10-15)
+
+`bench/coordination/results/note-kinds-2026-10-15/README.md` compares
+1.102.0’s original wording with the note-kind guidance on Claude Code with
+KLYPIX hooks installed: 5 runs per cell, shuffled, with identical evidence
+code, so only the words the agent reads differ.
+
+- Dead temporary reservations (6 scenarios): 30/30 handled correctly with the
+  note-kind guidance, 12/30 with 1.102.0’s wording, 5/30 without KLYPIX.
+- Live work, true reservations and permanent rules (7 scenarios, including a
+  generated file and legal-approved text): 35/35 with both wordings.
+- In every 1.102.0 failure the agent saw the evidence, reported the note as
+  stale, and still worked around the file.
+
+Limits: small synthetic repositories on one machine; Claude Code only (the
+Codex account’s usage limit was reached during the run; Codex is re-tested
+after 2026-10-22); the guidance was written after reading 1.102.0’s failures
+on s5–s5i, while s5j–s5m were written blind before it; only two
+permanent-rule scenarios. It compares KLYPIX wordings, not competing
+products, and does not establish “best in class.” Public claims follow the
+claims-matrix review process.
+
+### The inherited experiment
 
 That experiment predates the authority and incomplete-evidence fixes described
 here. It does not measure this revised version or establish “best in class.”
