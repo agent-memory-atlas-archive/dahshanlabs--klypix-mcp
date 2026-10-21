@@ -495,7 +495,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -568,11 +568,16 @@ try {
         ['SessionStart', { matcher: 'startup|resume|clear', hooks: [{ type: 'command', command: brainCmd('') }] }],
         ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
         ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
-        ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
+        ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
         // Guard cards (2026-08-24): pre-action lane. Fast path — reads only the
         // compiled guard sidecar; 'warn' injects context, 'block' denies with
         // the card's message. Absent guards = stat + one tiny read, then no-op.
         ['PreToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--guard'), timeout: 10 }] }],
+        // Session end (1.105.0): a closed or cut-off Claude Code session leaves
+        // the lane at once. Before this, only the 10-minute TTL removed it, so the
+        // next session read a dead peer as "live" and refused to continue its
+        // work (round-4 continuity bench, 2026-10-20). Codex already had this.
+        ['SessionEnd', { hooks: [{ type: 'command', command: brainCmd('--end'), timeout: 10 }] }],
     ];
     const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
         .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
@@ -679,7 +684,7 @@ try {
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     reportSemantic(semanticStep);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
-    else if (!notWired.length) console.log('✓ wired 5 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
+    else if (!notWired.length) console.log('✓ wired 6 hooks: SessionEnd (--end) · SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
