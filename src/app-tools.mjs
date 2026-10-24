@@ -66,7 +66,7 @@ import {
   appToolsPlatform, appVaultSetting, canonicalCanvasPath, isOpenInApp, pathHash, readEndpoint, sharedCanvasesDir,
   tellUser, TELL_USER, APP_BRIDGE_PROTOCOL, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
-import { brainTarget, canvasTitleOf, resolveCanvasDetailed, walkVault } from './klypix-core.mjs';
+import { brainTarget, canvasTitleOf, closestCanvases, notFoundText, resolveCanvasDetailed, walkVault } from './klypix-core.mjs';
 import {
   classifyLinkTier, derivedReading, DOCUMENT_TEXT_KIND, escapeInstructionLines, fenceContent, parseKlypix, readManifestCheap, recordedAuthor, savedReadingIndex, scopeLockedView,
 } from './klypix-format.mjs';
@@ -491,10 +491,12 @@ export async function readCardContents({ vault, canvas, card_ids, read_new, refr
   const resolved = resolveCanvasDetailed(vault, canvas);
   if (!resolved.file) {
     const sentence = tellUser('NOT_FOUND');
+    const closest = resolved.ambiguous ? [] : closestCanvases(vault, canvas);
     const first = resolved.ambiguous
       ? `More than one canvas is titled "${canvas}" — pass one of these paths:\n${resolved.ambiguous.map(p => `  - ${p}`).join('\n')}`
-      : `Canvas not found: ${canvas}. Names match a file name or the title KLYPIX shows.`;
-    return envelope({ ok: false, code: 'NOT_FOUND', tell_user: sentence, text: first, structured: resolved.ambiguous ? { candidates: resolved.ambiguous } : {} });
+      : notFoundText(canvas, null, closest);
+    return envelope({ ok: false, code: 'NOT_FOUND', tell_user: sentence, text: first,
+      structured: resolved.ambiguous ? { candidates: resolved.ambiguous } : { closest: closest.map((c) => c.path), maybe_cloud_space: true } });
   }
   const file = resolved.file;
   let parsed;
