@@ -898,7 +898,7 @@ placeholder requires checking the original media. The reader is bounded to 128 M
 silently drops turns or certifies coverage. Reconcile the card's Next list with the conversation
 and repository evidence before continuing.
 
-**Host coverage (development branch).** The shared handoff card works independently of the agent brand. Conversation recovery has separate coverage:
+**Host coverage (1.108.0).** The shared handoff card works independently of the agent brand. Conversation recovery has separate coverage:
 
 | Source | Evidence available |
 | --- | --- |
