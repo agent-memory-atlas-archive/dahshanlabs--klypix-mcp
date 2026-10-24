@@ -887,10 +887,15 @@ export function proposedEditDiff(projectRoot, toolName, toolInput) {
     } else {
       const edits = tool === 'MultiEdit' ? (Array.isArray(ti.edits) ? ti.edits : []) : [ti];
       const lines = [];
+      // An agent's edit text uses \n while a CRLF checkout holds \r\n: find the
+      // edit in the file with both normalised, or every finding reports line 1
+      // plus its offset (line 2 for a line added at 11). Line counts are the
+      // same either way.
+      const lf = current === null ? null : current.replace(/\r\n/g, '\n');
       for (const e of edits) {
-        const oldS = String(e?.old_string ?? ''); const newS = String(e?.new_string ?? '');
-        const at = current === null ? -1 : current.indexOf(oldS);
-        const start = current === null ? 1 : lineOf(current, at);
+        const oldS = String(e?.old_string ?? '').replace(/\r\n/g, '\n'); const newS = String(e?.new_string ?? '');
+        const at = lf === null ? -1 : lf.indexOf(oldS);
+        const start = lf === null ? 1 : lineOf(lf, at);
         for (const l of linesNotIn(newS, oldS)) lines.push({ line: start + l.idx, text: l.text });
       }
       push(rel, current === null ? 'A' : 'M', lines);

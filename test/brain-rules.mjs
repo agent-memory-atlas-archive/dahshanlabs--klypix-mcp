@@ -293,6 +293,19 @@ payload = JSON.parse(hook.stdout || '{}');
 ok(payload.decision === 'block' && /mixed to crlf/.test(payload.reason || ''), 'PostToolUse: an edit that flattened a mixed file is fed back to the agent at once');
 write(P.dir, 'src/mixed.ts', 'one\r\ntwo\nthree\r\nfour\n');
 
+// ── CRLF checkouts: an Edit's line is found in a \r\n file ──────────────────
+// The agent's old_string uses \n; on a CRLF checkout the file holds \r\n, so
+// the edit was "not found" and every finding said line 1 + offset (2 for 11).
+write(P.dir, 'admin/tests/crlf.test.ts', Array.from({ length: 10 }, (_, i) => `const line${i + 1} = ${i + 1};`).join('\r\n') + '\r\n');
+const crlfEdit = { file_path: path.join(P.dir, 'admin', 'tests', 'crlf.test.ts'), old_string: 'const line9 = 9;\nconst line10 = 10;', new_string: "const line9 = 9;\nconst line10 = 10;\nimport y from '@/lib/y';" };
+const crlfDiff = R.proposedEditDiff(P.dir, 'Edit', crlfEdit);
+ok(crlfDiff.added.get('admin/tests/crlf.test.ts')?.[0]?.line === 11, `an Edit on a CRLF file reports the added line where it lands (got ${crlfDiff.added.get('admin/tests/crlf.test.ts')?.[0]?.line})`);
+const crlfMulti = R.proposedEditDiff(P.dir, 'MultiEdit', { file_path: crlfEdit.file_path, edits: [{ old_string: 'const line2 = 2;', new_string: "const line2 = 2;\nimport z from '@/lib/z';" }, { old_string: crlfEdit.old_string, new_string: crlfEdit.new_string }] });
+ok(crlfMulti.added.get('admin/tests/crlf.test.ts')?.map((l) => l.line).join() === '3,11', 'MultiEdit on a CRLF file: each edit is located in the file');
+const crlfDecision = R.preToolUseDecision(P.dir, 'Edit', crlfEdit, { sessionId: 'crlf1' });
+ok(crlfDecision?.deny && /admin\/tests\/crlf\.test\.ts:11\b/.test(crlfDecision.deny), 'the edit-time warning names line 11 of the CRLF file, not line 2');
+fs.rmSync(path.join(P.dir, 'admin', 'tests', 'crlf.test.ts'));
+
 // ── Codex: apply_patch payloads (warnings — Codex cannot deny) ───────────────
 const patch = ['*** Begin Patch', '*** Add File: admin/tests/z.test.ts', "+import q from '@/lib/q';", '*** Update File: src/App.tsx', '@@', ' <Route path="/a" />', '+<Route path="/codex" />', '*** End Patch'].join('\n');
 const codex = R.preToolUseDecision(P.dir, 'apply_patch', { command: patch }, { sessionId: 'c1', host: 'codex' });

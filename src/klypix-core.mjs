@@ -170,6 +170,57 @@ export function resolveCanvas(vault, ref) {
   return resolveCanvasDetailed(vault, ref).file || null;
 }
 
+// Levenshtein distance, given up past `cap` (only small distances matter here).
+function editDistance(a, b, cap = 8) {
+  if (Math.abs(a.length - b.length) > cap) return cap + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    if (Math.min(...row) > cap) return cap + 1;
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+// The canvases on this computer whose file name or KLYPIX title is closest to a
+// reference that matched none: a name containing it (or contained in it), a
+// shared word, or a near spelling. → [{ name, path }] (path relative to the vault).
+export function closestCanvases(vault, ref, limit = 3) {
+  const want = String(ref || '').trim().toLowerCase();
+  if (!want) return [];
+  const wordsOf = (s) => s.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const words = wordsOf(want);
+  const scored = [];
+  for (const f of walkVault(vault)) {
+    const base = path.basename(f).replace(/\.(klypix|any)$/i, '');
+    const title = canvasTitleOf(f);
+    let best = 0;
+    for (const name of [base, title].filter(Boolean)) {
+      const n = name.toLowerCase();
+      if (n.includes(want) || want.includes(n)) best = Math.max(best, 3);
+      const shared = words.filter((w) => wordsOf(n).some((x) => x.startsWith(w) || w.startsWith(x))).length;
+      if (shared) best = Math.max(best, 1 + shared / words.length);
+      const distanceCap = Math.min(8, Math.max(2, Math.floor(Math.max(want.length, n.length) / 4)));
+      if (editDistance(want, n, distanceCap) <= distanceCap) best = Math.max(best, 1);
+    }
+    if (best > 0) scored.push({ name: title || base, path: path.relative(vault, f) || f, best });
+  }
+  return scored.sort((a, b) => b.best - a.best || a.name.localeCompare(b.name)).slice(0, limit).map(({ name, path: p }) => ({ name, path: p }));
+}
+
+// A reference that matches no canvas here may name a KLYPIX cloud space (made on
+// the phone or on klypix.com, or shared with the person). This tool reads canvas
+// files on this computer only and has no signed-in way to list cloud spaces, so
+// it says so, names the connector that can, and offers the closest local names.
+export function notFoundText(ref, vault, closest = closestCanvases(vault, ref)) {
+  return [
+    `Canvas not found: ${ref}${vault ? ` (vault: ${vault})` : ''}. Names match a file name or the title KLYPIX shows.`,
+    closest.length ? `Closest canvases on this computer: ${closest.map((c) => `"${c.name}" (${c.path})`).join(', ')}.` : 'No canvas on this computer has a similar name.',
+    `If "${ref}" is a KLYPIX cloud space (made on the phone or on klypix.com, or shared with you), this local tool cannot see it: open it with the KLYPIX connector's list_spaces in an AI app connected to KLYPIX.`,
+  ].join('\n');
+}
+
 // Resolve the DEFAULT project brain for the brain-* ops, INDEPENDENT of the
 // --vault library folder. The vault answers "where does my .klypix library live"
 // (list/read/search); the BRAIN is "THIS project's ./brain.klypix". Conflating
@@ -276,13 +327,15 @@ function cardDetailBlock(struct, onlyIds) {
 // structured half carries the code. Only KLYPIX speaks in tell_user.
 function notFoundResult(ref, vault, ambiguous = null) {
   const sentence = tellUser('NOT_FOUND');
+  const closest = ambiguous ? [] : closestCanvases(vault, ref);
   const first = ambiguous
     ? `More than one canvas is titled "${ref}" — pass one of these paths:\n${ambiguous.map(p => `  - ${p}`).join('\n')}`
-    : `Canvas not found: ${ref} (vault: ${vault}). Names match a file name or the title KLYPIX shows.`;
+    : notFoundText(ref, vault, closest);
   return {
     blocks: [text(first), text(`Tell the user: ${sentence}`)],
     isError: true,
-    structured: { ok: false, mode: 'file', code: 'NOT_FOUND', tell_user: sentence, ...(ambiguous ? { candidates: ambiguous } : {}) },
+    structured: { ok: false, mode: 'file', code: 'NOT_FOUND', tell_user: sentence,
+      ...(ambiguous ? { candidates: ambiguous } : { closest: closest.map((c) => c.path), maybe_cloud_space: true }) },
   };
 }
 

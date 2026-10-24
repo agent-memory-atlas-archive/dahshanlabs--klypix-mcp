@@ -136,6 +136,19 @@ const md = textOf(read);
   ok(f.status === 'saved' && f.method === 'folder_listing' && f.text.includes('src/a.ts') && !f.text.includes('docs/readme.md'), '4. a folder card gives its listing, filtered by entry_paths');
   const missing = await readCardContents({ vault, canvas: 'No such canvas', card_ids: ['x'] });
   ok(missing.isError === true && missing.structuredContent.code === 'NOT_FOUND' && missing.content.at(-1).text.startsWith('Tell the user: I can\'t find that canvas.'), 'an unknown canvas gives NOT_FOUND and the sentence');
+  // 2026-10-24: "Canvas not found: make" for a space that lives in the cloud.
+  // A name that matches nothing here may be a cloud space: say so, name the
+  // connector that can open it, and offer the closest canvases on this PC.
+  const near = await readCardContents({ vault, canvas: 'parity', card_ids: ['x'] });
+  const nearText = near.content.map(c => c.text || '').join('\n');
+  ok(near.structuredContent.code === 'NOT_FOUND' && near.structuredContent.maybe_cloud_space === true && near.structuredContent.closest.length === 1
+    && /Closest canvases on this computer: "Parity Fixture" \(/.test(nearText) && /If "parity" is a KLYPIX cloud space/.test(nearText) && /KLYPIX connector's list_spaces/.test(nearText)
+    && near.content.at(-1).text.startsWith('Tell the user: I can\'t find that canvas.'), 'read_card_contents: an unknown name may be a cloud space; the connector and the closest local canvas are named');
+  const far = await opReadCanvas({ vault, canvas: 'make' });
+  ok(far.isError === true && far.structured.code === 'NOT_FOUND' && far.structured.maybe_cloud_space === true && far.structured.closest.length === 0
+    && /No canvas on this computer has a similar name\./.test(textOf(far)) && /If "make" is a KLYPIX cloud space/.test(textOf(far)), 'read_canvas: a name like no local canvas says so and points at the cloud connector');
+  const longMissing = await opReadCanvas({ vault, canvas: 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' });
+  ok(longMissing.structured.closest.length === 0, 'an unrelated long reference does not match the capped edit-distance sentinel');
   const budget = await readCardContents({ vault, canvas: 'Parity Fixture', card_ids: ['vid_1'], max_chars: 1000 });
   ok(budget.structuredContent.results[0].truncated === false, 'a short reading under max_chars is not truncated');
   const saved = await readCardContents({ vault, canvas: 'Parity Fixture', card_ids: ['lnk_unread'], read_new: false });

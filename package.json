@@ -33,7 +33,10 @@
     "team-memory",
     "decision-log",
     "overlap-warnings",
-    "agent-collaboration"
+    "agent-collaboration",
+    "ci",
+    "git-hooks",
+    "code-review"
   ],
   "homepage": "https://klypix.com/klypix-mcp",
   "repository": {

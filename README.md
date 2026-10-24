@@ -722,6 +722,7 @@ the brain, and `npx klypix-mcp rules` shows each rule's blocks, overrides and fa
 How to write, approve and retire rules: [docs/brain-rules.md](docs/brain-rules.md). To see what a
 set of rules would have flagged on a repository's own history, `scripts/brain-rules-proof.mjs`
 replays them over its pull requests and failed Actions logs, with what those runs cost.
+A walk-through for teams: [Stop AI agents repeating the same mistakes](https://klypix.com/guides/stop-agents-repeating-mistakes).
 
 ### Presence and task intent
 
